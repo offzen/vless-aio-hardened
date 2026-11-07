@@ -1,21 +1,16 @@
 #!/bin/bash
-# 单元测试：脚本自升级的版本判定（_is_semver_version / _version_gt / _get_latest_script_version）。
+# 单元测试：h12 滚动 master 的 SHA-256 更新判定与版本防降级。
 #
-# 背景（v3.4.10-h4 真实故障，2026-10-30）：本仓 GitHub tag 是滚动名 `dev`，且没有
-# Release 对象，于是 `_get_latest_script_version` 回退到 `_get_latest_tag_version`
-# 拿到 "dev"，再交给 `_version_gt` 做「逐段数字比较」。遇到非数字段时它退化为字符串
-# 比较，"dev" > "3" 成立 ⇒ 恒判为「有新版本」，表现为：
-#     最新版本: vdev → 发现新版本? [Y/n] → ✓ 更新成功! v3.4.10-h4 -> v3.4.10-h4
-#     → 下次运行 vless 依旧提示更新（死循环）。
-# 本测试锁定修复后的行为：非语义化版本号一律不参与比较、不被缓存，
-# 版本号改为回退读 master 脚本内的 VERSION 常量。
-#
-# 全离线（网络函数用 stub 顶替），可在无外网的 runner 上跑。
-set -e
-CFG="/tmp/vless-version-check"; rm -rf "$CFG"; mkdir -p "$CFG"
+# h12 不再从 Release/tag 取版本；菜单提示比较远端/本地脚本哈希，同时用脚本内
+# readonly VERSION 做方向闸门：远端更高或同版本不同字节可更新，远端更旧拒绝。
+# 全离线（下载与本地脚本哈希均用 stub），可在无外网 runner 上运行。
+set -uo pipefail
 
-# 从 vless-server.sh 抽取真实函数体（与 test-anytls-secure.sh 同法）。
-# 抽取用 index() 前缀匹配而非动态正则，避免 gawk/mawk 对 \( 的转义差异。
+CFG="/tmp/vless-version-check"
+rm -rf "$CFG"
+mkdir -p "$CFG"
+
+# 从 vless-server.sh 抽取真实函数体。使用字符串前缀匹配，兼容 gawk/mawk。
 extract_fn() { # $1=fn_name
   local fn="$1"
   awk -v fn="$fn" '
@@ -31,26 +26,35 @@ extract_fn() { # $1=fn_name
   source "$CFG/$fn.sh"
 }
 
-for fn in _is_semver_version _get_remote_script_version_from_raw \
-          _get_latest_script_version _version_gt \
-          _has_script_update _get_script_update_info; do
+for fn in _script_sha256 _is_sha256 _is_semver_version _extract_script_version \
+          _version_gt _get_latest_script_hash _has_script_update \
+          _get_script_update_info; do
   extract_fn "$fn"
 done
 
-# ---- 测试夹具：脚本内被引用到的常量与依赖函数（全部 stub，离线） ----
-VERSION="3.4.10-h4"
-SCRIPT_REPO="offzen/vless-aio-hardened"
-SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
-SCRIPT_VERSION_CACHE_FILE="$CFG/.script_version"
-VERSION_CACHE_DIR="$CFG"
+VERSION="3.4.10-h12"
+RELEASE_CHANNEL="master"
+VERSION_CACHE_DIR="$CFG/cache"
+SCRIPT_HASH_CACHE_FILE="$VERSION_CACHE_DIR/.script_hash"
+SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
+mkdir -p "$VERSION_CACHE_DIR"
 
-_init_version_cache() { mkdir -p "$VERSION_CACHE_DIR" 2>/dev/null || true; }
-_is_cache_fresh() { [[ "${STUB_CACHE_FRESH:-1}" == "1" ]] && [[ -f "$1" ]]; }
+STUB_CACHE_FRESH=1
+STUB_CURRENT_HASH="$(printf '1%.0s' {1..64})"
+STUB_REMOTE_VER="3.4.10-h13"
+STUB_REMOTE_BODY="remote-build-a"
+FETCH_SHOULD_FAIL=0
 
-# 远端来源 stub（默认：无 release、tag 名为滚动名 dev、master 脚本 VERSION=3.4.10-h5）
-_get_latest_version() { return 1; }
-_get_latest_tag_version() { echo "dev"; }
-_get_remote_script_version_from_raw() { echo "${STUB_RAW_VER:-3.4.10-h5}"; }
+_init_version_cache() { mkdir -p "$VERSION_CACHE_DIR"; }
+_is_cache_fresh() { [[ "$STUB_CACHE_FRESH" == "1" && -f "$1" ]]; }
+_current_script_sha256() { printf '%s\n' "$STUB_CURRENT_HASH"; }
+_fetch_script_tmp() {
+  [[ "$FETCH_SHOULD_FAIL" == "0" ]] || return 1
+  local f
+  f=$(mktemp "$CFG/remote.XXXXXX") || return 1
+  printf '#!/bin/bash\nreadonly VERSION="%s"\n# %s\n' "$STUB_REMOTE_VER" "$STUB_REMOTE_BODY" > "$f"
+  printf '%s\n' "$f"
+}
 
 fail=0
 check() { # $1=描述 $2=实际 $3=期望
@@ -62,100 +66,75 @@ check() { # $1=描述 $2=实际 $3=期望
   fi
 }
 
-echo "########## 1. _is_semver_version：只认语义化版本 ##########"
-for v in "3.4.10-h4" "3.4.10" "3.4.10-h5" "10.0.0-h12" "3.4.10-h0"; do
+is_update() { _has_script_update && echo yes || echo no; }
+update_info() { _get_script_update_info 2>/dev/null || true; }
+
+echo "########## 1. 语义化版本与方向比较 ##########"
+for v in "3.4.10-h12" "3.4.10" "10.0.0-h1"; do
   check "接受 '$v'" "$(_is_semver_version "$v" && echo yes || echo no)" "yes"
 done
-for v in "dev" "dev3" "latest" "nightly" "v3.4.10" "3.4.10-h" "3.4.10-h4-extra" "" " " "3.4.x"; do
+for v in "dev" "latest" "v3.4.10-h12" "3.4.10-h" ""; do
   check "拒绝 '$v'" "$(_is_semver_version "$v" && echo yes || echo no)" "no"
 done
+check "h13 > h12" "$(_version_gt "3.4.10-h13" "3.4.10-h12" && echo gt || echo le)" "gt"
+check "h11 不大于 h12" "$(_version_gt "3.4.10-h11" "3.4.10-h12" && echo gt || echo le)" "le"
+check "同版本不大于自身" "$(_version_gt "3.4.10-h12" "3.4.10-h12" && echo gt || echo le)" "le"
 
 echo ""
-echo "########## 2. _version_gt：数字段与 -h 修订号 ##########"
-check "3.4.10-h5 > 3.4.10-h4"      "$(_version_gt "3.4.10-h5" "3.4.10-h4" && echo gt || echo le)" "gt"
-check "3.4.10-h4 < 3.4.10-h5"      "$(_version_gt "3.4.10-h4" "3.4.10-h5" && echo gt || echo le)" "le"
-check "3.4.10-h10 > 3.4.10-h9（数字比较而非字符串）" \
-      "$(_version_gt "3.4.10-h10" "3.4.10-h9" && echo gt || echo le)" "gt"
-check "3.4.11 > 3.4.10-h9（基础版本优先）" \
-      "$(_version_gt "3.4.11" "3.4.10-h9" && echo gt || echo le)" "gt"
-check "3.4.10-h1 > 3.4.10（无后缀最低）" \
-      "$(_version_gt "3.4.10-h1" "3.4.10" && echo gt || echo le)" "gt"
-check "同版本不比（3.4.10-h4 vs 3.4.10-h4）" \
-      "$(_version_gt "3.4.10-h4" "3.4.10-h4" && echo gt || echo le)" "le"
+echo "########## 2. 远端制品哈希与缓存 ##########"
+rm -f "$SCRIPT_HASH_CACHE_FILE" "$SCRIPT_VERSION_CACHE_FILE"
+STUB_REMOTE_VER="3.4.10-h13"
+STUB_REMOTE_BODY="remote-build-a"
+FETCH_SHOULD_FAIL=0
+STUB_CACHE_FRESH=1
+remote_hash=$(_get_latest_script_hash "false" "true")
+check "下载结果为 SHA-256" "$(_is_sha256 "$remote_hash" && echo yes || echo no)" "yes"
+check "哈希写入缓存" "$(cat "$SCRIPT_HASH_CACHE_FILE")" "$remote_hash"
+check "语义化 VERSION 写入缓存" "$(cat "$SCRIPT_VERSION_CACHE_FILE")" "3.4.10-h13"
 
-echo ""
-echo "########## 3. 回归：滚动 tag 名 dev 绝不能被判为更新版本 ##########"
-check "'dev' vs '3.4.10-h4' 不更新" "$(_version_gt "dev" "3.4.10-h4" && echo gt || echo le)" "le"
-check "'3.4.10-h4' vs 'dev' 不更新" "$(_version_gt "3.4.10-h4" "dev" && echo gt || echo le)" "le"
-check "'dev3' vs 'dev' 不更新"      "$(_version_gt "dev3" "dev" && echo gt || echo le)" "le"
-check "'latest' vs '3.4.10-h4' 不更新" "$(_version_gt "latest" "3.4.10-h4" && echo gt || echo le)" "le"
+cached_hash="$(printf 'a%.0s' {1..64})"
+printf '%s\n' "$cached_hash" > "$SCRIPT_HASH_CACHE_FILE"
+FETCH_SHOULD_FAIL=1
+check "新鲜合法缓存不访问下载路径" "$(_get_latest_script_hash "true" "false")" "$cached_hash"
 
-echo ""
-echo "########## 4. _get_latest_script_version：脏缓存与 tag 回退 ##########"
-# 4a. 旧版写进缓存的脏值 "dev" 必须被丢弃，改用远端真实版本
-echo "dev" > "$SCRIPT_VERSION_CACHE_FILE"
-STUB_CACHE_FRESH=1 check "缓存里的 'dev' 被丢弃，改用 master VERSION" \
-  "$(_get_latest_script_version "true" "false")" "3.4.10-h5"
-check "缓存已被纠正为 3.4.10-h5" "$(cat "$SCRIPT_VERSION_CACHE_FILE")" "3.4.10-h5"
-
-# 4b. tag 名非语义化 → 必须回退读 master 脚本 VERSION（这正是 h4 故障点）
+printf 'not-a-hash\n' > "$SCRIPT_HASH_CACHE_FILE"
+FETCH_SHOULD_FAIL=0
+STUB_REMOTE_VER="dev"
+STUB_REMOTE_BODY="remote-build-b"
 rm -f "$SCRIPT_VERSION_CACHE_FILE"
-check "tag='dev' 时回退到 master VERSION" \
-  "$(_get_latest_script_version "false" "true")" "3.4.10-h5"
-
-# 4c. release 给出语义化版本时优先用 release（不必回退）
-rm -f "$SCRIPT_VERSION_CACHE_FILE"
-_get_latest_version() { echo "3.4.10-h6"; }
-check "release 语义化版本优先" \
-  "$(_get_latest_script_version "false" "true")" "3.4.10-h6"
-_get_latest_version() { return 1; }
-
-# 4d. 所有来源都拿不到语义化版本 → 返回非 0，且不得写入脏缓存
-rm -f "$SCRIPT_VERSION_CACHE_FILE"
-_get_latest_tag_version() { echo "dev"; }
-_get_remote_script_version_from_raw() { return 1; }
-check "全来源失败返回非 0" "$(_get_latest_script_version "false" "true" >/dev/null 2>&1 && echo ok || echo err)" "err"
-check "失败时不写缓存" "$([[ -f "$SCRIPT_VERSION_CACHE_FILE" ]] && echo exists || echo absent)" "absent"
-
-# 4e. 缓存有效时不再走网络
-_get_latest_tag_version() { echo "dev"; }
-_get_remote_script_version_from_raw() { echo "9.9.9-h9"; }
-echo "3.4.10-h5" > "$SCRIPT_VERSION_CACHE_FILE"
-STUB_CACHE_FRESH=1 check "新鲜缓存命中" \
-  "$(_get_latest_script_version "true" "false")" "3.4.10-h5"
+remote_hash=$(_get_latest_script_hash "true" "false")
+check "脏哈希缓存被替换" "$(_is_sha256 "$remote_hash" && echo yes || echo no)" "yes"
+check "非语义化远端 VERSION 不写缓存" "$([[ -f "$SCRIPT_VERSION_CACHE_FILE" ]] && echo exists || echo absent)" "absent"
 
 echo ""
-echo "########## 5. 菜单/启动提示读缓存路径 ##########"
-echo "dev" > "$SCRIPT_VERSION_CACHE_FILE"
-check "缓存为 'dev' 时 _has_script_update 为假" \
-  "$(_has_script_update && echo yes || echo no)" "no"
-check "缓存为 'dev' 时 _get_script_update_info 为空" \
-  "$(_get_script_update_info)" ""
-echo "3.4.10-h9" > "$SCRIPT_VERSION_CACHE_FILE"
-check "缓存为 3.4.10-h9 时 _has_script_update 为真" \
-  "$(_has_script_update && echo yes || echo no)" "yes"
-check "缓存为 3.4.10-h9 时 _get_script_update_info 输出该版本" \
-  "$(_get_script_update_info)" "3.4.10-h9"
-echo "3.4.10-h4" > "$SCRIPT_VERSION_CACHE_FILE"
-check "缓存与本地同版本时无更新提示" \
-  "$(_has_script_update && echo yes || echo no)" "no"
+echo "########## 3. 哈希差异 + VERSION 防降级 ##########"
+STUB_CURRENT_HASH="$(printf '1%.0s' {1..64})"
+remote_hash="$(printf '2%.0s' {1..64})"
+printf '%s\n' "$STUB_CURRENT_HASH" > "$SCRIPT_HASH_CACHE_FILE"
+printf '3.4.10-h13\n' > "$SCRIPT_VERSION_CACHE_FILE"
+check "相同字节不提示更新" "$(is_update)" "no"
 
-echo ""
-echo "########## 6. 真实网络冒烟（离线/失败仅告警，不阻断 CI） ##########"
-real_ver=""
-if command -v curl >/dev/null 2>&1; then
-  real_ver=$(curl -sL --connect-timeout 5 --max-time 15 -r 0-4095 "$SCRIPT_RAW_URL" 2>/dev/null \
-    | grep -m1 '^readonly VERSION=' | cut -d'"' -f2 || true)
-fi
-if _is_semver_version "$real_ver"; then
-  echo "  OK   master 上的 VERSION 是语义化版本: $real_ver"
-else
-  echo "  WARN 无法从远端读取语义化 VERSION（离线或无网络），已跳过（不影响结论）"
-fi
+printf '%s\n' "$remote_hash" > "$SCRIPT_HASH_CACHE_FILE"
+printf '3.4.10-h13\n' > "$SCRIPT_VERSION_CACHE_FILE"
+check "远端高版本且字节不同可更新" "$(is_update)" "yes"
+check "更新提示返回滚动通道" "$(update_info)" "master"
+
+printf '3.4.10-h12\n' > "$SCRIPT_VERSION_CACHE_FILE"
+check "同版本滚动制品字节变化可更新" "$(is_update)" "yes"
+
+printf '3.4.10-h11\n' > "$SCRIPT_VERSION_CACHE_FILE"
+check "远端较旧即使字节不同也拒绝" "$(is_update)" "no"
+check "拒绝降级时不显示更新信息" "$(update_info)" ""
+
+printf 'dev\n' > "$SCRIPT_VERSION_CACHE_FILE"
+check "非法远端 VERSION 不参与更新" "$(is_update)" "no"
+
+rm -f "$SCRIPT_HASH_CACHE_FILE"
+check "缺少远端哈希缓存时不提示" "$(is_update)" "no"
 
 echo ""
 if [[ $fail -eq 0 ]]; then
-  echo "PASS: 版本判定正确（滚动 tag 名不参与比较，版本号回退读 master 脚本 VERSION）"
+  echo "PASS: h12 SHA 更新判定正确（高版本/同版本可更新，低版本拒绝）"
 else
   echo "FAIL: 有断言未通过"
   exit 1

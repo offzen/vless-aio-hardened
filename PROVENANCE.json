@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "package": "vless-aio-hardened",
+  "release_channel": "master",
+  "release_model": "rolling",
+  "source": {
+    "repository": "https://github.com/offzen/vless-aio-hardened",
+    "upstream": "https://gitlab.com/chil30-group/vless-all-in-one",
+    "upstream_baseline": "3.4.10"
+  },
+  "policy": "The master branch is the current end-user artifact set; no separate public package version is assigned or displayed.",
+  "upgrade_handshake": {
+    "version": "3.4.10-h12",
+    "why": "Legacy clients (<= 3.4.10-h5) decide upgrades by semantic version only and refuse to install a script whose readonly VERSION is missing; this constant is therefore an upgrade handshake token, not a public release number. It must stay monotonic and match ^[0-9]+(\\.[0-9]+)*(-h[0-9]+)?$.",
+    "anti_downgrade": "This build also refuses to install a remote artifact whose VERSION is lower than the local one (release rollback / mirror lag / accidental stale push)."
+  },
+  "file_count": 4,
+  "files": {
+    "README.md": "bd2261f6672aa97640b33c44e1081d8839bc44c52833e6df2c625952f5bd3f55",
+    "SHA256SUMS": "f55c071c56b4a188d6feee753506936e42445b22f11304dbdec193679bffba97",
+    "USAGE.md": "d0c016b74b7f37c7fe6dbbd161e612d6c3c52c7fe604c1fe66e485b754ff99b5",
+    "vless-server.sh": "13830a69680f4e2a8ba8a1476e0adb16a91b1dc70bdb20f005321e9f332490d3"
+  },
+  "note": "The files map covers README.md, USAGE.md, SHA256SUMS, and vless-server.sh. PROVENANCE.json is excluded from its own hash map to avoid recursive hashing."
+}

@@ -1,6 +1,6 @@
 #!/bin/bash 
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.4.10 [服务端]
+#  vless-aio-hardened 多协议代理一键部署脚本 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -18,18 +18,19 @@
 #  本仓(升级源): https://github.com/offzen/vless-aio-hardened
 #═══════════════════════════════════════════════════════════════════════════════
 
-# 版本格式: <上游版本>-h<本仓修订号>，如 3.4.10-h1。
-# 升级只对比本仓自身的发布版本，与上游版本无关（已脱离上游更新链）。
-# 版本来源优先级：GitHub release tag → git tag → master 脚本内的 VERSION 常量。
-# 注意：本仓 GitHub tag 是滚动名 `dev`（不是版本号），tag 名非语义化版本时
-# 必须回退去读 master 脚本里的 VERSION，绝不能把 `dev` 当版本号比较（见 FIXES.md §十）。
-readonly VERSION="3.4.10-h5"
+# 本仓采用滚动 master 发布；用户界面不显示独立发布版本号。
+# 脚本更新直接比较 master 制品的 SHA-256；release/tag 不参与版本判断。
+readonly RELEASE_CHANNEL="master"
+# 升级握手令牌（用户界面不展示）：
+#   1) 3.4.10-h5 及更早的存量客户端只认语义化版本号，靠它识别本制品并放行下载；
+#   2) 本版更新器用它做"防降级"方向判断（远端更旧一律拒绝）。
+# 格式受老客户端硬约束：^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$，且必须单调递增。
+readonly VERSION="3.4.10-h12"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/offzen/vless-aio-hardened"
-readonly SCRIPT_REPO="offzen/vless-aio-hardened"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
 readonly CFG="/etc/vless-reality"
-readonly ACME_DEFAULT_EMAIL="admin@example.com"
+readonly ACME_DEFAULT_EMAIL=""
 
 # curl 超时常量
 readonly CURL_TIMEOUT_FAST=5
@@ -59,6 +60,110 @@ _pgrep() {
 #  全局状态数据库 (JSON)
 #═══════════════════════════════════════════════════════════════════════════════
 readonly DB_FILE="$CFG/db.json"
+readonly WEBROOT_INDEX="${WEBROOT_INDEX:-/var/www/html/index.html}"
+readonly WEBROOT_PLACEHOLDER_META="$CFG/webroot-placeholder.meta"
+
+# 共享 Web root 所有权：只登记本项目在路径原先不存在时创建的 placeholder。
+# 元数据同时绑定文件系统 identity 与内容 hash；任一不匹配即 fail closed，不删除文件。
+_webroot_sha256() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+_webroot_identity() {
+    local file="$1"
+    stat -Lc '%d:%i:%s:%u:%g:%a' "$file" 2>/dev/null ||
+        stat -f '%d:%i:%z:%u:%g:%Lp' "$file" 2>/dev/null
+}
+
+create_webroot_placeholder() {
+    local file="$WEBROOT_INDEX" meta="$WEBROOT_PLACEHOLDER_META"
+    if [[ -e "$file" || -L "$file" ]]; then
+        _info "保留既存 Web 首页（不接管所有权）: $file"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$file")" "$CFG" || return 1
+    local tmp
+    tmp=$(mktemp "${file}.vless-placeholder.XXXXXX") || return 1
+    if ! cat > "$tmp" << 'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Welcome</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #333; text-align: center; }
+        p { color: #666; line-height: 1.6; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Welcome to Our Website</h1>
+        <p>This is a simple website hosted on our server.</p>
+    </div>
+</body>
+</html>
+HTMLEOF
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    # noclobber 防止并发创建时覆盖刚出现的第三方文件。
+    if ! ( set -o noclobber; cat "$tmp" > "$file" ) 2>/dev/null; then
+        rm -f "$tmp"
+        _warn "Web 首页已由其他进程创建，保持原样: $file"
+        return 0
+    fi
+    rm -f "$tmp"
+
+    local identity hash meta_tmp
+    identity=$(_webroot_identity "$file") || return 1
+    hash=$(_webroot_sha256 "$file") || return 1
+    meta_tmp=$(mktemp "${meta}.tmp.XXXXXX") || return 1
+    printf 'version=1\npath=%s\nidentity=%s\nsha256=%s\n' \
+        "$file" "$identity" "$hash" > "$meta_tmp" || { rm -f "$meta_tmp"; return 1; }
+    chmod 600 "$meta_tmp" 2>/dev/null || true
+    mv -f "$meta_tmp" "$meta"
+    _ok "已创建并登记项目 placeholder: $file"
+}
+
+cleanup_webroot_placeholder() {
+    local file="$WEBROOT_INDEX" meta="$WEBROOT_PLACEHOLDER_META"
+    [[ -f "$meta" ]] || return 0
+
+    local version="" path="" identity="" sha256=""
+    while IFS='=' read -r key value; do
+        case "$key" in
+            version) version="$value" ;;
+            path) path="$value" ;;
+            identity) identity="$value" ;;
+            sha256) sha256="$value" ;;
+        esac
+    done < "$meta"
+
+    if [[ "$version" == "1" && "$path" == "$file" && -f "$file" && ! -L "$file" ]] &&
+       [[ "$(_webroot_identity "$file" 2>/dev/null)" == "$identity" ]] &&
+       [[ "$(_webroot_sha256 "$file" 2>/dev/null)" == "$sha256" ]]; then
+        rm -f -- "$file" && _ok "已删除身份匹配的项目 placeholder: $file"
+    else
+        _warn "Web 首页已变化或所有权无法证明，保留文件: $file"
+    fi
+    # 无论是否匹配，都不让过期记录在未来误认新文件。
+    rm -f -- "$meta"
+}
 
 # 初始化数据库
 init_db() {
@@ -593,12 +698,27 @@ gen_xray_vless_clients() {
     local filter_port="${3:-}"
     
     local users=$(db_get_users_stats "xray" "$proto")
+    local db_user_count
+    db_user_count=$(jq -r --arg c xray --arg p "$proto" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then [$cfg[].users[]?] | length
+        else [$cfg.users[]?] | length end
+    ' "$DB_FILE" 2>/dev/null)
+    if [[ -n "$db_user_count" && "$db_user_count" -gt 0 && ( -z "$users" || "$users" == "[]" ) ]]; then
+        echo "[]"
+        return
+    fi
     if [[ -z "$users" ]]; then
         # 尝试从配置中获取默认 UUID（支持多端口数组）
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             # 检查是否为数组
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                # 多端口：任一实例已进入显式 users 管理时，不回退合成默认用户。
+                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 # 多端口：优先按端口过滤，其次取第一个端口的 uuid
                 local uuid=""
                 if [[ -n "$filter_port" ]]; then
@@ -615,7 +735,11 @@ gen_xray_vless_clients() {
                     return
                 fi
             else
-                # 单端口
+                # 单端口：显式 users 表（包括全禁用/过期）不再回退顶层 UUID。
+                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 local uuid=$(echo "$config" | jq -r '.uuid // empty')
                 if [[ -n "$uuid" ]]; then
                     if [[ -n "$flow" ]]; then
@@ -655,13 +779,22 @@ gen_xray_vmess_clients() {
     local proto="$1"
     
     local users=$(db_get_users_stats "xray" "$proto")
+    if [[ "$users" == "[]" ]]; then echo "[]"; return; fi
     if [[ -z "$users" ]]; then
         # 尝试从配置中获取默认 UUID（支持多端口数组）
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 local uuid=$(echo "$config" | jq -r '.[0].uuid // empty')
             else
+                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 local uuid=$(echo "$config" | jq -r '.uuid // empty')
             fi
             if [[ -n "$uuid" ]]; then
@@ -688,13 +821,22 @@ gen_xray_trojan_clients() {
     local proto="$1"
     
     local users=$(db_get_users_stats "xray" "$proto")
+    if [[ "$users" == "[]" ]]; then echo "[]"; return; fi
     if [[ -z "$users" ]]; then
         # 尝试从配置中获取默认 password（支持多端口数组）
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 local password=$(echo "$config" | jq -r '.[0].password // empty')
             else
+                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 local password=$(echo "$config" | jq -r '.password // empty')
             fi
             if [[ -n "$password" ]]; then
@@ -722,6 +864,7 @@ gen_xray_ss2022_clients() {
     local proto="$1"
     
     local users=$(db_get_users_stats "xray" "$proto")
+    [[ "$users" == "[]" ]] && { echo "[]"; return; }
     if [[ -z "$users" ]]; then
         # SS2022 多用户模式必须有 users 数组，返回空
         echo "[]"
@@ -744,15 +887,24 @@ gen_xray_socks_accounts() {
     local proto="$1"
     
     local users=$(db_get_users_stats "xray" "$proto")
+    if [[ "$users" == "[]" ]]; then echo "[]"; return; fi
     if [[ -z "$users" ]]; then
         # 尝试从配置中获取默认账号（支持多端口数组）
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             local username password
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 username=$(echo "$config" | jq -r '.[0].username // empty')
                 password=$(echo "$config" | jq -r '.[0].password // empty')
             else
+                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                    echo "[]"
+                    return
+                fi
                 username=$(echo "$config" | jq -r '.username // empty')
                 password=$(echo "$config" | jq -r '.password // empty')
             fi
@@ -931,9 +1083,9 @@ db_get_user_field() {
         if $cfg == null then
             empty
         elif ($cfg | type) == "array" then
-            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0][$f] // empty
+            [$cfg[].users // [] | .[] | select(.name == $n)] | .[0][$f] | if . == null then empty else . end
         else
-            ($cfg.users // [] | map(select(.name == $n)) | .[0][$f]) // empty
+            ($cfg.users // [] | map(select(.name == $n)) | .[0][$f]) | if . == null then empty else . end
         end
     ' "$DB_FILE" 2>/dev/null
 }
@@ -1092,7 +1244,38 @@ db_set_user_quota() {
 db_set_user_enabled() {
     local core="$1" proto="$2" name="$3" enabled="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
+    [[ "$enabled" == "true" || "$enabled" == "false" ]] || return 1
+    # 旧单用户配置没有 users 数组，菜单显示的 default 是合成用户。
+    # 禁用前先为每个相关端口落下真实用户记录，否则写入会静默成功而凭据仍可用。
+    if [[ "$name" == "default" ]]; then
+        _db_safe_write 0 "${core}.${proto}" \
+            --arg c "$core" --arg p "$proto" '
+            def migrate:
+                if ((.users // []) | length) == 0 then
+                    (.uuid // .password // .username // empty) as $cred |
+                    if $cred != null and $cred != "" then
+                        .users = [{name:"default", uuid:$cred, enabled:true, quota:0, used:0}]
+                    else . end
+                else . end;
+            if (.[$c][$p] | type) == "array" then
+                .[$c][$p] |= map(migrate)
+            else
+                .[$c][$p] |= migrate
+            end
+        ' || return 1
+    fi
     
+    local matched
+    matched=$(jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            [$cfg[].users[]? | select(.name == $n)] | length
+        else
+            [$cfg.users[]? | select(.name == $n)] | length
+        end
+    ' "$DB_FILE" 2>/dev/null) || return 1
+    [[ "$matched" -gt 0 ]] || { _err "用户 $name 不存在"; return 1; }
+
     _db_safe_write 0 "${core}.${proto}" \
         --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
         .[$c][$p] as $cfg |
@@ -1109,9 +1292,11 @@ db_set_user_enabled() {
     
     # 自动重建配置（按核心分别重建；否则 singbox 协议的用户启用/禁用不会生效）
     if [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent" 2>/dev/null
+        rebuild_and_reload_xray "silent" 2>/dev/null || { _err "数据库已更新，但 Xray 配置或服务重载失败"; return 1; }
+    elif [[ "$core" == "singbox" ]]; then
+        rebuild_and_reload_singbox "silent" 2>/dev/null || { _err "数据库已更新，但 Sing-box 配置或服务重载失败"; return 1; }
     else
-        rebuild_and_reload_singbox "silent" 2>/dev/null
+        return 1
     fi
 }
 
@@ -1591,7 +1776,7 @@ db_get_users_stats() {
             # 多端口数组
             $cfg[] | . as $port_cfg |
             if (.users | length) > 0 then
-                .users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\($port_cfg.port)|\(.routing // "")|\(.expire_date // "")"
+                .users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(if .enabled == null then true else .enabled end)|\($port_cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif (.uuid != null or .password != null or .username != null) then
                 # 无 users 数组，生成默认用户（与 Xray email 格式一致使用 "default"）
                 "default|\(.uuid // .password // .username)|0|0|true|\(.port)||"
@@ -1601,7 +1786,7 @@ db_get_users_stats() {
         else
             # 单端口对象
             if ($cfg.users | length) > 0 then
-                $cfg.users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(.enabled // true)|\($cfg.port)|\(.routing // "")|\(.expire_date // "")"
+                $cfg.users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(if .enabled == null then true else .enabled end)|\($cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif ($cfg.uuid != null or $cfg.password != null or $cfg.username != null) then
                 "default|\($cfg.uuid // $cfg.password // $cfg.username)|0|0|true|\($cfg.port)||"
             else
@@ -2304,69 +2489,6 @@ _is_real_cert() {
     [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]
 }
 
-# 确保 Nginx HTTPS 监听存在 (真实域名模式，供 Reality dest 回落)
-# 用法: _ensure_nginx_https_for_reality "domain.com"
-_ensure_nginx_https_for_reality() {
-    local domain="$1"
-    local nginx_https_port=8443
-    local nginx_conf=""
-    
-    # 确定 nginx 配置文件路径 (Alpine http.d 优先)
-    if [[ -d "/etc/nginx/http.d" ]]; then
-        nginx_conf="/etc/nginx/http.d/vless-reality-https.conf"
-    elif [[ -d "/etc/nginx/sites-available" ]]; then
-        nginx_conf="/etc/nginx/sites-available/vless-reality-https"
-    elif [[ -d "/etc/nginx/conf.d" ]]; then
-        nginx_conf="/etc/nginx/conf.d/vless-reality-https.conf"
-    else
-        return 1
-    fi
-    
-    # 检查 8443 端口是否已被 nginx 监听
-    if ss -tln 2>/dev/null | grep -q ":${nginx_https_port} "; then
-        # 端口已被占用，检查是否是我们的配置
-        [[ -f "$nginx_conf" ]] && return 0
-    fi
-    
-    # 确保 nginx 已安装
-    if ! command -v nginx &>/dev/null; then
-        return 1
-    fi
-    
-    # 生成 HTTPS 配置 (供 Reality dest 回落)
-    cat > "$nginx_conf" << EOF
-# Reality 回落后端 (真实域名模式) - 供 Reality dest 使用
-# 此配置由脚本自动生成，请勿手动修改
-server {
-    listen 127.0.0.1:${nginx_https_port} ssl http2;
-    server_name ${domain};
-    
-    ssl_certificate $CFG/certs/server.crt;
-    ssl_certificate_key $CFG/certs/server.key;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    
-    root /var/www/html;
-    index index.html;
-    
-    location / {
-        try_files \$uri \$uri/ =404;
-    }
-    
-    server_tokens off;
-}
-EOF
-    
-    # 如果是 sites-available 模式，创建软链接
-    if [[ "$nginx_conf" == *"sites-available"* ]]; then
-        ln -sf "$nginx_conf" "/etc/nginx/sites-enabled/vless-reality-https" 2>/dev/null
-    fi
-    
-    # 重载 nginx
-    nginx -t &>/dev/null && nginx -s reload &>/dev/null
-    return 0
-}
-
 # 配置 Nginx 反代 XHTTP (h2c 模式，用于 TLS+CDN)
 # 用法: _setup_nginx_xhttp_proxy "domain.com" "18080" "/xhttp_path"
 _setup_nginx_xhttp_proxy() {
@@ -2584,7 +2706,7 @@ init_log() {
             tail -n 1000 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null
         fi
     fi
-    _log "INFO" "========== 脚本启动 v${VERSION} =========="
+    _log "INFO" "========== vless-aio-hardened 脚本启动（${RELEASE_CHANNEL}） =========="
 }
 
 # timeout 兼容函数（某些精简系统可能没有 timeout 命令）
@@ -2871,9 +2993,20 @@ generate_xray_config() {
     [[ -z "$xray_protocols" ]] && return 1
     
     mkdir -p "$CFG"
+    # Replace stale generated configuration before rebuilding. If all proxy users are
+    # disabled, the final file must not retain clients from the previous generation.
+    rm -f "$CFG/config.json"
     
-    # 确保日志目录存在
-    mkdir -p /var/log/xray
+    # 日志根目录：隔离测试用 VLESS_TEST_LOG_ROOT 重定向到临时目录；未设置或空串时回退 /var/log。
+    # 先算一次、再复用同一个变量，避免“目录建在一处、配置指向另一处”这类不一致。
+    # 相对路径会让脚本（mkdir 按脚本 cwd）与 Xray（按自身 cwd 打开文件）错位，故直接拒绝。
+    if [[ -n "${VLESS_TEST_LOG_ROOT:-}" && "${VLESS_TEST_LOG_ROOT}" != /* ]]; then
+        _err "VLESS_TEST_LOG_ROOT 必须是绝对路径：$VLESS_TEST_LOG_ROOT"
+        return 1
+    fi
+    local log_root="${VLESS_TEST_LOG_ROOT:-/var/log}/xray"
+    # fail-fast：目录建不出来就在生成期报错，而不是产出指向不存在目录的 config.json、等 Xray 启动期才炸。
+    mkdir -p "$log_root" || { _err "无法创建日志目录：$log_root"; return 1; }
     
     # 读取直连出口 IP 版本设置（默认 AsIs）
     local direct_ip_version="as_is"
@@ -3190,8 +3323,8 @@ generate_xray_config() {
         # 添加 api outbound
         outbounds=$(echo "$outbounds" | jq '. + [{protocol: "blackhole", tag: "api"}]')
         
-        jq -n --argjson outbounds "$outbounds" --argjson balancers "$balancers" '{
-            log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
+        jq -n --arg logroot "$log_root" --argjson outbounds "$outbounds" --argjson balancers "$balancers" '{
+            log: {loglevel: "warning", access: ($logroot + "/access.log"), error: ($logroot + "/error.log")},
             api: {tag: "api", services: ["StatsService"]},
             stats: {},
             policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
@@ -3334,8 +3467,8 @@ generate_xray_config() {
             user_outbounds=$(echo "$user_outbounds" | jq '. + [{protocol: "blackhole", tag: "api"}]')
             
             # 生成包含用户路由的配置
-            jq -n --argjson outbounds "$user_outbounds" --argjson balancers "$user_balancers" --argjson rules "$all_rules" '{
-                log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
+            jq -n --arg logroot "$log_root" --argjson outbounds "$user_outbounds" --argjson balancers "$user_balancers" --argjson rules "$all_rules" '{
+                log: {loglevel: "warning", access: ($logroot + "/access.log"), error: ($logroot + "/error.log")},
                 api: {tag: "api", services: ["StatsService"]},
                 stats: {},
                 policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
@@ -3360,8 +3493,8 @@ generate_xray_config() {
                 # routing 规则将在 inbound 添加完成后统一添加
                 local all_outbounds=$(echo "[$direct_outbound, {\"protocol\": \"blackhole\", \"tag\": \"block\"}, {\"protocol\": \"blackhole\", \"tag\": \"blocked\"}]" | jq --argjson ip_outs "$ip_routing_outbounds" '. + $ip_outs + [{protocol: "blackhole", tag: "api"}]')
                 
-                jq -n --argjson outbounds "$all_outbounds" '{
-                    log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
+                jq -n --arg logroot "$log_root" --argjson outbounds "$all_outbounds" '{
+                    log: {loglevel: "warning", access: ($logroot + "/access.log"), error: ($logroot + "/error.log")},
                     api: {tag: "api", services: ["StatsService"]},
                     stats: {},
                     policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
@@ -3375,8 +3508,8 @@ generate_xray_config() {
                 }' > "$CFG/config.json"
             else
                 # 无任何路由规则，使用简单直连配置（仍需要 API 规则 + 默认拦截规则）
-                jq -n --argjson direct "$direct_outbound" '{
-                    log: {loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log"},
+                jq -n --arg logroot "$log_root" --argjson direct "$direct_outbound" '{
+                    log: {loglevel: "warning", access: ($logroot + "/access.log"), error: ($logroot + "/error.log")},
                     api: {tag: "api", services: ["StatsService"]},
                     stats: {},
                     policy: {levels: {"0": {statsUserUplink: true, statsUserDownlink: true}}},
@@ -3432,7 +3565,7 @@ generate_xray_config() {
             if [[ $port_success -gt 0 ]]; then
                 ((success_count++))
             else
-                _warn "协议 $p 配置生成失败，跳过"
+                _warn "协议 $p 所有端口均已跳过或生成失败"
                 failed_protocols+="$p "
             fi
         else
@@ -3448,6 +3581,10 @@ generate_xray_config() {
     
     # 检查是否至少有一个 inbound 成功添加
     if [[ $success_count -eq 0 ]]; then
+        if [[ -f "$CFG/config.json" ]] && jq -e '[.inbounds[]? | select(.tag != "api")] | length == 0' "$CFG/config.json" >/dev/null 2>&1; then
+            _warn "所有代理用户均已禁用，配置保留为无代理入站状态"
+            return 0
+        fi
         _err "没有任何协议配置成功生成"
         return 1
     fi
@@ -3458,7 +3595,7 @@ generate_xray_config() {
         return 1
     fi
     
-    # 检查 inbounds 数组是否为空
+    # 检查 inbounds 数组是否为空；所有用户都被禁用时不写入包含默认凭据的空替代配置。
     local inbound_count=$(jq '.inbounds | length' "$CFG/config.json" 2>/dev/null)
     if [[ "$inbound_count" == "0" || -z "$inbound_count" ]]; then
         _err "Xray 配置中没有有效的 inbound"
@@ -3591,26 +3728,19 @@ add_xray_inbound_v2() {
     local inbound_json=""
     local tmp_inbound=$(mktemp)
     
-    # 检测是否使用真实证书 (Reality 需要特殊处理 dest)
+    # Reality 的 target 必须是可独立完成 TLS 握手的外部站点。
+    # 本机证书域名只用于可选订阅服务；不能把 target 隐式改到固定的
+    # 127.0.0.1:8443，否则多端口场景会指回另一个 Xray inbound，并把
+    # VLESS 数据面错误地绑定到默认关闭的 Nginx。
     local reality_dest="${sni}:443"
-    local cert_domain=""
-    [[ -f "$CFG/cert_domain" ]] && cert_domain=$(cat "$CFG/cert_domain")
-    
-    # 只有 Reality 协议需要处理 dest 回落，其他协议不需要
-    if [[ "$base_protocol" == "vless" && -n "$cert_domain" && "$sni" == "$cert_domain" ]] && _is_real_cert; then
-        # 真实证书模式，dest 必须指向本地 Nginx HTTPS (固定 8443)
-        reality_dest="127.0.0.1:8443"
-        
-        # 确保 Nginx HTTPS 监听存在 (真实域名模式)
-        _ensure_nginx_https_for_reality "$cert_domain"
-    fi
     
     case "$base_protocol" in
         vless)
             # VLESS+Reality - 使用 jq 安全构建 (支持 WS 回落)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
+            # 空 clients 代表该端口全部用户已禁用；不得从顶层 uuid 恢复默认凭据。
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VLESS inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             jq -n \
                 --argjson port "$port" \
@@ -3651,7 +3781,8 @@ add_xray_inbound_v2() {
             # VLESS-Vision - 使用 jq 安全构建
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "xtls-rprx-vision" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"flow\":\"xtls-rprx-vision\"}]"
+            # 空 clients 代表该端口全部用户已禁用；不得从顶层 uuid 恢复默认凭据。
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VLESS inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             jq -n \
                 --argjson port "$port" \
@@ -3687,7 +3818,8 @@ add_xray_inbound_v2() {
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             # vless-ws 不需要 flow
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            # 空 clients 代表该端口全部用户已禁用；不得从顶层 uuid 恢复默认凭据。
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VLESS inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             if [[ "$has_master" == "true" ]]; then
                 # 回落模式：监听本地
@@ -3747,7 +3879,8 @@ add_xray_inbound_v2() {
         vless-ws-notls)
             # VLESS-WS 无 TLS - 专为 CF Tunnel 设计
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            # 空 clients 代表该端口全部用户已禁用；不得从顶层 uuid 恢复默认凭据。
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VLESS inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             # 从数据库获取 host 配置
             local host=$(db_get_field "xray" "$base_protocol" "host")
@@ -3777,7 +3910,8 @@ add_xray_inbound_v2() {
         vless-xhttp)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            # 空 clients 代表该端口全部用户已禁用；不得从顶层 uuid 恢复默认凭据。
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VLESS inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             jq -n \
                 --argjson port "$port" \
@@ -3818,7 +3952,8 @@ add_xray_inbound_v2() {
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vless_clients "$base_protocol" "" "$port")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\"}]"
+            # 空 clients 代表该端口全部用户已禁用；不得从顶层 uuid 恢复默认凭据。
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VLESS inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             jq -n \
                 --argjson port "$internal_port" \
@@ -3842,7 +3977,7 @@ add_xray_inbound_v2() {
         vmess-ws)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_vmess_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"id\":\"$uuid\",\"email\":\"default@${base_protocol}\",\"alterId\":0}]"
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VMess inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             if [[ "$has_master" == "true" ]]; then
                 jq -n \
@@ -3894,7 +4029,7 @@ add_xray_inbound_v2() {
         trojan)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_trojan_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "Trojan inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             jq -n \
                 --argjson port "$port" \
@@ -3926,7 +4061,7 @@ add_xray_inbound_v2() {
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
             local clients=$(gen_xray_trojan_clients "$base_protocol")
-            [[ -z "$clients" || "$clients" == "[]" ]] && clients="[{\"password\":\"$password\",\"email\":\"default@${base_protocol}\"}]"
+            if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "Trojan inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             # Trojan-WS 作为回落协议或独立运行
             if _has_master_protocol; then
@@ -4153,7 +4288,7 @@ _get_query_param() {
 _header() {
     clear; echo "" >&2
     _dline
-    echo -e "      ${W}多协议代理${NC} ${D}一键部署${NC} ${C}v${VERSION}${NC} ${Y}[服务端]${NC}" >&2
+    echo -e "      ${W}vless-aio-hardened${NC} ${D}多协议代理一键部署${NC} ${C}${RELEASE_CHANNEL}${NC} ${Y}[服务端]${NC}" >&2
     echo -e "      ${D}作者: ${AUTHOR}  快捷命令: vless${NC}" >&2
     echo -e "      ${D}${REPO_URL}${NC}" >&2
     _dline
@@ -4358,46 +4493,68 @@ ensure_dual_stack_listen() {
 # 核心功能：强力清理 & 时间同步
 #═══════════════════════════════════════════════════════════════════════════════
 force_cleanup() {
-    # 停止所有 vless 相关服务
+    # 只通过本项目的 vless-* 服务边界停止进程。裸 killall/pkill 会误杀同机其它实例。
     local services="watchdog reality hy2 tuic snell snell-v5 anytls singbox"
     services+=" snell-shadowtls snell-v5-shadowtls ss2022-shadowtls"
     services+=" snell-shadowtls-backend snell-v5-shadowtls-backend ss2022-shadowtls-backend"
     for s in $services; do svc stop "vless-$s" 2>/dev/null; done
-    
-    killall xray sing-box snell-server snell-server-v5 anytls-server shadow-tls 2>/dev/null
-    
-    # 清理 iptables NAT 规则
+
+    # 只删除能由数据库精确归属到本项目的端口跳跃规则。
     cleanup_hy2_nat_rules
 }
 
-# 清理 Hysteria2/TUIC 端口跳跃 NAT 规则
+# 清理 Hysteria2/TUIC 端口跳跃 NAT 规则。
+# DB 缺失或配置无效时 fail closed；不枚举、不删除其它应用的 REDIRECT 规则。
 cleanup_hy2_nat_rules() {
-    # 清理 Hysteria2 端口跳跃规则
-    if db_exists "singbox" "hy2"; then
-        local port=$(db_get_field "singbox" "hy2" "port")
-        local hs=$(db_get_field "singbox" "hy2" "hop_start"); hs="${hs:-20000}"
-        local he=$(db_get_field "singbox" "hy2" "hop_end"); he="${he:-50000}"
-        [[ -n "$port" ]] && {
-            iptables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-        }
-    fi
-    # 清理 TUIC 端口跳跃规则
-    if db_exists "singbox" "tuic"; then
-        local port=$(db_get_field "singbox" "tuic" "port")
-        local hs=$(db_get_field "singbox" "tuic" "hop_start"); hs="${hs:-20000}"
-        local he=$(db_get_field "singbox" "tuic" "hop_end"); he="${he:-50000}"
-        [[ -n "$port" ]] && {
-            iptables -t nat -D PREROUTING -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-            iptables -t nat -D OUTPUT -p udp --dport ${hs}:${he} -j REDIRECT --to-ports ${port} 2>/dev/null
-        }
-    fi
-    # 兜底清理
-    for chain in PREROUTING OUTPUT; do
-        iptables -t nat -S $chain 2>/dev/null | grep -E "REDIRECT.*--to-ports" | while read -r rule; do
-            eval "iptables -t nat $(echo "$rule" | sed 's/^-A/-D/')" 2>/dev/null
-        done
+    [[ -f "$DB_FILE" ]] || return 0
+
+    local only_proto="${1:-}" only_port="${2:-}"
+    local proto config row port hs he family chain
+    for proto in hy2 tuic; do
+        [[ -z "$only_proto" || "$proto" == "$only_proto" ]] || continue
+        config=$(jq -c --arg p "$proto" '.singbox[$p] // empty' "$DB_FILE" 2>/dev/null) || continue
+        [[ -n "$config" && "$config" != "null" ]] || continue
+
+        if jq -e 'type == "array"' <<< "$config" >/dev/null 2>&1; then
+            while IFS= read -r row; do
+                [[ -n "$row" ]] || continue
+                port=$(jq -r '.port // empty' <<< "$row")
+                [[ -z "$only_port" || "$port" == "$only_port" ]] || continue
+                hs=$(jq -r '.hop_start // 20000' <<< "$row")
+                he=$(jq -r '.hop_end // 50000' <<< "$row")
+                [[ "$(jq -r '.hop_enable // 0' <<< "$row")" == "1" ]] || continue
+                [[ "$port" =~ ^[0-9]+$ && "$hs" =~ ^[0-9]+$ && "$he" =~ ^[0-9]+$ && "$hs" -lt "$he" ]] || continue
+                for family in iptables ip6tables; do
+                    command -v "$family" >/dev/null 2>&1 || continue
+                    for chain in PREROUTING OUTPUT; do
+                        "$family" -t nat -D "$chain" -p udp --dport "${hs}:${he}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+                    done
+                done
+            done < <(jq -c '.[]' <<< "$config")
+        else
+            port=$(jq -r '.port // empty' <<< "$config")
+            [[ -z "$only_port" || "$port" == "$only_port" ]] || continue
+            hs=$(jq -r '.hop_start // 20000' <<< "$config")
+            he=$(jq -r '.hop_end // 50000' <<< "$config")
+            [[ "$(jq -r '.hop_enable // 0' <<< "$config")" == "1" ]] || continue
+            [[ "$port" =~ ^[0-9]+$ && "$hs" =~ ^[0-9]+$ && "$he" =~ ^[0-9]+$ && "$hs" -lt "$he" ]] || continue
+            for family in iptables ip6tables; do
+                command -v "$family" >/dev/null 2>&1 || continue
+                for chain in PREROUTING OUTPUT; do
+                    "$family" -t nat -D "$chain" -p udp --dport "${hs}:${he}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+                done
+            done
+        fi
     done
+}
+
+# HY2/TUIC 的证书目录属于整个协议，而不是某一个端口实例。
+# 只有数据库确认该协议已不存在时才允许删除。
+cleanup_protocol_cert_if_unused() {
+    local proto="$1"
+    case "$proto" in hy2|tuic) ;; *) return 1 ;; esac
+    db_exists "singbox" "$proto" && return 0
+    rm -rf -- "$CFG/certs/$proto"
 }
 
 sync_time() {
@@ -4990,8 +5147,13 @@ diagnose_certificate() {
     echo ""
 }
 
-# 创建伪装网页
+# 创建伪装网页（仅供菜单 6 显式启用订阅时调用）
 create_fake_website() {
+    if [[ "${SUBSCRIPTION_EXPLICIT_ENABLE:-false}" != "true" ]]; then
+        _err "拒绝隐式配置 Nginx；请从主菜单 6 显式启用订阅服务"
+        return 1
+    fi
+
     local domain="$1"
     local protocol="$2"
     local custom_nginx_port="$3"  # 新增：自定义 Nginx 端口
@@ -5021,37 +5183,11 @@ create_fake_website() {
     # 同时删除可能冲突的 vless-sub.conf (包括 http.d 目录)
     rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf 2>/dev/null
     
-    # 创建网页目录
-    mkdir -p "$web_dir"
-    
-    # 创建简单的伪装网页
-    cat > "$web_dir/index.html" << 'EOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        p { color: #666; line-height: 1.6; }
-        .footer { text-align: center; margin-top: 40px; color: #999; font-size: 14px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Welcome to Our Website</h1>
-        <p>This is a simple website hosted on our server. We provide various web services and solutions for our clients.</p>
-        <p>Our team is dedicated to delivering high-quality web hosting and development services. Feel free to contact us for more information about our services.</p>
-        <div class="footer">
-            <p>&copy; 2024 Web Services. All rights reserved.</p>
-        </div>
-    </div>
-</body>
-</html>
-EOF
+    # 共享 Web root 不得覆盖既存首页；仅在路径原先不存在时创建并登记 placeholder。
+    create_webroot_placeholder || {
+        _err "无法安全创建伪装网页"
+        return 1
+    }
     
     # 检查是否有SSL证书，决定使用Nginx
     if [[ -n "$domain" ]] && [[ -f "/etc/vless-reality/certs/server.crt" ]]; then
@@ -5285,25 +5421,28 @@ server {
 EOF
         fi
         
-        # 如果使用 sites-available 模式，创建软链接
+        # 如果使用 sites-available 模式，只启用本项目站点；不删除默认/第三方站点。
         if [[ "$nginx_conf_dir" == "/etc/nginx/sites-available" ]]; then
             mkdir -p /etc/nginx/sites-enabled
-            rm -f /etc/nginx/sites-enabled/default
             ln -sf "$nginx_conf_file" /etc/nginx/sites-enabled/vless-fake
         fi
         
         # 测试Nginx配置
         _info "配置Nginx并启动Web服务..."
         if nginx -t 2>/dev/null; then
-            # 强制重启 Nginx 确保新配置生效（直接用 systemctl，更可靠）
+            # 显式启用场景也保护共享服务：已运行则 reload，未运行才 start。
             if [[ "$DISTRO" == "alpine" ]]; then
-                rc-service nginx stop 2>/dev/null
-                sleep 1
-                rc-service nginx start 2>/dev/null
+                if rc-service nginx status >/dev/null 2>&1; then
+                    rc-service nginx reload 2>/dev/null
+                else
+                    rc-service nginx start 2>/dev/null
+                fi
             else
-                systemctl stop nginx 2>/dev/null
-                sleep 1
-                systemctl start nginx 2>/dev/null
+                if systemctl is-active --quiet nginx 2>/dev/null; then
+                    systemctl reload nginx 2>/dev/null
+                else
+                    systemctl start nginx 2>/dev/null
+                fi
             fi
             sleep 1
             
@@ -5829,38 +5968,83 @@ install_acme_tool() {
     return 1
 }
 
-# 确保 ACME 账户邮箱有效（避免 example.com 被拒）
+# 确保 ACME 账户邮箱可用。example.com 是保留示例域，公开 CA 会拒绝。
 ensure_acme_account_email() {
     local acme_sh="$1"
     local account_conf="$HOME/.acme.sh/account.conf"
     local current_email=""
-    
+    local account_email="${ACME_ACCOUNT_EMAIL:-$ACME_DEFAULT_EMAIL}"
+
     if [[ -f "$account_conf" ]]; then
         current_email=$(grep -E "^ACCOUNT_EMAIL=" "$account_conf" | head -1 | sed -E "s/^ACCOUNT_EMAIL=['\"]?([^'\"]*)['\"]?$/\1/")
     fi
-    
-    if [[ -z "$current_email" || "$current_email" == *"example.com"* ]]; then
-        echo ""
-        _info "设置 ACME 账户邮箱为默认值: $ACME_DEFAULT_EMAIL"
-        if [[ -f "$account_conf" ]]; then
-            if grep -q "^ACCOUNT_EMAIL=" "$account_conf"; then
-                sed -i "s/^ACCOUNT_EMAIL=.*/ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'/" "$account_conf"
-            else
-                echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" >> "$account_conf"
-            fi
-        else
-            mkdir -p "$HOME/.acme.sh"
-            echo "ACCOUNT_EMAIL='$ACME_DEFAULT_EMAIL'" > "$account_conf"
-        fi
-        
-        if ! ACCOUNT_EMAIL="$ACME_DEFAULT_EMAIL" "$acme_sh" --register-account -m "$ACME_DEFAULT_EMAIL" >/dev/null 2>&1; then
-            _err "ACME 账户注册失败，请检查网络或稍后重试"
+
+    if [[ -n "$current_email" && "$current_email" != *"@example.com" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$account_email" || "$account_email" == *"@example.com" ]]; then
+        _warn "未配置有效 ACME 联系邮箱；将使用 Let's Encrypt 无邮箱账户"
+        if ! "$acme_sh" --register-account --server letsencrypt >/dev/null 2>&1; then
+            _err "ACME 账户注册失败，请设置 ACME_ACCOUNT_EMAIL 后重试"
             return 1
         fi
-        _ok "ACME 账户邮箱已更新: $ACME_DEFAULT_EMAIL"
+        return 0
     fi
-    
+
+    _info "正在更新 ACME 联系邮箱..."
+    if ! ACCOUNT_EMAIL="$account_email" "$acme_sh" --register-account --server letsencrypt -m "$account_email" >/dev/null 2>&1; then
+        _err "ACME 账户注册失败，请检查邮箱或稍后重试"
+        return 1
+    fi
+    _ok "ACME 联系邮箱已更新"
     return 0
+}
+
+# Cloudflare token active 不代表能访问目标 zone；先只读验证状态与 zone 可见性。
+_preflight_cloudflare_token() {
+    local domain="$1"
+    local token="$2"
+    local response=""
+    local zone="$domain"
+    local labels=0
+
+    [[ -n "$token" ]] || { _err "Cloudflare Token 不能为空"; return 1; }
+    command -v jq >/dev/null 2>&1 || { _err "Cloudflare Token 预检需要 jq"; return 1; }
+
+    response=$(curl -fsS --connect-timeout "$CURL_TIMEOUT_FAST" --max-time "$CURL_TIMEOUT_NORMAL" \
+        -H "Authorization: Bearer $token" \
+        -H "Accept: application/json" \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || {
+        _err "Cloudflare Token 验证请求失败"
+        return 1
+    }
+    if [[ $(jq -r '.success == true and .result.status == "active"' <<< "$response" 2>/dev/null) != true ]]; then
+        _err "Cloudflare Token 无效或已停用"
+        return 1
+    fi
+
+    while [[ "$zone" == *.* ]]; do
+        labels=$(awk -F. '{print NF}' <<< "$zone")
+        (( labels >= 2 )) || break
+        response=$(curl -fsS --get --connect-timeout "$CURL_TIMEOUT_FAST" --max-time "$CURL_TIMEOUT_NORMAL" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/json" \
+            --data-urlencode "name=$zone" \
+            "https://api.cloudflare.com/client/v4/zones" 2>/dev/null) || {
+            _err "Cloudflare zone 查询失败"
+            return 1
+        }
+        if [[ $(jq -r --arg zone "$zone" '.success == true and any(.result[]?; .name == $zone)' <<< "$response" 2>/dev/null) == true ]]; then
+            _ok "Cloudflare Token 可访问目标 zone: $zone"
+            return 0
+        fi
+        zone="${zone#*.}"
+    done
+
+    _err "Cloudflare Token 虽为 active，但无权访问 $domain 所属 zone"
+    _warn "请创建包含 Zone:DNS:Edit 与 Zone:Zone:Read、且覆盖该域名 zone 的 Token"
+    return 1
 }
 
 # DNS-01 验证申请证书
@@ -5893,8 +6077,10 @@ _issue_cert_dns() {
             echo -e "  ${D}https://dash.cloudflare.com/profile/api-tokens${NC}"
             echo -e "  ${D}创建 Token 时选择 'Edit zone DNS' 模板${NC}"
             echo ""
-            read -rp "  请输入 CF_Token: " cf_token
+            read -rsp "  请输入 CF_Token: " cf_token
+            echo ""
             [[ -z "$cf_token" ]] && { _err "Token 不能为空"; return 1; }
+            _preflight_cloudflare_token "$domain" "$cf_token" || return 1
             dns_api="dns_cf"
             dns_env="CF_Token=$cf_token"
             ;;
@@ -5939,40 +6125,50 @@ _issue_cert_dns() {
     _info "正在通过 DNS 验证申请证书..."
     echo ""
     
-    # 设置环境变量并申请证书
+    # 设置环境变量并申请证书。保留 acme.sh 自身返回码；grep/sed 只负责展示，
+    # 否则无匹配行或过滤成功会把真实签发失败误判为成功。
     eval "export $dns_env"
-    
+
     local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt"
-    
-    if "$acme_sh" --issue -d "$domain" --dns "$dns_api" --force 2>&1 | tee /tmp/acme_dns.log | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
+    local acme_rc=0
+
+    "$acme_sh" --issue -d "$domain" --dns "$dns_api" --server letsencrypt --force \
+        > /tmp/acme_dns.log 2>&1
+    acme_rc=$?
+    grep -E "^\[|Verify finished|Cert success|error|Error" /tmp/acme_dns.log | sed 's/^/  /' || true
+
+    unset CF_Token Ali_Key Ali_Secret DP_Id DP_Key
+    cf_token=""; ali_key=""; ali_secret=""; dp_id=""; dp_key=""; dns_env=""
+
+    if [[ "$acme_rc" -eq 0 ]]; then
         echo ""
         _ok "证书申请成功，安装证书..."
-        
-        "$acme_sh" --install-cert -d "$domain" \
+
+        if ! "$acme_sh" --install-cert -d "$domain" --server letsencrypt \
             --key-file       "$cert_dir/server.key"  \
             --fullchain-file "$cert_dir/server.crt" \
-            --reloadcmd      "$reload_cmd" >/dev/null 2>&1
-        
+            --reloadcmd      "$reload_cmd" >/dev/null 2>&1; then
+            _err "证书已签发，但安装到目标目录失败"
+            rm -f /tmp/acme_dns.log
+            return 1
+        fi
+
         # 保存域名
         echo "$domain" > "$CFG/cert_domain"
-        
+
         rm -f /tmp/acme_dns.log
-        
-        # 读取自定义 nginx 端口
-        local custom_port=""
-        [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-        create_fake_website "$domain" "$protocol" "$custom_port"
-        
+
+        # 证书签发与订阅服务解耦：这里只安装证书，不自动安装/配置/启停 Nginx。
         _ok "证书已配置到 $cert_dir"
         diagnose_certificate "$domain"
         return 0
-    else
-        echo ""
-        _err "DNS 验证失败！"
-        cat /tmp/acme_dns.log 2>/dev/null | grep -E "(error|Error)" | head -3
-        rm -f /tmp/acme_dns.log
-        return 1
     fi
+
+    echo ""
+    _err "DNS 验证失败！(acme.sh rc=$acme_rc)"
+    grep -E "(error|Error|invalid|Invalid|unauthorized|Unauthorized|disallowed)" /tmp/acme_dns.log 2>/dev/null | head -5 || true
+    rm -f /tmp/acme_dns.log
+    return 1
 }
 
 # 手动 DNS 验证
@@ -6031,10 +6227,7 @@ _issue_cert_dns_manual() {
         
         echo "$domain" > "$CFG/cert_domain"
         
-        local custom_port=""
-        [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-        create_fake_website "$domain" "$protocol" "$custom_port"
-        
+        # 手动 DNS 同样只安装证书；订阅需在菜单 6 显式启用。
         _ok "证书已配置到 $cert_dir"
         echo ""
         _warn "注意: 手动 DNS 模式无法自动续期，证书到期前需要手动更新"
@@ -6062,13 +6255,7 @@ get_acme_cert() {
             if openssl x509 -in "$cert_dir/server.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
                 _ok "现有证书仍然有效（30天以上）"
                 
-                # 读取自定义 nginx 端口（如果有）
-                local custom_port=""
-                [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-                
-                # 确保Web服务器也启动（复用证书时也需要）
-                create_fake_website "$domain" "$protocol" "$custom_port"
-                
+                # 复用证书不自动触碰 Web 服务；订阅需在菜单 6 显式启用。
                 diagnose_certificate "$domain"
                 return 0
             else
@@ -6149,12 +6336,12 @@ get_acme_cert() {
     local acme_sh="$HOME/.acme.sh/acme.sh"
     ensure_acme_account_email "$acme_sh" || return 1
     
-    # 临时停止可能占用 80 端口的服务（兼容 Alpine/systemd）
-    local nginx_was_running=false
-    if svc status nginx 2>/dev/null; then
-        nginx_was_running=true
-        _info "临时停止 Nginx..."
-        svc stop nginx
+    # 默认不停止共享 Nginx。HTTP-01 standalone 要求 80 端口空闲；若已占用，
+    # 明确失败并让用户改用 DNS-01，而不是为签证书自动中断现有 Web 服务。
+    if ss -tln 2>/dev/null | grep -qE '(^|[[:space:]])(0\.0\.0\.0|\[::\]|\*|127\.0\.0\.1):80([[:space:]]|$)'; then
+        _err "80 端口已被占用，拒绝自动停止现有服务"
+        _info "请重新选择 DNS 验证，或先由管理员释放 80 端口"
+        return 1
     fi
     
     _info "正在为 $domain 申请证书 (Let's Encrypt)..."
@@ -6183,21 +6370,10 @@ get_acme_cert() {
         
         rm -f "$acme_log"
         
-        # 恢复 Nginx
-        if [[ "$nginx_was_running" == "true" ]]; then
-            svc start nginx
-        fi
-        
         _ok "证书已配置到 $cert_dir"
         _ok "证书自动续期已启用 (60天后)"
         
-        # 读取自定义 nginx 端口（如果有）
-        local custom_port=""
-        [[ -f "$CFG/.nginx_port_tmp" ]] && custom_port=$(cat "$CFG/.nginx_port_tmp")
-        
-        # 创建简单的伪装网页
-        create_fake_website "$domain" "$protocol" "$custom_port"
-        
+        # 证书路径不自动创建伪装页或订阅 Nginx；菜单 6 是唯一启用入口。
         # 验证证书文件
         if [[ -f "$cert_dir/server.crt" && -f "$cert_dir/server.key" ]]; then
             _ok "证书文件验证通过"
@@ -6211,11 +6387,6 @@ get_acme_cert() {
         return 0
     else
         echo ""
-        # 恢复 Nginx
-        if [[ "$nginx_was_running" == "true" ]]; then
-            svc start nginx
-        fi
-        
         _err "证书申请失败！"
         echo ""
         _err "详细错误信息："
@@ -6250,7 +6421,7 @@ get_acme_cert() {
             2)
                 # DNS 验证模式
                 _info "切换到 DNS 验证模式..."
-                get_acme_cert_dns "$domain" "$protocol"
+                _issue_cert_dns "$domain" "$cert_dir" "$protocol"
                 return $?
                 ;;
             3)
@@ -6267,16 +6438,14 @@ get_acme_cert() {
     fi
 }
 
-# 检测并设置证书和 Nginx 配置（统一入口）
-# 返回: 0=成功（有证书和Nginx），1=失败（无证书或用户取消）
-# 设置全局变量: CERT_DOMAIN, NGINX_PORT
+# 检测并设置协议证书（订阅/Nginx 默认关闭）
+# 返回: 0=证书可用或协议无需证书，1=失败/回退，2=用户取消
+# 设置全局变量: CERT_DOMAIN；订阅只能从菜单 6 显式启用
 setup_cert_and_nginx() {
     local protocol="$1"
-    local default_nginx_port="18443"
     
     # 全局变量，供调用方使用
     CERT_DOMAIN=""
-    NGINX_PORT="$default_nginx_port"
     
     # === 回落子协议检测：如果是 WS 协议且主协议在 8443 端口，跳过 Nginx 配置 ===
     local is_fallback_mode=false
@@ -6306,12 +6475,13 @@ setup_cert_and_nginx() {
                 is_self_signed=false
             fi
             
-            # 如果是自签名证书，询问用户是否申请真实证书
-            if [[ "$is_self_signed" == "true" && "$is_fallback_mode" == "false" ]]; then
+            # 如果是自签名证书，询问用户是否申请真实证书。
+            # Reality 数据面不使用本地证书；不要为了随机 SNI 删除/替换共享证书。
+            if [[ "$is_self_signed" == "true" && "$is_fallback_mode" == "false" && "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
                 echo ""
                 _warn "检测到自签名证书 (域名: $CERT_DOMAIN)"
-                echo -e "  ${G}1)${NC} 申请真实证书 (推荐 - 订阅功能可用)"
-                echo -e "  ${G}2)${NC} 继续使用自签名证书 (订阅功能不可用)"
+                echo -e "  ${G}1)${NC} 申请真实证书 (推荐；订阅仍默认关闭)"
+                echo -e "  ${G}2)${NC} 继续使用自签名证书"
                 echo ""
                 read -rp "  请选择 [1]: " self_cert_choice
                 
@@ -6339,103 +6509,28 @@ setup_cert_and_nginx() {
                     _ok "检测到现有证书: $CERT_DOMAIN"
                     echo ""
                     echo -e "  ${Y}Reality 协议可选择:${NC}"
-                    echo -e "  ${G}1)${NC} 使用真实域名 (使用现有证书，支持订阅服务)"
+                    echo -e "  ${G}1)${NC} 使用真实域名 (仅复用证书；订阅默认关闭)"
                     echo -e "  ${G}2)${NC} 无域名模式 (使用随机 SNI，更隐蔽)"
                     echo ""
                     read -rp "  请选择 [1]: " reality_cert_choice
                     
                     if [[ "$reality_cert_choice" == "2" ]]; then
-                        # 用户选择无域名模式，清除证书域名变量和旧证书
+                        # 随机 SNI 只影响本次 Reality 配置；保留共享证书和 cert_domain，
+                        # 避免破坏其它 TLS 协议、续期或用户之后显式启用的订阅。
                         CERT_DOMAIN=""
-                        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
-                        _info "将使用随机 SNI (无域名模式)"
+                        _info "将使用随机 SNI；现有证书保持不变"
                         return 0
                     fi
-                    # 继续使用真实证书，标记SNI已确定，避免ask_sni_config再次询问
+                    # 使用证书域名作为 Reality SNI；这不会启用订阅或触碰 Nginx。
                     REALITY_SNI_CONFIRMED="$CERT_DOMAIN"
                 fi
                 
-                # 读取已有的订阅配置
-                if [[ -f "$CFG/sub.info" ]]; then
-                    source "$CFG/sub.info" 2>/dev/null
-                    NGINX_PORT="${sub_port:-$default_nginx_port}"
-                    
-                    # Reality 协议使用真实域名时，必须用 HTTPS 端口，不能用 80
-                    if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
-                        if [[ "$NGINX_PORT" == "80" ]]; then
-                            NGINX_PORT="$default_nginx_port"
-                        fi
-                    fi
-                fi
-                
                 _ok "使用证书域名: $CERT_DOMAIN"
-                
-                # 检查 Nginx 配置文件是否存在 (包括 Alpine http.d)
-                local nginx_conf_exists=false
-                if [[ -f "/etc/nginx/http.d/vless-fake.conf" ]] || [[ -f "/etc/nginx/conf.d/vless-fake.conf" ]] || [[ -f "/etc/nginx/sites-available/vless-fake" ]]; then
-                    nginx_conf_exists=true
-                fi
-                
-                # 检查订阅文件是否存在
-                local sub_uuid=$(get_sub_uuid)  # 使用统一的函数获取或生成 UUID
-                local sub_files_exist=false
-                if [[ -f "$CFG/subscription/$sub_uuid/base64" ]]; then
-                    sub_files_exist=true
-                fi
-                
-                # 如果 Nginx 配置或订阅文件不存在，重新配置
-                if [[ "$nginx_conf_exists" == "false" ]] || [[ "$sub_files_exist" == "false" ]]; then
-                    _info "配置订阅服务 (端口: $NGINX_PORT)..."
-                    generate_sub_files
-                    create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
+                if [[ -f "$CFG/sub.info" ]]; then
+                    _info "现有订阅配置保持不变；可在主菜单 6 管理"
                 else
-                    # 检查 Nginx 配置是否有正确的订阅路由 (使用 alias 指向 subscription 目录)
-                    local nginx_conf_valid=false
-                    if grep -q "alias.*subscription" "/etc/nginx/http.d/vless-fake.conf" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    elif grep -q "alias.*subscription" "/etc/nginx/conf.d/vless-fake.conf" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    elif grep -q "alias.*subscription" "/etc/nginx/sites-available/vless-fake" 2>/dev/null; then
-                        nginx_conf_valid=true
-                    fi
-                    
-                    if [[ "$nginx_conf_valid" == "false" ]]; then
-                        _warn "检测到旧版 Nginx 配置，正在更新..."
-                        generate_sub_files
-                        create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
-                    fi
-                    
-                    # Reality 协议不显示 Nginx 端口（外部访问走 Reality 端口）
-                    if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
-                        _ok "订阅服务端口: $NGINX_PORT"
-                    fi
-                    
-                    # 确保订阅文件是最新的
-                    generate_sub_files
-                    
-                    # 确保 Nginx 运行
-                    if ! ss -tlnp 2>/dev/null | grep -qE ":${NGINX_PORT}\s|:${NGINX_PORT}$"; then
-                        _info "启动 Nginx 服务..."
-                        systemctl stop nginx 2>/dev/null
-                        sleep 1
-                        systemctl start nginx 2>/dev/null || rc-service nginx start 2>/dev/null
-                        sleep 1
-                    fi
-                    
-                    # 再次检查端口是否监听
-                    if ss -tlnp 2>/dev/null | grep -qE ":${NGINX_PORT}\s|:${NGINX_PORT}$"; then
-                        _ok "Nginx 服务运行正常"
-                        # Reality 协议不显示 Nginx 端口
-                        if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
-                            _ok "伪装网页: https://$CERT_DOMAIN:$NGINX_PORT"
-                        fi
-                    else
-                        _warn "Nginx 端口 $NGINX_PORT 未监听，尝试重新配置..."
-                        generate_sub_files
-                        create_fake_website "$CERT_DOMAIN" "$protocol" "$NGINX_PORT"
-                    fi
+                    _info "订阅服务保持关闭；如需启用请使用主菜单 6"
                 fi
-                
                 return 0
             fi
         fi
@@ -6467,22 +6562,14 @@ setup_cert_and_nginx() {
         
         CERT_DOMAIN="$input_domain"
         
-        # 确保配置目录存在
+        # 确保配置目录存在；证书申请不自动配置订阅/Nginx。
         mkdir -p "$CFG" 2>/dev/null
         
-        # 保存端口到临时文件，供 create_fake_website 使用
-        echo "$NGINX_PORT" > "$CFG/.nginx_port_tmp" 2>/dev/null
-        
-        # 申请证书（内部会调用 create_fake_website，会自动保存 sub.info）
         if get_acme_cert "$CERT_DOMAIN" "$protocol"; then
             echo "$CERT_DOMAIN" > "$CFG/cert_domain"
-            # 确保订阅文件存在
-            generate_sub_files
-            rm -f "$CFG/.nginx_port_tmp"
             return 0
         else
             _err "证书申请失败"
-            rm -f "$CFG/.nginx_port_tmp"
             return 1
         fi
     else
@@ -6502,24 +6589,16 @@ setup_cert_and_nginx() {
             if [[ -n "$input_domain" ]]; then
                 CERT_DOMAIN="$input_domain"
                 
-                # 确保配置目录存在
+                # 确保配置目录存在；证书申请不自动配置订阅/Nginx。
                 mkdir -p "$CFG" 2>/dev/null
                 
-                # 保存端口到临时文件，供 create_fake_website 使用
-                echo "$NGINX_PORT" > "$CFG/.nginx_port_tmp" 2>/dev/null
-                
-                # 申请证书（内部会调用 create_fake_website，会自动保存 sub.info）
                 if get_acme_cert "$CERT_DOMAIN" "$protocol"; then
                     echo "$CERT_DOMAIN" > "$CFG/cert_domain"
-                    # 确保订阅文件存在
-                    generate_sub_files
-                    rm -f "$CFG/.nginx_port_tmp"
                     return 0
                 else
                     _warn "证书申请失败，使用自签证书"
                     gen_self_cert "$CERT_DOMAIN"
                     echo "$CERT_DOMAIN" > "$CFG/cert_domain"
-                    rm -f "$CFG/.nginx_port_tmp"
                     return 1
                 fi
             fi
@@ -6782,7 +6861,8 @@ fix_selinux_context() {
 readonly GITHUB_API_PER_PAGE=10
 readonly VERSION_CACHE_DIR="/tmp/vless-version-cache"
 readonly VERSION_CACHE_TTL=3600  # 缓存1小时
-readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
+readonly SCRIPT_HASH_CACHE_FILE="$VERSION_CACHE_DIR/.script_master_sha256"
+readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_master_version"
 readonly SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 readonly SNELL_RELEASE_NOTES_ZH_URL="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell.md"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
@@ -6842,11 +6922,70 @@ _fetch_script_tmp() {
     echo "$tmp_file"
 }
 
-# 提取脚本版本号
+# 计算脚本内容哈希；滚动 master 以制品字节而不是公开版本号判断更新。
+_script_sha256() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" 2>/dev/null | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" 2>/dev/null | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
+_is_sha256() {
+    [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# 语义化版本号判定（与 3.4.10-h5 客户端同一规则，保证跨版本互认）
+_is_semver_version() {
+    [[ -n "$1" ]] && [[ "$1" =~ ^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$ ]]
+}
+
+# 从脚本文件里读取 readonly VERSION=（老客户端只认这一行）
 _extract_script_version() {
     local file="$1"
     [[ -f "$file" ]] || return 1
     grep -m1 '^readonly VERSION=' "$file" 2>/dev/null | cut -d'"' -f2
+}
+
+# 语义化版本比较：v1 > v2 返回 0；支持 <基础版本>-h<修订号>，无后缀视为最低
+_version_gt() {
+    local v1="$1" v2="$2"
+    [[ "$v1" == "$v2" ]] && return 1
+    _is_semver_version "$v1" || return 1
+    _is_semver_version "$v2" || return 1
+
+    local base1="${v1%%-h*}" rev1="${v1#*-h}"
+    local base2="${v2%%-h*}" rev2="${v2#*-h}"
+    [[ "$base1" == "$v1" ]] && rev1=-1
+    [[ "$base2" == "$v2" ]] && rev2=-1
+
+    local IFS=.
+    local i v1_arr=($base1) v2_arr=($base2)
+    unset IFS
+    for ((i=0; i<${#v1_arr[@]} || i<${#v2_arr[@]}; i++)); do
+        local n1=${v1_arr[i]:-0} n2=${v2_arr[i]:-0}
+        [[ "$n1" =~ ^[0-9]+$ ]] || n1=0
+        [[ "$n2" =~ ^[0-9]+$ ]] || n2=0
+        ((n1 > n2)) && return 0
+        ((n1 < n2)) && return 1
+    done
+
+    [[ "$rev1" =~ ^[0-9]+$ ]] || rev1=-1
+    [[ "$rev2" =~ ^[0-9]+$ ]] || rev2=-1
+    ((rev1 > rev2)) && return 0
+    return 1
+}
+
+_current_script_sha256() {
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+    _script_sha256 "$script_path"
 }
 
 # 下载脚本到指定路径
@@ -6865,162 +7004,69 @@ _download_script_to() {
     return 1
 }
 
-# 获取最新标签版本号（无缓存）
-# 获取最新 tag 版本号（回退：release 缺失时取 GitHub tags）
-_get_latest_tag_version() {
-    local repo="$1"
-    local result version
-
-    result=$(curl -sL --connect-timeout 5 --max-time 10 \
-    "https://api.github.com/repos/$repo/tags?per_page=1" 2>/dev/null)
-
-    [[ -z "$result" ]] && return 1
-
-    version=$(echo "$result" | jq -r '.[0].name // empty' 2>/dev/null | sed 's/^v//')
-
-    [[ -z "$version" ]] && return 1
-
-    echo "$version"
-}
-
-# 判断是否为语义化版本号（允许本仓 -h<修订号> 后缀）
-# 只接受纯数字段：dev / dev3 / latest / nightly 这类滚动 tag 名一律拒绝。
-_is_semver_version() {
-    [[ -n "$1" ]] && [[ "$1" =~ ^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$ ]]
-}
-
-# 从远端 master 脚本里读取 readonly VERSION=（不依赖 tag 命名）
-# 本仓 GitHub tag 是滚动名 `dev`、且未建 Release 对象，tag 名不能当版本号用；
-# 版本号的权威来源是 master 分支脚本内的 VERSION 常量本身。
-# VERSION 在第 23 行，用 HTTP Range 只取前 4KB，避免每次检查都下载整个 ~1MB 脚本。
-_get_remote_script_version_from_raw() {
-    local version="" body=""
-    body=$(curl -sL --connect-timeout 8 --max-time 15 -r 0-4095 "$SCRIPT_RAW_URL" 2>/dev/null)
-    if [[ -n "$body" ]]; then
-        version=$(printf '%s\n' "$body" | grep -m1 '^readonly VERSION=' | cut -d'"' -f2)
-    fi
-    if ! _is_semver_version "$version"; then
-        # Range 不被支持（或首 4KB 不含 VERSION）时回退为整文件下载
-        local tmp_file
-        tmp_file=$(_fetch_script_tmp 8 25) || return 1
-        [[ -z "$tmp_file" || ! -f "$tmp_file" ]] && return 1
-        version=$(_extract_script_version "$tmp_file")
-        rm -f "$tmp_file"
-    fi
-    _is_semver_version "$version" || return 1
-    echo "$version"
-}
-
-# 获取脚本最新版本号（带缓存）
-# 取值顺序：GitHub release tag → git tag → master 脚本内的 VERSION 常量。
-# 只采纳/缓存语义化版本号：历史实现把滚动 tag `dev` 当版本号，而
-# _version_gt("dev","3.4.10-h4") 走字符串比较得 "d" > "3" ⇒ 恒判为有新版本，
-# 于是每次运行都提示更新、更新完依旧提示（2026-10-30 实测故障，见 FIXES.md §十）。
-_get_latest_script_version() {
+# 获取滚动 master 制品的 SHA-256。缓存只用于菜单提示；手动更新会强制下载复核。
+_get_latest_script_hash() {
     local use_cache="${1:-true}"
     local force="${2:-false}"
-    local version="" cached_version=""
+    local cached_hash="" remote_hash="" tmp_file=""
 
     _init_version_cache
-    cached_version=$(cat "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null)
-    if _is_semver_version "$cached_version"; then
-        if [[ "$force" != "true" ]] && _is_cache_fresh "$SCRIPT_VERSION_CACHE_FILE"; then
-            echo "$cached_version"
-            return 0
-        fi
-        if [[ "$force" != "true" && "$use_cache" == "true" ]]; then
-            echo "$cached_version"
-            return 0
-        fi
-    elif [[ -n "$cached_version" ]]; then
-        # 缓存里是历史脏数据（旧版写入的 "dev"），直接丢弃后重新获取
-        rm -f "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
+    cached_hash=$(cat "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null)
+    if _is_sha256 "$cached_hash" && [[ "$force" != "true" ]] && [[ "$use_cache" == "true" ]] && _is_cache_fresh "$SCRIPT_HASH_CACHE_FILE"; then
+        printf '%s\n' "$cached_hash"
+        return 0
+    elif [[ -n "$cached_hash" ]] && ! _is_sha256 "$cached_hash"; then
+        rm -f "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null
     fi
 
-    version=$(_get_latest_version "$SCRIPT_REPO" "false" "true" 2>/dev/null)
-    if ! _is_semver_version "$version"; then
-        version=$(_get_latest_tag_version "$SCRIPT_REPO")
-    fi
-    if ! _is_semver_version "$version"; then
-        version=$(_get_remote_script_version_from_raw)
-    fi
-    _is_semver_version "$version" || return 1
+    local remote_ver=""
+    tmp_file=$(_fetch_script_tmp 8 25) || return 1
+    remote_ver=$(_extract_script_version "$tmp_file")
+    remote_hash=$(_script_sha256 "$tmp_file")
+    rm -f "$tmp_file"
+    _is_sha256 "$remote_hash" || return 1
 
-    echo "$version" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null || true
-    echo "$version"
+    printf '%s\n' "$remote_hash" > "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null || true
+    if _is_semver_version "$remote_ver"; then
+        printf '%s\n' "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null || true
+    fi
+    printf '%s\n' "$remote_hash"
 }
 
-# 语义化版本比较（v1 > v2 返回 0）
-# 支持本仓修订后缀: <上游版本>-h<修订号>，如 3.4.10-h2 > 3.4.10-h1 > 3.4.10。
-# 先比较基础版本（. 分割的数字段），相同则比较 -h 后修订号（无后缀 < 有后缀）。
-_version_gt() {
-    local v1="$1" v2="$2"
-    [[ "$v1" == "$v2" ]] && return 1
-
-    # 防御：任一侧不是语义化版本号时一律视为「不更新」。
-    # 否则下面的字符串比较会把滚动 tag 名 "dev" 判为大于 "3.4.10-h4"（"d" > "3"），
-    # 造成「永远有新版本」的死循环（2026-10-30 实测故障）。
-    _is_semver_version "$v1" || return 1
-    _is_semver_version "$v2" || return 1
-
-    # 剥离 -h<修订号> 后缀
-    local base1="${v1%%-h*}" rev1="${v1#*-h}"
-    local base2="${v2%%-h*}" rev2="${v2#*-h}"
-    [[ "$base1" == "$v1" ]] && rev1=-1   # 无后缀视为最低
-    [[ "$base2" == "$v2" ]] && rev2=-1
-
-    # 逐段比较基础版本（. 分割，数字段）
-    local IFS=.
-    local i v1_arr=($base1) v2_arr=($base2)
-    unset IFS
-    for ((i=0; i<${#v1_arr[@]} || i<${#v2_arr[@]}; i++)); do
-        local n1=${v1_arr[i]:-0} n2=${v2_arr[i]:-0}
-        # 防御：非纯数字段按字符串比较（容错异常 tag）
-        if [[ "$n1" =~ ^[0-9]+$ && "$n2" =~ ^[0-9]+$ ]]; then
-            ((n1 > n2)) && return 0
-            ((n1 < n2)) && return 1
-        else
-            [[ "$n1" > "$n2" ]] && return 0
-            [[ "$n1" < "$n2" ]] && return 1
-        fi
-    done
-
-    # 基础版本相同 → 比较本仓修订号
-    [[ "$rev1" =~ ^[0-9]+$ ]] || rev1=-1
-    [[ "$rev2" =~ ^[0-9]+$ ]] || rev2=-1
-    ((rev1 > rev2)) && return 0
-    ((rev1 < rev2)) && return 1
-    return 1
-}
-
-# 后台异步检查脚本版本（用于主菜单提示）
+# 后台异步检查滚动 master 制品（用于主菜单提示）。
 _check_script_update_async() {
     _init_version_cache
-    if _is_cache_fresh "$SCRIPT_VERSION_CACHE_FILE"; then
+    if _is_cache_fresh "$SCRIPT_HASH_CACHE_FILE"; then
         return 0
     fi
     (
-        _get_latest_script_version "false" "true" >/dev/null 2>&1 || exit 0
+        _get_latest_script_hash "false" "true" >/dev/null 2>&1 || exit 0
     ) &
 }
 
 _has_script_update() {
-    [[ -f "$SCRIPT_VERSION_CACHE_FILE" ]] || return 1
-    local remote_ver
+    [[ -f "$SCRIPT_HASH_CACHE_FILE" ]] || return 1
+    local remote_hash current_hash remote_ver
+    remote_hash=$(cat "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null)
+    current_hash=$(_current_script_sha256)
+    _is_sha256 "$remote_hash" || return 1
+    _is_sha256 "$current_hash" || return 1
+    [[ "$remote_hash" == "$current_hash" ]] && return 1
+
+    # 防降级：只有「远端版本更高」或「同版本的滚动制品字节变化」才算有更新。
+    # 远端更旧（发布回退 / 镜像滞后 / 误推旧文件）一律不提示，避免把机器静默打回旧版。
     remote_ver=$(cat "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null)
-    [[ -z "$remote_ver" ]] && return 1
-    _is_semver_version "$remote_ver" || return 1
-    _version_gt "$remote_ver" "$VERSION"
+    if _is_semver_version "$remote_ver" && _is_semver_version "$VERSION"; then
+        _version_gt "$remote_ver" "$VERSION" && return 0
+        [[ "$remote_ver" == "$VERSION" ]] && return 0
+        return 1
+    fi
+    return 1
 }
 
 _get_script_update_info() {
-    [[ -f "$SCRIPT_VERSION_CACHE_FILE" ]] || return 1
-    local remote_ver
-    remote_ver=$(cat "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null)
-    _is_semver_version "$remote_ver" || return 1
-    if _version_gt "$remote_ver" "$VERSION"; then
-        echo "$remote_ver"
-    fi
+    _has_script_update || return 1
+    printf '%s\n' "$RELEASE_CHANNEL"
 }
 
 _get_snell_versions_from_kb() {
@@ -7645,6 +7691,19 @@ _install_binary() {
     url="${url//\$\{xarch\}/$xarch}"
     url="${url//\$\{sarch\}/$sarch}"
     url="${url//\$\{aarch\}/$aarch}"
+
+    # 防御性断言：替换表之外的占位符（如 ${amd64}/${arch}/${goarch}）会静默残留字面量 `$`，
+    # 让 curl 拿到 404、用户只看到"下载失败"。这里在请求前就报出具体残留的占位符。
+    if [[ "$url" == *'$'* ]]; then
+        local _unresolved _unresolved_re='\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)'
+        if [[ "$url" =~ $_unresolved_re ]]; then
+            _unresolved="${BASH_REMATCH[0]}"
+        else
+            _unresolved='$'
+        fi
+        _err "下载 URL 含未替换的占位符 ${_unresolved}：${url}"
+        return 1
+    fi
 
     # 下载并验证
     if ! curl -fsSL --connect-timeout 60 --retry 2 -o "$tmp/pkg" "$url"; then
@@ -9119,29 +9178,16 @@ generate_singbox_config() {
                 local users_json="[]"
                 # 过滤：禁用用户 + 已过期用户（到期时间对 sing-box 协议真正生效的关键）
                 local _today=$(date '+%Y-%m-%d')
-                local db_users=$(jq -r --arg p "$proto" --arg today "$_today" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | map(select(.enabled != false))
-                          | map(select((.expire_date // "") == "" or (.expire_date // "") >= $today))
-                          | unique_by(.name)
-                    else
-                        ($cfg.users // []) | map(select(.enabled != false))
-                          | map(select((.expire_date // "") == "" or (.expire_date // "") >= $today))
-                          | unique_by(.name)
-                    end
-                ' "$DB_FILE" 2>/dev/null)
-                
-                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    # 有自定义用户，为每个用户生成 {name, password}
-                    # hy2 用户的 uuid 字段存储的是密码
-                    local default_user_json=$(jq -n --arg pw "$password" '{name: "default", password: $pw}')
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: .name, password: .uuid}))) | unique_by(.name)')
-                else
-                    # 没有自定义用户，使用默认密码
-                    users_json=$(jq -n --arg pw "$password" '[{name: "default", password: $pw}]')
-                fi
+                # 从当前端口实例取用户；显式 users 表（包括空表）不得回退顶层密码。
+                users_json=$(echo "$cfg" | jq -c --arg today "$_today" '
+                    if (.users | type) == "array" then
+                        [.users[] | select(.enabled != false) |
+                            select((.expire_date // "") == "" or .expire_date >= $today) |
+                            {name:.name, password:(.uuid // .password)}]
+                    elif (.password // "") != "" then
+                        [{name:"default", password:.password}]
+                    else [] end
+                ')
                 
                 inbound=$(jq -n \
                     --argjson port "$port" \
@@ -9175,10 +9221,19 @@ generate_singbox_config() {
                 local key_path="$CFG/certs/tuic/server.key"
                 [[ ! -f "$cert_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
                 
+                local tuic_users
+                tuic_users=$(echo "$cfg" | jq -c --arg today "$(date '+%Y-%m-%d')" '
+                    if (.users | type) == "array" then
+                        [.users[] | select(.enabled != false) |
+                            select((.expire_date // "") == "" or .expire_date >= $today) |
+                            {uuid:(.uuid // ""), password:(.password // .uuid)}]
+                    elif (.uuid // "") != "" and (.password // "") != "" then
+                        [{uuid:.uuid, password:.password}]
+                    else [] end
+                ')
                 inbound=$(jq -n \
                     --argjson port "$port" \
-                    --arg uuid "$uuid" \
-                    --arg password "$password" \
+                    --argjson users "$tuic_users" \
                     --arg cert "$cert_path" \
                     --arg key "$key_path" \
                     --arg listen_addr "$listen_addr" \
@@ -9188,7 +9243,7 @@ generate_singbox_config() {
                     tag: $tag,
                     listen: $listen_addr,
                     listen_port: $port,
-                    users: [{uuid: $uuid, password: $password}],
+                    users: $users,
                     congestion_control: "bbr",
                     tls: {
                         enabled: true,
@@ -9236,31 +9291,18 @@ generate_singbox_config() {
                     fi
                 fi
 
-                # 构建用户列表：多用户支持（{name, password}），否则用默认密码
+                # 构建用户列表：显式 users 表不回退顶层密码；旧格式才用默认密码
                 local users_json="[]"
-                # 过滤：禁用用户 + 已过期用户（到期时间对 sing-box 协议真正生效的关键）
                 local _today=$(date '+%Y-%m-%d')
-                local db_users=$(jq -r --arg p "$proto" --arg today "$_today" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | map(select(.enabled != false))
-                          | map(select((.expire_date // "") == "" or (.expire_date // "") >= $today))
-                          | unique_by(.name)
-                    else
-                        ($cfg.users // []) | map(select(.enabled != false))
-                          | map(select((.expire_date // "") == "" or (.expire_date // "") >= $today))
-                          | unique_by(.name)
-                    end
-                ' "$DB_FILE" 2>/dev/null)
-
-                if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
-                    local default_user_json=$(jq -n --arg pw "$password" '{name: "default", password: $pw}')
-                    # 合并 default 与 DB 用户，并按 name 去重（DB 里若存在同名 default 会被丢弃，避免重复）
-                    users_json=$(jq -n --argjson db_users "$db_users" --argjson chk_def "$default_user_json" '([$chk_def] + ($db_users | map({name: .name, password: (.password // .uuid)}))) | unique_by(.name)')
-                else
-                    users_json=$(jq -n --arg pw "$password" '[{name: "default", password: $pw}]')
-                fi
+                users_json=$(echo "$cfg" | jq -c --arg today "$_today" '
+                    if (.users | type) == "array" then
+                        [.users[] | select(.enabled != false) |
+                            select((.expire_date // "") == "" or .expire_date >= $today) |
+                            {name:.name, password:(.password // .uuid)}]
+                    elif (.password // "") != "" then
+                        [{name:"default", password:.password}]
+                    else [] end
+                ')
 
                 inbound=$(jq -n \
                     --argjson port "$port" \
@@ -9286,8 +9328,12 @@ generate_singbox_config() {
         esac
         
         if [[ -n "$inbound" ]]; then
-            inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
-            ((success_count++))
+            if jq -e '(.users? | type == "array") and (.users | length == 0)' <<< "$inbound" >/dev/null 2>&1; then
+                _warn "$proto inbound $port 无启用用户，跳过该端口"
+            else
+                inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
+                ((success_count++))
+            fi
         fi
         done <<< "$cfg_list"
     done
@@ -10085,9 +10131,12 @@ gen_naive_server_config() {
 }
 EOF
     
-    # 创建日志目录和伪装页面
-    mkdir -p /var/log/caddy /var/www/html
-    echo "<html><body><h1>Welcome</h1></body></html>" > /var/www/html/index.html
+    # 创建日志目录；共享 Web root 只在首页缺失时创建并登记 placeholder。
+    mkdir -p /var/log/caddy
+    create_webroot_placeholder || {
+        _err "无法安全创建 NaïveProxy placeholder"
+        return 1
+    }
     
     register_protocol "naive" "$(build_config username "$username" password "$password" port "$port" domain "$domain")"
     # 链接使用域名而不是 IP
@@ -10340,6 +10389,15 @@ restart_service() {
     fi
 }
 
+# 兼容 systemd 与 Alpine BusyBox 的精确进程检测。
+_pgrep() {
+    local proc="$1"
+    if pgrep -x "$proc" >/dev/null 2>&1; then
+        return 0
+    fi
+    pgrep -f "(^|/)$proc([[:space:]]|$)" >/dev/null 2>&1
+}
+
 # 获取所有需要监控的服务 (支持多协议) - 从数据库读取
 get_all_services() {
     local services=""
@@ -10374,8 +10432,8 @@ log "INFO: Watchdog 启动"
 while true; do
     for svc_info in $(get_all_services); do
         IFS=':' read -r svc_name proc_name <<< "$svc_info"
-        # 多种方式检测进程 (使用兼容函数)
-        if ! _pgrep "$proc_name" && ! pgrep -f "$proc_name" > /dev/null 2>&1; then
+        # 使用脚本内自包含的兼容函数，避免依赖主脚本作用域。
+        if ! _pgrep "$proc_name"; then
             log "CRITICAL: $proc_name 进程不存在，尝试重启 $svc_name..."
             restart_service "$svc_name"
             sleep 5
@@ -10898,7 +10956,7 @@ _auto_update_system_script() {
             ln -sf "$system_script" /usr/local/bin/vless 2>/dev/null
             ln -sf "$system_script" /usr/bin/vless 2>/dev/null
             hash -r 2>/dev/null
-            _ok "系统脚本已同步更新 (v$VERSION)"
+            _ok "系统脚本已同步到当前 ${RELEASE_CHANNEL} 制品"
         fi
     fi
 }
@@ -15217,6 +15275,7 @@ _import_subscription_interactive() {
 # 链式代理管理菜单
 # 一键导入 Alice SOCKS5 节点 (8个出口)
 _import_alice_nodes() {
+    # 此预设需要管理员自行提供节点地址与凭据；占位符未配置时必须在修改数据库前退出。
     _header
     echo -e "  ${W}导入 Alice SOCKS5 节点${NC}"
     _line
@@ -15224,7 +15283,19 @@ _import_alice_nodes() {
     echo -e "  ${D}统一命名为 Alice-TW-SOCKS5-01 ~ 08${NC}"
     echo ""
 
-    # 先删除所有旧的 Alice-TW-SOCKS5 节点
+    local server="<SET-ME-node-ipv6>"
+    local username="<SET-ME-username>"
+    local password="<SET-ME-password>"
+    local base_port=10001
+    local imported=0
+
+    if [[ "$server" == '<SET-ME-'* || "$username" == '<SET-ME-'* || "$password" == '<SET-ME-'* ]]; then
+        _warn "Alice 节点预设未配置；未修改任何现有节点或分流规则"
+        _pause
+        return 1
+    fi
+
+    # 只有完整配置通过后才清理同名前缀旧节点，避免占位符导致破坏性修改。
     local old_nodes=$(db_get_chain_nodes 2>/dev/null)
     local deleted=0
     if [[ -n "$old_nodes" && "$old_nodes" != "[]" ]]; then
@@ -15238,16 +15309,9 @@ _import_alice_nodes() {
 
     if [[ $deleted -gt 0 ]]; then
         echo -e "  ${C}▸${NC} 清理了 $deleted 个旧节点"
-        # 同时清理相关的分流规则
         local tmp=$(mktemp)
         jq '.routing_rules = [.routing_rules[]? | select(.outbound | (startswith("chain:Alice-TW-SOCKS5-") | not))]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
     fi
-
-    local server="2a14:67c0:116::1"
-    local username="alice"
-    local password="alicefofo123..OVO"
-    local base_port=10001
-    local imported=0
 
     echo -e "  ${C}▸${NC} 开始导入 8 个节点..."
     echo ""
@@ -17354,72 +17418,21 @@ show_single_protocol_info() {
         domain=$(cat "$CFG/cert_domain")
     fi
     
-    # 检查Web服务状态
-    local web_service_running=false
-    local nginx_port=""
-    
-    # 检查是否有Reality协议（Reality 不需要 Nginx，不提供订阅服务）
-    local has_reality=false
-    if db_exists "xray" "vless" || db_exists "xray" "vless-xhttp"; then
-        has_reality=true
-        # Reality 协议不启用 Nginx，不设置 nginx_port
-    fi
-    
-    # 检查是否有需要证书的协议（这些协议才需要 Nginx 订阅服务）
-    local has_cert_protocol=false
-    if db_exists "xray" "vless-ws" || db_exists "xray" "vless-vision" || db_exists "xray" "trojan"; then
-        has_cert_protocol=true
-        # 从 sub.info 读取实际配置的端口，否则使用默认 8443
-        if [[ -f "$CFG/sub.info" ]]; then
-            source "$CFG/sub.info"
-            nginx_port="${sub_port:-8443}"
-        else
-            nginx_port="8443"
-        fi
-    fi
-    
-    # 判断Web服务是否运行 - 只有证书协议才检查
-    if [[ -n "$nginx_port" ]]; then
-        if ss -tlnp 2>/dev/null | grep -q ":${nginx_port} "; then
-            web_service_running=true
-        fi
-    fi
-    
-    # 显示订阅链接提示
-    if [[ "$has_cert_protocol" == "true" ]]; then
-        # 有证书协议，显示订阅状态
-        if [[ "$web_service_running" == "true" && -f "$CFG/sub.info" ]]; then
-            source "$CFG/sub.info"
-            local sub_protocol="http"
-            [[ "$sub_https" == "true" ]] && sub_protocol="https"
+    # 订阅对所有协议都默认关闭，仅以 sub.info 作为显式启用标记。
+    if [[ -f "$CFG/sub.info" ]]; then
+        local sub_uuid="" sub_port="" sub_domain="" sub_https=""
+        source "$CFG/sub.info"
+        local sub_protocol="http"
+        [[ "$sub_https" == "true" ]] && sub_protocol="https"
+        if [[ -n "$sub_port" ]] && ss -tlnp 2>/dev/null | grep -q ":${sub_port} "; then
             local base_url="${sub_protocol}://${sub_domain:-$ipv4}:${sub_port}/sub/${sub_uuid}"
             echo -e "  ${Y}Clash/Clash Verge:${NC}"
             echo -e "  ${G}$base_url/clash${NC}"
-        elif [[ "$web_service_running" == "true" ]]; then
-            echo -e "  ${Y}订阅服务未配置，请在主菜单选择「订阅管理」进行配置${NC}"
         else
-            echo -e "  ${D}(Web服务未运行，订阅功能不可用)${NC}"
-            echo -e "  ${D}提示: 请在主菜单选择「订阅管理」配置订阅服务${NC}"
-        fi
-    elif [[ "$has_reality" == "true" && ("$protocol" == "vless" || "$protocol" == "vless-xhttp") ]]; then
-        # Reality 协议：订阅需要手动配置真实域名和启用
-        if [[ -n "$domain" && -f "$CFG/sub.info" && "$web_service_running" == "true" ]]; then
-            source "$CFG/sub.info"
-            
-            # Reality 真实域名模式时，检查订阅是否已手动启用
-            if [[ "${sub_enabled:-false}" == "true" && -n "$sub_port" ]]; then
-                local base_url="https://${sub_domain:-$domain}:${sub_port}/sub/${sub_uuid}"
-                echo -e "  ${Y}Clash/Clash Verge:${NC}"
-                echo -e "  ${G}$base_url/clash${NC}"
-            else
-                echo -e "  ${D}(订阅服务未启用，如需使用请在主菜单选择「订阅管理」)${NC}"
-            fi
-        else
-            echo -e "  ${D}(直接使用分享链接即可)${NC}"
+            echo -e "  ${Y}订阅已配置但端口未监听，请在主菜单 6 检查${NC}"
         fi
     else
-        # Sing-box 协议 (hy2/tuic) 或其他协议
-        echo -e "  ${D}(直接使用分享链接即可)${NC}"
+        echo -e "  ${D}(订阅默认关闭；直接使用分享链接，或在主菜单 6 显式启用)${NC}"
     fi
     
     _line
@@ -17740,16 +17753,14 @@ uninstall_specific_protocol() {
     elif [[ " $SINGBOX_PROTOCOLS " == *" $selected_protocol "* ]]; then
         # Sing-box 协议 (hy2/tuic)：需要重新生成配置
         
-        # Hysteria2: 先清理 iptables 端口跳跃规则
-        if [[ "$selected_protocol" == "hy2" ]]; then
-            cleanup_hy2_nat_rules
-            rm -rf "$CFG/certs/hy2"
-        fi
-        
-        # TUIC: 先清理 iptables 端口跳跃规则，删除证书目录
-        if [[ "$selected_protocol" == "tuic" ]]; then
-            cleanup_hy2_nat_rules
-            rm -rf "$CFG/certs/tuic"
+        # 在修改数据库前按精确 DB 记录清理当前端口跳跃规则；证书属于整个协议，
+        # 必须等端口删除完成并确认协议已不存在后再处理。
+        if [[ "$selected_protocol" == "hy2" || "$selected_protocol" == "tuic" ]]; then
+            if [[ "$SELECTED_PORT" == "all" ]]; then
+                cleanup_hy2_nat_rules "$selected_protocol"
+            else
+                cleanup_hy2_nat_rules "$selected_protocol" "$SELECTED_PORT"
+            fi
         fi
         
         # 根据选择的端口进行卸载
@@ -17779,6 +17790,10 @@ uninstall_specific_protocol() {
                 unregister_protocol "$selected_protocol"
                 rm -f "$CFG/${selected_protocol}.join"
             fi
+        fi
+
+        if [[ "$selected_protocol" == "hy2" || "$selected_protocol" == "tuic" ]]; then
+            cleanup_protocol_cert_if_unused "$selected_protocol"
         fi
         
         # 检查是否还有其他 Sing-box 协议
@@ -17881,33 +17896,11 @@ uninstall_specific_protocol() {
         fi
     fi
     
-    # 检查是否还有需要订阅服务的协议
-    local has_sub_protocol=false
-    for proto in vless-ws vless-vision trojan vmess-ws; do
-        if is_protocol_installed "$proto"; then
-            has_sub_protocol=true
-            break
-        fi
-    done
-    
-    # 如果没有需要订阅的协议了，清理订阅相关配置
-    if [[ "$has_sub_protocol" == "false" ]]; then
-        _info "清理订阅服务..."
-        # 停止并删除 Nginx 订阅配置 (包括 Alpine 的 http.d 目录)
-        rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf
-        rm -f /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf
-        nginx -s reload 2>/dev/null
-        # 清理订阅目录和配置
-        rm -rf "$CFG/subscription"
-        rm -f "$CFG/sub.info"
-        rm -f "$CFG/sub_uuid"
-        _ok "订阅服务已清理"
-    else
-        # 还有其他协议，检查订阅服务是否已配置
-        if [[ -f "$CFG/sub.info" ]] || [[ -d "$CFG/subscription" ]]; then
-            _info "更新订阅文件..."
-            generate_sub_files
-        fi
+    # 订阅是独立的显式 opt-in 服务，不随某类协议卸载而自动停用。
+    # 若已启用，只刷新剩余节点；是否停用由用户在菜单 6 明确决定。
+    if [[ -f "$CFG/sub.info" ]]; then
+        _info "更新已显式启用的订阅文件..."
+        generate_sub_files
     fi
     _ok "$selected_protocol 已卸载"
     _pause
@@ -18016,25 +18009,17 @@ do_uninstall() {
         [[ "$other_configs" -gt 0 ]] && nginx_has_other_sites=true
     fi
     
-    # 如果清理了配置
+    # Nginx 可能是共享服务。卸载只删除本项目配置；若服务正在运行且配置有效，
+    # 仅平滑重载，绝不自动 stop/disable 或以 restart 兜底。
     if [[ "$nginx_cleaned" == "true" ]]; then
-        if [[ "$nginx_has_other_sites" == "true" ]]; then
-            # 还有其他站点，仅重载
-            if nginx -t 2>/dev/null; then
-                svc reload nginx 2>/dev/null || svc restart nginx 2>/dev/null
-                cleaned_items+=("Nginx配置")
-            fi
-        else
-            # 没有其他站点，停止并禁用 Nginx
-            _info "停止 Nginx 服务..."
-            svc stop nginx 2>/dev/null
+        if nginx -t 2>/dev/null; then
             if [[ "$DISTRO" == "alpine" ]]; then
-                rc-update del nginx default 2>/dev/null
+                rc-service nginx status >/dev/null 2>&1 && rc-service nginx reload 2>/dev/null
             else
-                systemctl disable nginx 2>/dev/null
+                systemctl is-active --quiet nginx 2>/dev/null && systemctl reload nginx 2>/dev/null
             fi
-            cleaned_items+=("Nginx服务")
         fi
+        cleaned_items+=("Nginx配置")
     fi
     
     # 显示清理结果
@@ -18042,8 +18027,8 @@ do_uninstall() {
         echo "  ▸ 已清理: ${cleaned_items[*]}"
     fi
     
-    # 清理网页文件
-    rm -rf /var/www/html/index.html 2>/dev/null
+    # 仅删除身份仍匹配的项目 placeholder；第三方或被管理员替换的首页一律保留。
+    cleanup_webroot_placeholder
     
     # 强力清理残留进程
     force_cleanup
@@ -18094,15 +18079,13 @@ do_uninstall() {
     _info "删除快捷命令..."
     rm -f /usr/local/bin/vless /usr/local/bin/vless.sh /usr/local/bin/vless-server.sh /usr/bin/vless 2>/dev/null
     
-    # 清理 Caddy（如果存在）
-    # 支持 NaïveProxy 自定义编译版本和标准版本
+    # Caddy 可能被其它站点或 unit 共享。即使 DB/join/Caddyfile 表明本项目用过
+    # NaïveProxy，也只停止本项目 unit；不按进程名终止，也不删除共享二进制。
+    if [[ "$has_naive" == "true" ]]; then
+        svc stop vless-naive 2>/dev/null || true
+    fi
     if [[ -f "/usr/local/bin/caddy" ]]; then
-        _info "清理 Caddy 二进制文件..."
-        # 先停止可能存在的 Caddy 进程
-        pkill -9 caddy 2>/dev/null
-        # 删除二进制文件
-        rm -f /usr/local/bin/caddy 2>/dev/null
-        _ok "Caddy 已删除"
+        _warn "Caddy 可能为共享二进制，卸载已保留；确认无其它 unit/站点引用后再手动删除"
     fi
     
     _ok "卸载完成"
@@ -18447,7 +18430,7 @@ do_install_server() {
             local pubkey=$(echo "$keys" | grep "PublicKey" | awk '{print $NF}')
             [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; _pause; return 1; }
             
-            # 使用统一的证书和 Nginx 配置函数
+            # 使用统一的证书配置函数（订阅/Nginx 默认关闭）
             setup_cert_and_nginx "vless"
             local cert_domain="$CERT_DOMAIN"
             
@@ -18465,9 +18448,8 @@ do_install_server() {
             _line
             echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
             echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
-            # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
             if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
-                echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
+                echo -e "  ${D}(订阅默认关闭；可在主菜单 6 显式启用)${NC}"
             fi
             _line
             echo ""
@@ -18509,7 +18491,7 @@ do_install_server() {
                 local pubkey=$(echo "$keys" | grep "PublicKey" | awk '{print $NF}')
                 [[ -z "$privkey" || -z "$pubkey" ]] && { _err "密钥提取失败"; _pause; return 1; }
                 
-                # 使用统一的证书和 Nginx 配置函数
+                # 使用统一的证书配置函数（订阅/Nginx 默认关闭）
                 setup_cert_and_nginx "vless-xhttp"
                 local cert_domain="$CERT_DOMAIN"
                 
@@ -18523,9 +18505,8 @@ do_install_server() {
                 echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
                 echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
                 echo -e "  Path: ${G}$path${NC}"
-                # Reality 真实域名模式时，订阅走 Reality 端口，不显示 Nginx 端口
                 if [[ -n "$CERT_DOMAIN" && "$final_sni" == "$CERT_DOMAIN" ]]; then
-                    echo -e "  ${D}(订阅通过 Reality 端口访问)${NC}"
+                    echo -e "  ${D}(订阅默认关闭；可在主菜单 6 显式启用)${NC}"
                 fi
                 _line
                 echo ""
@@ -18546,7 +18527,7 @@ do_install_server() {
                 _line
                 echo ""
                 
-                # 使用统一的证书和 Nginx 配置函数
+                # 使用统一的证书配置函数（订阅/Nginx 默认关闭）
                 # TLS+CDN 模式必须有真实证书
                 local cert_retry=true
                 local domain=""
@@ -18569,8 +18550,7 @@ do_install_server() {
                         if [[ "$retry_choice" == "2" ]]; then
                             return 0
                         fi
-                        # 清除失败的配置，准备重试
-                        rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key" "$CFG/cert_domain"
+                        # 申请失败不删除可能被其它协议/订阅复用的现有证书；直接重试。
                     fi
                 done
                 
@@ -18702,7 +18682,7 @@ do_install_server() {
                         final_sni="$master_domain"
                         _ok "自动使用主协议 SNI: $master_domain"
                     else
-                        # 使用统一的证书和 Nginx 配置函数
+                        # 使用统一的证书配置函数（订阅/Nginx 默认关闭）
                         setup_cert_and_nginx "vless-ws"
                         cert_domain="$CERT_DOMAIN"
                         final_sni=$(ask_sni_config "$(gen_sni)" "$cert_domain")
@@ -18718,7 +18698,7 @@ do_install_server() {
                 [[ -n "$_p" ]] && path="$_p"
                 [[ "$path" != /* ]] && path="/$path"
                 
-                # 检测是否为真实证书（用于决定是否显示订阅端口）
+                # 检测是否为真实证书（用于显示订阅需显式启用的提示）
                 local _is_real_cert=false
                 if [[ -f "$CFG/certs/server.crt" ]]; then
                     local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
@@ -18737,7 +18717,7 @@ do_install_server() {
                 fi
                 echo -e "  UUID: ${G}${uuid:0:8}...${NC}"
                 echo -e "  SNI: ${G}$final_sni${NC}  Path: ${G}$path${NC}"
-                [[ -n "$cert_domain" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}${NGINX_PORT:-18443}${NC}"
+                [[ -n "$cert_domain" && "$_is_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
                 _line
                 echo ""
                 read -rp "  确认安装? [Y/n]: " confirm
@@ -18851,7 +18831,7 @@ do_install_server() {
         vless-vision)
             local uuid=$(gen_uuid)
             
-            # 使用统一的证书和 Nginx 配置函数
+            # 使用统一的证书配置函数（订阅/Nginx 默认关闭）
             setup_cert_and_nginx "vless-vision"
             local cert_domain="$CERT_DOMAIN"
             
@@ -18870,7 +18850,7 @@ do_install_server() {
                 [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
             fi
             echo -e "  SNI: ${G}$final_sni${NC}"
-            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
+            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -19171,7 +19151,7 @@ do_install_server() {
             local path="/trojan"
             [[ "$trojan_mode" == "2" ]] && use_ws=true
             
-            # 使用统一的证书和 Nginx 配置函数
+            # 使用统一的证书配置函数（订阅/Nginx 默认关闭）
             if [[ "$use_ws" == "true" ]]; then
                 setup_cert_and_nginx "trojan-ws"
             else
@@ -19207,7 +19187,7 @@ do_install_server() {
                 local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
                 [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
             fi
-            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  订阅端口: ${G}$NGINX_PORT${NC}"
+            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -21236,8 +21216,13 @@ FINAL,Proxy
 EOF
 }
 
-# 生成订阅文件
+# 生成订阅文件。默认只能更新已有显式订阅；首次生成必须来自菜单 6 opt-in。
 generate_sub_files() {
+    if [[ ! -f "$CFG/sub.info" && "${SUBSCRIPTION_EXPLICIT_ENABLE:-false}" != "true" ]]; then
+        _err "订阅服务未显式启用；请使用主菜单 6"
+        return 1
+    fi
+
     local sub_uuid=$(get_sub_uuid)
     local sub_dir="$CFG/subscription/$sub_uuid"
     mkdir -p "$sub_dir"
@@ -21259,6 +21244,11 @@ generate_sub_files() {
 
 # 配置 Nginx 订阅服务
 setup_nginx_sub() {
+    if [[ "${SUBSCRIPTION_EXPLICIT_ENABLE:-false}" != "true" ]]; then
+        _err "拒绝隐式配置 Nginx；请从主菜单 6 显式启用订阅服务"
+        return 1
+    fi
+
     local sub_uuid=$(get_sub_uuid)
     local sub_port="${1:-8443}" domain="${2:-}" use_https="${3:-true}"
 
@@ -21347,9 +21337,17 @@ EOF
 
     if nginx -t 2>/dev/null; then
         if [[ "$DISTRO" == "alpine" ]]; then
-            rc-service nginx restart 2>/dev/null || nginx -s reload
+            if rc-service nginx status >/dev/null 2>&1; then
+                rc-service nginx reload 2>/dev/null
+            else
+                rc-service nginx start 2>/dev/null
+            fi
         else
-            systemctl reload nginx 2>/dev/null || nginx -s reload
+            if systemctl is-active --quiet nginx 2>/dev/null; then
+                systemctl reload nginx 2>/dev/null
+            else
+                systemctl start nginx 2>/dev/null
+            fi
         fi
         _ok "Nginx 配置完成"
         return 0
@@ -21440,8 +21438,11 @@ manage_subscription() {
                         source "$CFG/sub.info"
                     fi
                     
-                    # 删除配置文件
-                    rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf "$CFG/sub.info"
+                    # 删除本项目订阅配置；兼容旧版可能生成的 vless-fake 文件。
+                    rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf \
+                        /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf \
+                        /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake \
+                        "$CFG/sub.info"
                     rm -rf "$CFG/subscription"
                     
                     # 清理 hosts 记录
@@ -21450,19 +21451,14 @@ manage_subscription() {
                         _info "已清理 /etc/hosts 中的域名记录"
                     fi
                     
-                    # 检查是否还有其他 nginx 配置，如果没有则停止 nginx
-                    local other_configs=$(ls /etc/nginx/conf.d/*.conf /etc/nginx/http.d/*.conf 2>/dev/null | wc -l)
-                    if [[ "$other_configs" -eq 0 ]]; then
-                        _info "没有其他 Nginx 配置，停止 Nginx 服务..."
+                    # Nginx 可能是共享服务。停用订阅只删除本项目配置，绝不自动停服；
+                    # 若 Nginx 正在运行，仅在语法通过后平滑重载。
+                    if nginx -t >/dev/null 2>&1; then
                         if [[ "$DISTRO" == "alpine" ]]; then
-                            rc-service nginx stop 2>/dev/null
+                            rc-service nginx status >/dev/null 2>&1 && rc-service nginx reload 2>/dev/null
                         else
-                            systemctl stop nginx 2>/dev/null
+                            systemctl is-active --quiet nginx 2>/dev/null && systemctl reload nginx 2>/dev/null
                         fi
-                        _ok "Nginx 服务已停止"
-                    else
-                        _info "检测到其他 Nginx 配置，仅重载配置..."
-                        nginx -s reload 2>/dev/null
                     fi
                     
                     _ok "订阅服务已停用"
@@ -21482,6 +21478,9 @@ manage_subscription() {
 
 # 交互式配置订阅
 setup_subscription_interactive() {
+    # 唯一允许安装/配置/启停 Nginx 的订阅入口。
+    local SUBSCRIPTION_EXPLICIT_ENABLE=true
+
     _header
     echo -e "  ${W}配置订阅服务${NC}"
     _line
@@ -21501,7 +21500,17 @@ setup_subscription_interactive() {
         echo ""
     fi
     
-    # 安装 Nginx
+    # 到这里仍未产生任何 Nginx 副作用；再次确认后才允许安装/配置/启停。
+    echo -e "  ${Y}订阅服务将安装/配置 Nginx，并监听一个新端口。${NC}"
+    echo -e "  ${D}已有共享 Nginx 不会被停用；停用订阅仅删除本项目配置。${NC}"
+    read -rp "  确认显式启用订阅服务? [y/N]: " enable_confirm
+    if [[ ! "$enable_confirm" =~ ^[yY]$ ]]; then
+        _info "已取消，订阅与 Nginx 保持关闭"
+        _pause
+        return 0
+    fi
+
+    # 用户已明确 opt-in，缺少 Nginx 时才安装。
     if ! check_cmd nginx; then
         _info "需要安装 Nginx..."
         install_nginx || { _err "Nginx 安装失败"; _pause; return; }
@@ -21557,9 +21566,9 @@ setup_subscription_interactive() {
     local nginx_conf="$nginx_conf_dir/vless-sub.conf"
     mkdir -p "$nginx_conf_dir"
     
-    # 删除可能冲突的旧配置 (包括 http.d 目录)
+    # 删除本项目旧版订阅配置，不触碰发行版默认站点或第三方站点。
     rm -f /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf 2>/dev/null
-    rm -f /etc/nginx/sites-enabled/vless-fake 2>/dev/null
+    rm -f /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake 2>/dev/null
     
     if [[ "$use_https" == "true" ]]; then
         # HTTPS 模式：需要证书
@@ -21650,32 +21659,12 @@ server {
 EOF
     fi
     
-    # 确保伪装网页存在
-    mkdir -p /var/www/html
-    if [[ ! -f "/var/www/html/index.html" ]]; then
-        cat > /var/www/html/index.html << 'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Welcome</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: 0 auto; background: white; padding: 40px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #333; text-align: center; }
-        p { color: #666; line-height: 1.6; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Welcome to Our Website</h1>
-        <p>This is a simple website hosted on our server.</p>
-    </div>
-</body>
-</html>
-HTMLEOF
-    fi
+    # 共享 Web root 不得覆盖既存首页；仅在路径原先不存在时创建并登记 placeholder。
+    create_webroot_placeholder || {
+        _err "无法安全创建订阅 placeholder"
+        rm -f "$nginx_conf"
+        return 1
+    }
     
     # 保存订阅配置
     cat > "$CFG/sub.info" << EOF
@@ -21697,10 +21686,18 @@ EOF
     if nginx -t 2>/dev/null; then
         if [[ "$DISTRO" == "alpine" ]]; then
             rc-update add nginx default 2>/dev/null
-            rc-service nginx restart 2>/dev/null
+            if rc-service nginx status >/dev/null 2>&1; then
+                rc-service nginx reload 2>/dev/null
+            else
+                rc-service nginx start 2>/dev/null
+            fi
         else
             systemctl enable nginx 2>/dev/null
-            systemctl restart nginx 2>/dev/null
+            if systemctl is-active --quiet nginx 2>/dev/null; then
+                systemctl reload nginx 2>/dev/null
+            else
+                systemctl start nginx 2>/dev/null
+            fi
         fi
         _ok "订阅服务已配置"
     else
@@ -23853,10 +23850,8 @@ _add_user() {
             _ok "路由配置: $routing_display"
         fi
         
-        # 重新生成配置
-        _info "更新配置..."
-        _regenerate_config "$core" "$proto"
-        
+        # db_add_user 已以 db.json 为事实源完成一次全量重建；不要再对旧派生文件
+        # 执行 VLESS 专用局部 patch，否则会串写其它 VLESS inbound/协议 schema。
         _ok "配置已更新"
     else
         _err "添加失败"
@@ -23909,10 +23904,7 @@ _delete_user() {
             if db_del_user "$core" "$proto" "$name"; then
                 _ok "用户 $name 已删除"
                 
-                # 重新生成配置
-                _info "更新配置..."
-                _regenerate_config "$core" "$proto"
-                
+                # db_del_user 已完成一次全量重建，避免再次运行 VLESS 专用局部 patch。
                 _ok "配置已更新"
             else
                 _err "删除失败"
@@ -24094,15 +24086,9 @@ _toggle_user() {
             fi
             
             if db_set_user_enabled "$core" "$proto" "$name" "$new_state"; then
-                _ok "用户 $name 已${action}"
-                
-                # 重新生成配置
-                _info "更新配置..."
-                _regenerate_config "$core" "$proto"
-                
-                _ok "配置已更新"
+                _ok "用户 $name 已${action}，配置已更新"
             else
-                _err "操作失败"
+                _err "操作未完全生效；请检查数据库状态及服务重载，勿将其视作禁用成功"
             fi
             return
         fi
@@ -24182,9 +24168,11 @@ _set_user_expire_date() {
                 if [[ "$enabled" != "true" && -n "$new_expire" ]]; then
                     read -rp "  用户当前已禁用，是否启用? [y/N]: " enable_now
                     if [[ "$enable_now" =~ ^[yY]$ ]]; then
-                        db_set_user_enabled "$core" "$proto" "$name" true
-                        _regenerate_config "$core" "$proto"
-                        _ok "用户已启用"
+                        if db_set_user_enabled "$core" "$proto" "$name" true; then
+                            _ok "用户已启用"
+                        else
+                            _err "启用失败；请检查数据库状态及完整重建结果"
+                        fi
                     fi
                 fi
             else
@@ -24196,249 +24184,15 @@ _set_user_expire_date() {
     done
 }
 
-# 重新生成配置 (添加/删除用户后调用)
-# 更新 Xray/Sing-box 配置文件中的用户列表、用户级路由规则、链式代理和负载均衡并重载服务
+# 从 db.json 完整重建核心配置。禁止对既有派生文件做协议专用局部 patch：
+# 那会把一个协议的 clients/schema 串写到其它 inbound。
 _regenerate_config() {
-    local core="$1" proto="$2"
-    local config_file=""
-    local service_name=""
-    
-    # 确定配置文件路径和服务名称
-    if [[ "$core" == "xray" ]]; then
-        config_file="$CFG/config.json"
-        service_name="vless-reality"
-    elif [[ "$core" == "singbox" ]]; then
-        # Sing-box 配置是 db.json 的派生产物，直接重建（不套用 Xray 的 clients schema）
-        # 原实现指向 $CFG/singbox/config.json（该路径不存在），导致用户增删后配置从不更新
-        rebuild_and_reload_singbox "silent" 2>/dev/null
-        return 0
-    fi
-    
-    # 检查配置文件是否存在
-    if [[ ! -f "$config_file" ]]; then
-        _info "用户信息已保存到数据库"
-        return 0
-    fi
-    
-    # 从数据库读取用户列表
-    local db_users=$(db_get_field "$core" "$proto" "users")
-    local users_json=""
-    local xray_user_rules="[]"
-    local xray_balancer_rules="[]"
-    local needed_chain_nodes=""
-    local needed_balancer_groups=""
-    
-    if [[ -n "$db_users" && "$db_users" != "null" ]]; then
-        # 有用户列表，转换为 Xray 格式的 clients 数组
-        # email 格式为 用户名@协议，用于流量统计
-        users_json=$(echo "$db_users" | jq -c --arg proto "$proto" '[.[] | select(.enabled == true) | {id: .uuid, email: (.name + "@" + $proto), flow: "xtls-rprx-vision"}]' 2>/dev/null)
-        
-        # 生成用户级路由规则
-        while IFS= read -r line; do
-            [[ -z "$line" ]] && continue
-            local user_name=$(echo "$line" | jq -r '.name')
-            local user_routing=$(echo "$line" | jq -r '.routing // ""')
-            
-            [[ -z "$user_name" || -z "$user_routing" ]] && continue
-            
-            # user 字段需要匹配 clients 中的 email 格式：用户名@协议
-            local user_email="${user_name}@${proto}"
-            
-            case "$user_routing" in
-                direct)
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" \
-                        '. + [{"type": "field", "user": [$user], "outboundTag": "direct"}]')
-                    ;;
-                warp)
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" \
-                        '. + [{"type": "field", "user": [$user], "outboundTag": "warp"}]')
-                    ;;
-                chain:*)
-                    local node_name="${user_routing#chain:}"
-                    xray_user_rules=$(echo "$xray_user_rules" | jq --arg user "$user_email" --arg tag "chain-${node_name}-prefer-ipv4" \
-                        '. + [{"type": "field", "user": [$user], "outboundTag": $tag}]')
-                    needed_chain_nodes="$needed_chain_nodes $node_name"
-                    ;;
-                balancer:*)
-                    local group_name="${user_routing#balancer:}"
-                    # 负载均衡使用 balancerTag 而不是 outboundTag
-                    xray_balancer_rules=$(echo "$xray_balancer_rules" | jq --arg user "$user_email" --arg tag "$group_name" \
-                        '. + [{"type": "field", "user": [$user], "balancerTag": $tag}]')
-                    needed_balancer_groups="$needed_balancer_groups $group_name"
-                    ;;
-            esac
-        done < <(echo "$db_users" | jq -c '.[] | select(.enabled == true and .routing != null and .routing != "")')
-    else
-        # 使用默认 UUID
-        local default_uuid=$(db_get_field "$core" "$proto" "uuid")
-        if [[ -n "$default_uuid" ]]; then
-            users_json="[{\"id\": \"$default_uuid\", \"email\": \"default@${proto}\", \"flow\": \"xtls-rprx-vision\"}]"
-        fi
-    fi
-    
-    # 从数据库读取链式代理节点配置
-    local chain_outbounds="[]"
-    if [[ -n "$needed_chain_nodes" && -f "$DB_FILE" ]]; then
-        for node_name in $needed_chain_nodes; do
-            local node_config=$(jq -r --arg n "$node_name" '.chain_proxy.nodes[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
-            if [[ -n "$node_config" ]]; then
-                local node_type=$(echo "$node_config" | jq -r '.type')
-                local server=$(echo "$node_config" | jq -r '.server')
-                local port=$(echo "$node_config" | jq -r '.port')
-                local username=$(echo "$node_config" | jq -r '.username // ""')
-                local password=$(echo "$node_config" | jq -r '.password // ""')
-                
-                if [[ "$node_type" == "socks" ]]; then
-                    local outbound="{\"tag\": \"chain-${node_name}-prefer-ipv4\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
-                    if [[ -n "$username" && -n "$password" ]]; then
-                        outbound="$outbound, \"users\": [{\"user\": \"$username\", \"pass\": \"$password\"}]"
-                    fi
-                    outbound="$outbound}]}}"
-                    chain_outbounds=$(echo "$chain_outbounds" | jq --argjson ob "$outbound" '. + [$ob]')
-                fi
-            fi
-        done
-    fi
-    
-    # 从数据库读取负载均衡组配置
-    local xray_balancers="[]"
-    if [[ -n "$needed_balancer_groups" && -f "$DB_FILE" ]]; then
-        for group_name in $needed_balancer_groups; do
-            local group_config=$(jq -r --arg n "$group_name" '.balancer_groups[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
-            if [[ -n "$group_config" ]]; then
-                local strategy=$(echo "$group_config" | jq -r '.strategy // "random"')
-                local nodes=$(echo "$group_config" | jq -r '.nodes[]' 2>/dev/null)
-                
-                # 构建 selector 列表（每个节点对应一个 outbound tag）
-                local selectors="[]"
-                for node in $nodes; do
-                    selectors=$(echo "$selectors" | jq --arg s "proxy-${node}" '. + [$s]')
-                    # 确保这些节点也被添加到 chain_outbounds
-                    needed_chain_nodes="$needed_chain_nodes $node"
-                done
-                
-                # 构建 balancer
-                local balancer="{\"tag\": \"$group_name\", \"selector\": $selectors, \"strategy\": {\"type\": \"$strategy\"}}"
-                xray_balancers=$(echo "$xray_balancers" | jq --argjson b "$balancer" '. + [$b]')
-            fi
-        done
-        
-        # 重新生成需要的链式代理节点 outbounds
-        chain_outbounds="[]"
-        for node_name in $needed_chain_nodes; do
-            # 检查是否已添加
-            local exists=$(echo "$chain_outbounds" | jq --arg t "chain-${node_name}-prefer-ipv4" '[.[] | select(.tag == $t)] | length')
-            [[ "$exists" != "0" ]] && continue
-            
-            local node_config=$(jq -r --arg n "$node_name" '.chain_proxy.nodes[] | select(.name == $n)' "$DB_FILE" 2>/dev/null)
-            if [[ -n "$node_config" ]]; then
-                local node_type=$(echo "$node_config" | jq -r '.type')
-                local server=$(echo "$node_config" | jq -r '.server')
-                local port=$(echo "$node_config" | jq -r '.port')
-                local username=$(echo "$node_config" | jq -r '.username // ""')
-                local password=$(echo "$node_config" | jq -r '.password // ""')
-                
-                if [[ "$node_type" == "socks" ]]; then
-                    local outbound="{\"tag\": \"chain-${node_name}-prefer-ipv4\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"$server\", \"port\": $port"
-                    if [[ -n "$username" && -n "$password" ]]; then
-                        outbound="$outbound, \"users\": [{\"user\": \"$username\", \"pass\": \"$password\"}]"
-                    fi
-                    outbound="$outbound}]}}"
-                    chain_outbounds=$(echo "$chain_outbounds" | jq --argjson ob "$outbound" '. + [$ob]')
-                fi
-            fi
-        done
-    fi
-    
-    # 合并 outboundTag 规则和 balancerTag 规则
-    local all_user_rules=$(echo "$xray_user_rules" | jq --argjson br "$xray_balancer_rules" '. + $br')
-    
-    # 更新配置文件
-    if [[ -n "$users_json" ]]; then
-        local tmp=$(mktemp)
-        
-        # 使用 jq 更新配置
-        if jq --argjson clients "$users_json" \
-              --argjson user_rules "$all_user_rules" \
-              --argjson chain_obs "$chain_outbounds" \
-              --argjson balancers "$xray_balancers" '
-            # 更新 clients (通过 protocol 查找 VLESS inbound，避免索引问题)
-            (.inbounds[] | select(.protocol == "vless")).settings.clients = $clients |
-            
-            # 确保 routing 结构存在
-            if .routing == null then .routing = {"domainStrategy": "AsIs", "rules": []} else . end |
-            if .routing.rules == null then .routing.rules = [] else . end |
-            
-            # 确保 api 和 stats 存在（用于流量统计）
-            if .api == null then .api = {"tag": "api", "services": ["StatsService"]} else . end |
-            if .stats == null then .stats = {} else . end |
-            if .policy == null then .policy = {"system": {"statsInboundUplink": true, "statsInboundDownlink": true}, "levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}}} else . end |
-            if .policy.system == null then .policy.system = {"statsInboundUplink": true, "statsInboundDownlink": true} else . end |
-            if .policy.levels == null then .policy.levels = {"0": {"statsUserUplink": true, "statsUserDownlink": true}} else . end |
-            if .policy.levels["0"] == null then .policy.levels["0"] = {"statsUserUplink": true, "statsUserDownlink": true} else . end |
-            .policy.system.statsInboundUplink = true |
-            .policy.system.statsInboundDownlink = true |
-            .policy.levels["0"].statsUserUplink = true |
-            .policy.levels["0"].statsUserDownlink = true |
-            
-            # 确保有 API inbound（监听 127.0.0.1:10085）
-            if ([.inbounds[] | select(.tag == "api")] | length) == 0 then
-                .inbounds += [{"tag": "api", "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1"}}]
-            else . end |
-            
-            # 确保有 API outbound
-            if ([.outbounds[] | select(.tag == "api")] | length) == 0 then
-                .outbounds += [{"tag": "api", "protocol": "blackhole", "settings": {}}]
-            else . end |
-            
-            # 添加链式代理 outbounds（先移除旧的 proxy-* outbounds）
-            .outbounds = ([.outbounds[] | select(.tag | startswith("proxy-") | not)] + $chain_obs) |
-            
-            # 添加/更新负载均衡器
-            if ($balancers | length) > 0 then
-                .routing.balancers = $balancers
-            else . end |
-            
-            # 确保 routing 中有 API 规则
-            if ([.routing.rules[]? | select(.inboundTag != null and (.inboundTag | contains(["api"])))] | length) == 0 then
-                .routing.rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}] + (.routing.rules // [])
-            else . end |
-            
-            # 更新用户级路由规则
-            # 用户级规则优先于全局规则：API规则 > 用户规则 > 其他规则
-            .routing.rules = (
-                # 1. API 规则必须在最前
-                [.routing.rules[]? | select(.inboundTag != null and (.inboundTag | contains(["api"])))] +
-                # 2. 用户级路由规则（高优先级）
-                $user_rules +
-                # 3. 其他规则（全局规则等）
-                [.routing.rules[]? | select(
-                    (.user == null or (.user | type) != "array") and
-                    (.inboundTag == null or (.inboundTag | contains(["api"])) | not)
-                )]
-            )
-        ' "$config_file" > "$tmp" 2>/dev/null; then
-            mv "$tmp" "$config_file"
-        else
-            rm -f "$tmp"
-            # 如果完整更新失败，至少尝试更新 clients
-            tmp=$(mktemp)
-            if jq --argjson clients "$users_json" '(.inbounds[] | select(.protocol == "vless")).settings.clients = $clients' "$config_file" > "$tmp" 2>/dev/null; then
-                mv "$tmp" "$config_file"
-            else
-                rm -f "$tmp"
-            fi
-        fi
-    fi
-    
-    _info "用户信息已保存到数据库"
-    
-    # 重载服务使配置生效
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service "$service_name" restart 2>/dev/null || true
-    elif systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        systemctl reload "$service_name" 2>/dev/null || systemctl restart "$service_name" 2>/dev/null
-    fi
+    local core="$1"
+    case "$core" in
+        xray) rebuild_and_reload_xray "silent" 2>/dev/null ;;
+        singbox) rebuild_and_reload_singbox "silent" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
 }
 
 # 配置 TG 通知
@@ -25044,96 +24798,101 @@ do_update() {
     _header
     echo -e "  ${W}脚本更新${NC}"
     _line
-    
-    echo -e "  当前版本: ${G}v${VERSION}${NC}"
-    _info "检查最新版本..."
-    
+
+    echo -e "  发布通道: ${G}${RELEASE_CHANNEL}${NC}"
+    _info "检查远程 master 制品..."
+
     _init_version_cache
-    local tmp_file="" remote_ver=""
-    remote_ver=$(_get_latest_script_version "true" "false")
-    if [[ -z "$remote_ver" ]]; then
-        _err "无法获取远程版本信息"
+    local tmp_file="" remote_hash="" current_hash="" downloaded_hash=""
+    current_hash=$(_current_script_sha256)
+    if ! _is_sha256 "$current_hash"; then
+        _err "无法计算当前脚本 SHA-256"
         return 1
     fi
-    
-    echo -e "  最新版本: ${C}v${remote_ver}${NC}"
-    
-    # 比较版本 - 只有远程版本更新时才提示更新
-    if ! _version_gt "$remote_ver" "$VERSION"; then
-        _ok "已是最新版本"
-        return 0
-    fi
-    
-    _line
-    read -rp "  发现新版本，是否更新? [Y/n]: " confirm
-    if [[ "$confirm" =~ ^[nN]$ ]]; then
-        return 0
-    fi
-    
-    _info "更新中..."
+
     tmp_file=$(_fetch_script_tmp 10)
     if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
         _err "下载失败，请检查网络连接"
         return 1
     fi
-    local downloaded_ver
-    downloaded_ver=$(_extract_script_version "$tmp_file")
-    # 下载内容必须带合法版本号：否则可能拿到 404/HTML 错误页，直接覆盖会把脚本写坏
-    if [[ -z "$downloaded_ver" ]] || ! _is_semver_version "$downloaded_ver"; then
+    remote_hash=$(_script_sha256 "$tmp_file")
+    if ! _is_sha256 "$remote_hash"; then
         rm -f "$tmp_file"
-        _err "下载的脚本版本号异常（${downloaded_ver:-空}），已中止更新"
+        _err "无法验证下载脚本的 SHA-256，已中止更新"
         return 1
     fi
-    if [[ "$downloaded_ver" != "$remote_ver" ]]; then
-        if _version_gt "$downloaded_ver" "$VERSION"; then
-            # 以脚本内的 VERSION 为准（release tag 可能滞后/超前于 master）
-            remote_ver="$downloaded_ver"
-            echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
-        else
-            # 远端发布信息指向的版本高于 master 脚本实际版本（发布未同步）：
-            # 继续覆盖会得到「更新成功 vX -> vX」的假成功，直接中止并纠正缓存。
-            rm -f "$tmp_file"
-            echo "$downloaded_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null || true
-            _warn "远端发布版本(v${remote_ver})与 master 脚本版本(v${downloaded_ver})不一致，已中止更新"
-            return 1
-        fi
+    printf '%s\n' "$remote_hash" > "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null || true
+
+    if [[ "$remote_hash" == "$current_hash" ]]; then
+        rm -f "$tmp_file"
+        _ok "已是最新 master 制品"
+        return 0
     fi
-    
-    # 获取当前脚本路径
-    local script_path=$(readlink -f "$0")
-    local script_dir=$(dirname "$script_path")
-    local script_name=$(basename "$script_path")
-    
-    # 系统目录的脚本路径
+
+    # 防降级硬闸门：远端制品必须带合法版本号，且不得低于本机版本。
+    # 缺版本号通常意味着拿到 404/HTML 错误页；版本更低意味着发布回退——两者都必须拒绝。
+    local remote_ver=""
+    remote_ver=$(_extract_script_version "$tmp_file")
+    if ! _is_semver_version "$remote_ver"; then
+        rm -f "$tmp_file"
+        _err "远端制品缺少合法版本号，已中止更新"
+        return 1
+    fi
+    if _version_gt "$VERSION" "$remote_ver"; then
+        rm -f "$tmp_file"
+        _err "远端制品较旧(v${remote_ver} < v${VERSION})，已跳过"
+        return 1
+    fi
+    printf '%s\n' "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null || true
+
+    _line
+    read -rp "  master 制品已有变化，是否更新? [Y/n]: " confirm
+    if [[ "$confirm" =~ ^[nN]$ ]]; then
+        rm -f "$tmp_file"
+        return 0
+    fi
+
+    # 下载结果必须仍是完整 Bash 脚本；避免把 404/HTML 错误页覆盖到系统脚本。
+    if ! head -n 1 "$tmp_file" | grep -qE '^#!.*/(env +)?bash([[:space:]]|$)' || ! bash -n "$tmp_file"; then
+        rm -f "$tmp_file"
+        _err "下载内容不是语法有效的 Bash 脚本，已中止更新"
+        return 1
+    fi
+    downloaded_hash=$(_script_sha256 "$tmp_file")
+    if [[ "$downloaded_hash" != "$remote_hash" ]]; then
+        rm -f "$tmp_file"
+        _err "下载脚本在校验期间发生变化，已中止更新"
+        return 1
+    fi
+
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
     local system_script="/usr/local/bin/vless-server.sh"
-    
+
     # 备份当前脚本
     cp "$script_path" "${script_path}.bak" 2>/dev/null
-    
+
     # 替换当前运行的脚本
     if mv "$tmp_file" "$script_path" && chmod +x "$script_path"; then
-        # 如果当前脚本不是系统目录的脚本，也更新系统目录
         if [[ "$script_path" != "$system_script" && -f "$system_script" ]]; then
             cp -f "$script_path" "$system_script" 2>/dev/null
             chmod +x "$system_script" 2>/dev/null
             _info "已同步更新系统目录脚本"
         fi
-        
-        _ok "更新成功! v${VERSION} -> v${remote_ver}"
-        _info "正在自动重新生成配置并重启服务以使新版本生效..."
-        
-        # 自动初始化数据库并重构/应用配置
+
+        _ok "已更新到最新 master 制品"
+        _info "正在自动重新生成配置并重启服务以使新制品生效..."
+
         init_db 2>/dev/null
         rebuild_and_reload_xray "silent" 2>/dev/null
         rebuild_and_reload_singbox "silent" 2>/dev/null
-        
+
         echo ""
-        echo -e "  ${G}✓ 升级完成，配置已自动生成并生效！${NC}"
+        echo -e "  ${G}✓ 更新完成；请继续核对配置、服务状态与真实连接。${NC}"
         echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
         _line
         exit 0
     else
-        # 恢复备份
         [[ -f "${script_path}.bak" ]] && mv "${script_path}.bak" "$script_path"
         rm -f "$tmp_file"
         _err "更新失败"
@@ -25159,23 +24918,21 @@ main_menu() {
     _update_all_versions_async "SagerNet/sing-box"
     _check_script_update_async
 
-    # 自动同步隧道配置
-    _sync_tunnel_config 2>/dev/null
+    # 进入菜单本身必须是只读导航；Tunnel 配置同步只在用户明确的协议变更路径执行。
 
-    # 默认即升级：已安装环境下，跑一键命令时若检测到本仓有新版本，主动引导升级（默认 Yes）
-    # 仅对已安装协议生效；全新安装不打扰。用户输 n 可跳过进入菜单。
+    # 已安装环境若检测到滚动 master 制品变化，则主动引导更新（默认 Yes）。
+    # 全新安装不打扰；用户输 n 可跳过进入菜单。
     if get_installed_protocols >/dev/null 2>&1; then
-        local _remote_ver
-        _remote_ver=$(_get_latest_script_version "false" "true" 2>/dev/null)
-        if [[ -n "$_remote_ver" && "$_remote_ver" != "$VERSION" ]] && _version_gt "$_remote_ver" "$VERSION"; then
+        _get_latest_script_hash "false" "true" >/dev/null 2>&1 || true
+        if _has_script_update; then
             echo ""
-            echo -e "  ${C}发现本仓新版本 v${_remote_ver}（当前 v${VERSION}）${NC}"
-            read -rp "  检测到已有安装，是否立即升级并自动生效? [Y/n]: " _upg_confirm
-            if [[ ! "$_upg_confirm" =~ ^[nN]$ ]]; then
+            echo -e "  ${C}检测到 master 制品已有更新${NC}"
+            read -rp "  是否立即更新并尝试自动生效? [y/N]: " _upg_confirm
+            if [[ "$_upg_confirm" =~ ^[yY]$ ]]; then
                 do_update
                 exit 0
             fi
-            echo -e "  ${D}跳过本次升级，进入菜单${NC}"
+            echo -e "  ${D}跳过本次更新，进入菜单${NC}"
         fi
     fi
 
@@ -25221,7 +24978,7 @@ main_menu() {
         echo -e "  ${D}系统: ${os_version} | ${kernel_version}${NC}"
         echo -e "  ${D}核心: Xray ${xray_ver_with_status} | Sing-box ${singbox_ver_with_status}${NC}"
         if [[ -n "$script_update_ver" ]]; then
-            echo -e "  ${Y}提示: 脚本有新版本 v${script_update_ver}，可在菜单选择「检查脚本更新」${NC}"
+            echo -e "  ${Y}提示: master 制品已有更新，可在菜单选择「检查脚本更新」${NC}"
         fi
         echo ""
         show_status
@@ -25247,7 +25004,7 @@ main_menu() {
             _item "11" "查看运行日志"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
             local script_update_item="检查脚本更新"
-            [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
+            [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[master 有更新]${NC}"
             _item "12" "$script_update_item"
             _item "13" "完全卸载"
             _item "14" "重建全部配置 (手改 db 后生效)"
@@ -25256,7 +25013,7 @@ main_menu() {
             _item "1" "安装协议"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
             local script_update_item="检查脚本更新"
-            [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
+            [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[master 有更新]${NC}"
             _item "12" "$script_update_item"
         fi
         _item "0" "退出"
@@ -25295,6 +25052,12 @@ main_menu() {
         [[ "$skip_pause" == "false" ]] && _pause
     done
 }
+
+# 本地隔离回归可 source 完整脚本后直接调用真实函数；不执行 CLI/main_menu。
+# 仅显式环境变量生效，普通安装/升级路径行为不变。
+if [[ "${VLESS_SOURCE_ONLY:-0}" == "1" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # 命令行参数处理
 case "${1:-}" in

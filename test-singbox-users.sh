@@ -67,9 +67,9 @@ jq -e '.inbounds[] | select(.type=="anytls") | .users[] | select(.name=="bob")' 
 jq -e '.inbounds[] | select(.type=="anytls") | .users[] | select(.name=="carol")' "$J1" >/dev/null 2>&1 \
   && { echo "FAIL: carol(过期) 不应出现"; fail=1; }
 
-# 断言：default 用户存在且无重复
+# 已有显式 users 时不得额外注入顶层 default 密码（否则禁用 default 会被绕过）
 defcount=$(jq -r '[.inbounds[] | select(.type=="anytls") | .users[] | select(.name=="default")] | length' "$J1" 2>/dev/null)
-[[ "$defcount" == "1" ]] || { echo "FAIL: default 用户数 $defcount != 1"; fail=1; }
+[[ "$defcount" == "0" ]] || { echo "FAIL: 显式 users 下 default 用户数 $defcount != 0"; fail=1; }
 
 # 断言：sniff 动作在 route.rules 首位
 [[ "$(jq -r '.route.rules[0].action' "$J1" 2>/dev/null)" == "sniff" ]] \
