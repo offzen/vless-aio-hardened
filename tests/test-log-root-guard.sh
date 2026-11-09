@@ -61,12 +61,23 @@ get_xray_protocols() { db_list_protocols xray; }
 PEER='{"name":"on","uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","enabled":true}'
 printf '%s\n' "{\"xray\":{\"vless-ws-notls\":{\"port\":18447,\"uuid\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"users\":[$PEER]}}}" > "$DB_FILE"
 
-gen_rc() { # <VLESS_TEST_LOG_ROOT value or __UNSET__>
-    local v="$1" rc
+gen_rc() { # <VLESS_TEST_LOG_ROOT value or __UNSET__> [stub-default-mkdir]
+    local v="$1" stub_default_mkdir="${2:-0}" rc
     rm -f "$CFG/config.json"
     (
         set +e    # product code may re-enable errexit; a probe must never abort the harness
         if [[ "$v" == "__UNSET__" ]]; then unset VLESS_TEST_LOG_ROOT; else export VLESS_TEST_LOG_ROOT="$v"; fi
+        if [[ "$stub_default_mkdir" == 1 ]]; then
+            # The product is root-only, while hosted CI runs this test as an unprivileged user.
+            # Stub only the successful /var/log boundary; all rejection probes keep real mkdir.
+            mkdir() {
+                if [[ "$#" -eq 2 && "$1" == "-p" && "$2" == "/var/log/xray" ]]; then
+                    printf '%s\n' "$*" >> "$WORK/default-mkdir.calls"
+                    return 0
+                fi
+                command mkdir "$@"
+            }
+        fi
         generate_xray_config
     ) >/dev/null 2>&1
     rc=$?
@@ -78,10 +89,12 @@ t_nonzero 'relative log root rejected'        "$(gen_rc 'relative/logs')"
 t_check   'relative log root wrote no config' no "$([[ -s "$CFG/config.json" ]] && echo yes || echo no)"
 t_nonzero 'unwritable log root rejected'      "$(gen_rc '/proc/vless-cannot-create')"
 t_check   'unwritable log root wrote no config' no "$([[ -s "$CFG/config.json" ]] && echo yes || echo no)"
-t_check   'unset log root still generates'    0  "$(gen_rc '__UNSET__')"
+: > "$WORK/default-mkdir.calls"
+t_check   'unset log root still generates'    0  "$(gen_rc '__UNSET__' 1)"
 t_check   'unset log root -> /var/log'        /var/log/xray/access.log "$(jq -r '.log.access // "<none>"' "$CFG/config.json" 2>/dev/null)"
-t_check   'empty log root still generates'    0  "$(gen_rc '')"
+t_check   'empty log root still generates'    0  "$(gen_rc '' 1)"
 t_check   'empty log root -> /var/log'        /var/log/xray/access.log "$(jq -r '.log.access // "<none>"' "$CFG/config.json" 2>/dev/null)"
+t_check   'default cases request exact log directory' 2 "$(grep -cxF -- '-p /var/log/xray' "$WORK/default-mkdir.calls")"
 
 echo '--- guard 2: URL with an unsubstituted placeholder must be refused before curl ---'
 : > "$WORK/curl.calls"

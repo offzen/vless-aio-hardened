@@ -6,7 +6,7 @@ name: ci
 
 on:
   push:
-    branches: [master, main, release/h13-converged-1]
+    branches: [master, main]
   pull_request:
 
 permissions:
