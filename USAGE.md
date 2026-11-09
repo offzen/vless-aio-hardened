@@ -1,8 +1,6 @@
 # vless-aio-hardened 使用手册
 
 > 适用安装器：本仓 `master` 分支中的 `vless-server.sh`
->
-> 本仓采用滚动 `master` 发布，不使用独立公开版本号。本手册描述当前脚本的实际行为；脚本与手册冲突时，以当前脚本为准并提交修正。
 
 ## 目录
 
@@ -16,6 +14,7 @@
 8. [命令行与常见操作](#8-命令行与常见操作)
 9. [验证与排障](#9-验证与排障)
 10. [更新与卸载边界](#10-更新与卸载边界)
+11. [H13 验收基线](#11-h13-验收基线)
 
 ## 1. 项目与支持范围
 
@@ -34,7 +33,7 @@
 - 主要用户/协议数据库变更通过 `_db_safe_write` 采用唯一临时文件、目录锁和原子替换，并阻止非删除操作意外清空用户；脚本中的其它 JSON 写入不都经过这条路径。
 - Xray 与 sing-box 默认加入私网和 BitTorrent 出站拦截；sing-box 显式执行 sniff 以识别协议。
 - AnyTLS 的实际入站由 sing-box 生成，支持多用户、多端口、到期/禁用过滤、用户分享链接及真实证书。
-- 菜单更新替换脚本后会尝试重新生成 Xray / sing-box 配置并重载服务；操作后仍须人工验证。
+- 菜单更新替换脚本后会尝试重新生成 Xray / sing-box 配置并重载服务；任一自动应用步骤失败时，新脚本与备份会保留、更新流程返回非零并要求人工核对/重建。无论返回值如何，操作后仍须人工验证。
 - 生成 Xray 配置前会先建立日志目录，创建失败立即停止；测试日志根路径必须是绝对路径。
 - Xray 用户增删只走数据库驱动的完整重建；NAT 清理只删除数据库精确归属且已启用的 v4/v6 端口跳跃规则；卸载不按裸进程名终止共享实例；HY2/TUIC 证书只在协议最后一个端口删除后清理；主菜单不隐式同步 Tunnel。
 - 通过通用 `_install_binary` 路径下载核心时，先检查 URL 是否仍含未替换的变量占位符，避免把模板错误伪装成网络 404；其它自定义下载路径不受此守卫覆盖。
@@ -68,7 +67,7 @@ sudo ./vless-server.sh
 
 ```bash
 base=https://raw.githubusercontent.com/offzen/vless-aio-hardened/master
-for file in vless-server.sh README.md USAGE.md SHA256SUMS PROVENANCE.json; do
+for file in vless-server.sh README.md USAGE.md FIXES.md SHA256SUMS PROVENANCE.json; do
   wget -O "$file" "$base/$file"
 done
 sha256sum -c SHA256SUMS
@@ -76,7 +75,7 @@ chmod +x vless-server.sh
 sudo ./vless-server.sh
 ```
 
-`master` 是滚动分支；可复现留档应同时保存下载时的仓库 commit ID、全部五个文件和校验结果。
+`master` 是滚动分支；可复现留档应同时保存下载时的仓库 commit ID、全部六个文件和校验结果。
 
 无参数运行当前文件进入主菜单时，脚本会尝试把它复制到 `/usr/local/bin/vless-server.sh`，并创建 `/usr/local/bin/vless` 与 `/usr/bin/vless` 软链接；首次协议安装成功后也会再次确保快捷命令存在。只运行 `--help` 等 CLI 分支不会触发这一步。进入菜单后选择 `1 安装协议`；成功后可运行：
 
@@ -93,7 +92,7 @@ sudo /usr/local/bin/vless-server.sh --help
 2. 运行 `sudo vless`，选择 `12 检查脚本更新`。
 3. 脚本下载远程 `master` 制品并比较 SHA-256；字节不同时才询问更新。release 和 tag 不参与判断。
 4. 替换前检查下载内容的 Bash shebang 与语法，并尝试写入同路径 `.bak` 备份；替换成功后会尝试重建、重载 Xray 与 sing-box。
-5. 重建/重载的返回值没有形成可靠的整体成功判据；即使界面显示更新完成，也必须执行第 9 节的配置、服务与连接验证。
+5. 三个自动应用步骤会全部尝试；任一步骤失败时流程返回非零，但已验证的新脚本不会回滚，`.bak` 备份仍保留。即使界面显示更新完成，也必须执行第 9 节的配置、服务与连接验证。
 
 ### 3.3 已有部署：手动替换
 
@@ -282,7 +281,7 @@ sing-box check -c /etc/vless-reality/singbox.json
 - 仓库：`https://github.com/offzen/vless-aio-hardened`
 - 脚本：`https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh`
 
-菜单 12 会下载远程 `master` 制品，比较本地与远程 SHA-256，并在替换前检查 Bash shebang 和语法。它不会把 release/tag 当作版本源，也不验证签名或 `PROVENANCE.json`；需要完整发行包一致性时应按第 3.1 节同时下载全部文件并核对 `SHA256SUMS`。替换完成后的自动重建是“尝试执行”而不是完整验收；始终按第 9 节复核。
+菜单 12 会下载远程 `master` 制品，比较本地与远程 SHA-256，并在替换前检查 Bash shebang 和语法。它不会把 release/tag 当作制品身份源，也不验证签名或 `PROVENANCE.json`；脚本内语义化 `VERSION` 只用于兼容发现和拒绝降级。需要完整发行包一致性时应按第 3.1 节同时下载全部文件并核对 `SHA256SUMS`。替换完成后的三个自动应用步骤会全部尝试；任一步骤失败时返回非零、保留新脚本与 `.bak`，仍须按第 9 节复核。
 
 ### 完全卸载
 
@@ -300,5 +299,19 @@ sing-box check -c /etc/vless-reality/singbox.json
 - 完全卸载会按卸载前数据库中的精确 `hop_enable=1` 记录成对清理本项目 IPv4/IPv6 端口跳跃规则，不再枚举或删除第三方 REDIRECT 规则；数据库缺失或记录无效时不会猜测清理。
 
 “完全卸载”并不等于删除所有证书、核心二进制或主机级副作用。执行前备份配置、root crontab、iptables/ip6tables、相关 sysctl 与共享服务状态；如需连证书和整个配置目录一并删除，必须按脚本最后显示的命令另行操作。
+
+## 11. H13 验收基线
+
+H13 交付制品 `vless-server.sh` 的冻结 SHA-256 为 `33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88`，大小 982,535 bytes。该精确制品已通过：
+
+- `bash -n`、ShellCheck error 级、diff/JSON/checksum 和 h12→h13 VERSION 单调抬升门禁；
+- 16 个命名离线回归脚本、Xray 日志路径 mutation 4/4、候选身份 fail-closed 4/4；
+- updater 集成 97/97，覆盖 init/Xray/sing-box 单项或组合应用失败时的非零返回与备份保留；
+- Docker bookworm 隔离生命周期 E2E 9/9，使用真实 Xray 26.3.27 客户端—服务端—HTTP 数据面，并确认测试容器/镜像零遗留；
+- 固定 sing-box 1.13.0 的原生配置 `check`（rc=0）及私有网络命名空间 AnyTLS→SOCKS→HTTP 数据面。
+
+这些是发布前验收证据，不替代目标主机的备份、配置检查、服务状态与真实客户端连接验证。任何 `vless-server.sh` 或绑定测试脚本字节变化都会使对应收据失效，必须重跑相关门禁。
+
+私有 manifest、分层测试计划与测试收据不随包分发；六文件发布包包含 `vless-server.sh`、三份脱敏文档、`SHA256SUMS` 与 `PROVENANCE.json`，不携带内部测试环境与证据路径。实际复跑需另行取得与候选 SHA 匹配的测试源码和计划。
 
 本仓为第三方补丁副本，版权与主要设计归原项目作者；请遵守适用许可与当地法律法规，仅用于合法用途。

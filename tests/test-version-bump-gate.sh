@@ -2,14 +2,14 @@
 # 单元测试：check-version-bump.sh（发布闸门「改了脚本必须抬 VERSION」）。
 #
 # 覆盖两条基准路径：
-#   * 有父提交（gitorca 全历史正本）→ 用 HEAD^
-#   * 无父提交（gitpub / GitHub 是无父单 commit 快照）→ 用仓库内最高语义化 tag
+#   * 有父提交（private canonical repository 全历史正本）→ 用 HEAD^
+#   * 无父提交（sanitized private replica / GitHub 是无父单 commit 快照）→ 用仓库内最高语义化 tag
 # 以及放行路径（首次发布 / 新增文件 / 无基准可比）与非法版本号。
 #
 # 全离线、纯本地临时 git 仓，不碰网络与真实仓库。
 set -uo pipefail
 
-GATE="$(cd "$(dirname "$0")" && pwd)/check-version-bump.sh"
+GATE="$(cd "$(dirname "$0")/.." && pwd)/check-version-bump.sh"
 [ -f "$GATE" ] || { echo "FAIL: 找不到 $GATE" >&2; exit 1; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/vless-bump-gate.XXXXXX")"
@@ -46,7 +46,7 @@ new_repo() { # name -> dir
 
 commit() { git -C "$1" add -A && git -C "$1" commit -qm "$2"; }
 
-# 把 HEAD 树重做成一个**无父**提交（模拟 gitpub / GitHub 的单 commit 快照）
+# 把 HEAD 树重做成一个**无父**提交（模拟 sanitized private replica / GitHub 的单 commit 快照）
 orphan_head() { # dir msg
     local tree new
     tree="$(git -C "$1" rev-parse 'HEAD^{tree}')" || return 1
@@ -61,7 +61,7 @@ run_gate() { # dir [args...] -> rc
     echo $?
 }
 
-echo "########## 1. 有父提交（gitorca 全历史路径） ##########"
+echo "########## 1. 有父提交（private canonical repository 全历史路径） ##########"
 
 r="$(new_repo p1)"; mk_script "$r" 3.4.10-h5 a; commit "$r" init
 check "未改脚本 → 通过" "$(run_gate "$r")" "0"
@@ -91,7 +91,7 @@ mk_script "$r" 3.5.0 b; commit "$r" bump
 check "跨基础版本抬升 3.4.10→3.5.0 → 通过" "$(run_gate "$r")" "0"
 
 echo ""
-echo "########## 2. 无父提交（gitpub / GitHub 单 commit 快照路径） ##########"
+echo "########## 2. 无父提交（sanitized private replica / GitHub 单 commit 快照路径） ##########"
 
 r="$(new_repo o1)"; mk_script "$r" 3.4.10-h5 a; commit "$r" init
 git -C "$r" tag v3.4.10-h5

@@ -1,25 +1,64 @@
 {
-  "schema": 1,
-  "package": "vless-aio-hardened",
-  "release_channel": "master",
-  "release_model": "rolling",
-  "source": {
-    "repository": "https://github.com/offzen/vless-aio-hardened",
-    "upstream": "https://gitlab.com/chil30-group/vless-all-in-one",
-    "upstream_baseline": "3.4.10"
-  },
-  "policy": "The master branch is the current end-user artifact set; no separate public package version is assigned or displayed.",
-  "upgrade_handshake": {
-    "version": "3.4.10-h12",
-    "why": "Legacy clients (<= 3.4.10-h5) decide upgrades by semantic version only and refuse to install a script whose readonly VERSION is missing; this constant is therefore an upgrade handshake token, not a public release number. It must stay monotonic and match ^[0-9]+(\\.[0-9]+)*(-h[0-9]+)?$.",
-    "anti_downgrade": "This build also refuses to install a remote artifact whose VERSION is lower than the local one (release rollback / mirror lag / accidental stale push)."
+  "artifact_state": "release-ready",
+  "derivation": {
+    "overlay_manifest_sha256": "f991b81168ba5425aa295581f506f54017c307c7e278b0e001a20809bc8be596",
+    "overlay_source": {
+      "commit": "18e23563409960e86981962a27d3c7e3df825f15",
+      "paths": 23,
+      "tree": "60ed3992e7b5527e683a3b1cc5ac9679fe9898ad"
+    },
+    "payload_policy": {
+      "FIXES.md": "approved final-6 base plus safety splice and approved terminology-only runner neutralization",
+      "README.md": "final-6 exact bytes",
+      "USAGE.md": "final-6 exact bytes",
+      "vless-server.sh": "frozen v4 equals final-6 exact bytes"
+    },
+    "payload_source": {
+      "commit": "089cd0b700866685ce2cfd068588fd42c7678c3b",
+      "paths": 6,
+      "tree": "5e93af69d0693a066d7a06e6c25ce238e6f323d1"
+    }
   },
   "file_count": 4,
   "files": {
-    "README.md": "bd2261f6672aa97640b33c44e1081d8839bc44c52833e6df2c625952f5bd3f55",
-    "SHA256SUMS": "f55c071c56b4a188d6feee753506936e42445b22f11304dbdec193679bffba97",
-    "USAGE.md": "d0c016b74b7f37c7fe6dbbd161e612d6c3c52c7fe604c1fe66e485b754ff99b5",
-    "vless-server.sh": "13830a69680f4e2a8ba8a1476e0adb16a91b1dc70bdb20f005321e9f332490d3"
+    "FIXES.md": "f7044e23101401fed24d41346bd05f2a995f66bd5cc4c8bef1a02f4be33eb08c",
+    "README.md": "7a12cb486a9b5f74e0200f22dc766a186c41c42c3b12bacc46beb2ba8fe6f24b",
+    "USAGE.md": "e96229a25bb97b0f6568eeb5d6aad929a3743b90ccc1312263359dbf72844c54",
+    "vless-server.sh": "33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88"
   },
-  "note": "The files map covers README.md, USAGE.md, SHA256SUMS, and vless-server.sh. PROVENANCE.json is excluded from its own hash map to avoid recursive hashing."
+  "integration": {
+    "parent_commit": "0cb21d4b32ef861a9d2c674b5585bd8f4c8fb7f3",
+    "parent_tree": "d74adb8093867204e772cc40e9993fd30095cea2",
+    "topology": "single-parent successor"
+  },
+  "note": "The six-file release package contains four non-recursive content files plus SHA256SUMS and PROVENANCE.json. The files map and SHA256SUMS cover exactly FIXES.md, README.md, USAGE.md, and vless-server.sh. Generated files are excluded to avoid recursive hashing. Commit and tree identifiers for this artifact are recorded in external receipts because embedding them would create a hash cycle.",
+  "package": "vless-aio-hardened",
+  "product": {
+    "sha256": "33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88",
+    "version": "3.4.10-h13"
+  },
+  "release_channel": "main",
+  "release_model": "rolling",
+  "schema": 2,
+  "verification_bindings": {
+    "docker_lifecycle_e2e": {
+      "product_sha256": "33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88",
+      "result": "verified-9-of-9",
+      "test_installer_e2e_sha256": "85c8f4b962d288234560d67d6facad812ea59236e7d5d17b698138ef6fd5b1ef"
+    },
+    "native_sing_box": {
+      "product_sha256": "33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88",
+      "result": "verified"
+    },
+    "real_artifact_upgrade": {
+      "product_sha256": "33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88",
+      "result": "verified-15-of-15"
+    },
+    "runtime": {
+      "basis": "composition",
+      "direct_receipt_scope": "Debian systemd and Alpine OpenRC lifecycle",
+      "product_sha256": "33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88",
+      "result": "verified"
+    }
+  }
 }

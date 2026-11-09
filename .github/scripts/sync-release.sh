@@ -15,7 +15,7 @@
 #   GITHUB_SHA         必需，Release 的 target_commitish
 #   GH_TOKEN / GITHUB_TOKEN  必需，需 contents: write
 #   GITHUB_API_URL     可选，默认 https://api.github.com
-#                      非 GitHub（gitorca/gitpub 的 act_runner）会跑到本作业 ⇒ 跳过并 exit 0
+#                      非 GitHub（private canonical repository/sanitized private replica 的 self-hosted runner）会跑到本作业 ⇒ 跳过并 exit 0
 #   SCRIPT_FILE        可选，默认 vless-server.sh
 #
 # 幂等性：同一 VERSION 重复跑 = no-op；已存在的 Release 不删除、不改写。
@@ -40,7 +40,7 @@ err_ann() {
     if [ "${GITHUB_ACTIONS:-}" = "true" ]; then printf '::error::%s\n' "$*" >&2; else printf '✗ %s\n' "$*" >&2; fi
 }
 
-# 非 GitHub 侧（gitorca / gitpub 的 act_runner）正常会跑到本作业：直接**跳过并成功**。
+# 非 GitHub 侧（private canonical repository / sanitized private replica 的 self-hosted runner）正常会跑到本作业：直接**跳过并成功**。
 # 不能失败——三端共用同一份 ci.yml，若在这里 exit 1 就会把私有侧 CI 染红，
 # 而「私有侧不建 Release」本身是预期行为，不是错误。
 # 2026-10-30 实测：Gitea 1.27.3 的 if: 求值对该作业未生效（作业仍被排队），
@@ -52,7 +52,7 @@ case "$API" in
         if [ "${SYNC_RELEASE_ALLOW_API_OVERRIDE:-0}" = "1" ]; then
             info "警告：已按 SYNC_RELEASE_ALLOW_API_OVERRIDE=1 允许非 GitHub API（仅限离线单测）"
         else
-            info "当前不是 GitHub（GITHUB_API_URL=$API）——私有侧（gitorca/gitpub）不建 Release，跳过"
+            info "当前不是 GitHub（GITHUB_API_URL=$API）——私有侧（private canonical repository/sanitized private replica）不建 Release，跳过"
             printf 'RELEASE_SYNC=skipped\n'
             exit 0
         fi
@@ -151,10 +151,33 @@ if [ -n "$AHEAD" ]; then
 fi
 info "现有 Release 无高于 $VER 的版本（安全阀通过）"
 
-# ---------- 2. 已存在则幂等跳过 ----------
+verify_exact_target() {
+    local release_json="$1" target code tag_commit
+    target="$(jq -r '.target_commitish // empty' "$release_json" 2>/dev/null)"
+    [ -n "$target" ] || { err_ann "Release $TAG 缺少 target_commitish"; return 1; }
+    if [[ "$target" =~ ^[0-9a-f]{40}$|^[0-9a-f]{64}$ ]] && [ "$target" != "$SHA" ]; then
+        err_ann "Release $TAG 的 target_commitish=$target 与当前 GITHUB_SHA=$SHA 不一致"
+        return 1
+    fi
+    # commits/<tag> 会把 lightweight/annotated tag 都解析到最终 commit。
+    code="$(api GET "/repos/$REPO/commits/$TAG" "$TMP/tag-commit.json")"
+    if [ "$code" != "200" ]; then
+        err_ann "解析 tag $TAG 到 commit 失败（HTTP $code）"
+        return 1
+    fi
+    tag_commit="$(jq -r '.sha // empty' "$TMP/tag-commit.json" 2>/dev/null)"
+    if [ "$tag_commit" != "$SHA" ]; then
+        err_ann "Release $TAG 绑定错误：tag peel=${tag_commit:-<空>}，期望当前 GITHUB_SHA=$SHA"
+        return 1
+    fi
+    ok "exact-commit 核验通过：Release/tag $TAG → ${SHA:0:7}"
+}
+
+# ---------- 2. 已存在则仅在 exact commit 一致时幂等成功 ----------
 code="$(api GET "/repos/$REPO/releases/tags/$TAG" "$TMP/one.json")"
 if [ "$code" = "200" ]; then
-    ok "Release $TAG 已存在（幂等，不重建）"
+    verify_exact_target "$TMP/one.json" || exit 1
+    ok "Release $TAG 已存在且绑定当前提交（幂等，不重建）"
     CREATED=0
 elif [ "$code" = "404" ]; then
     BODY="本仓发布快照 \`$TAG\`（脚本 \`readonly VERSION=$VER\`）。
@@ -175,7 +198,8 @@ elif [ "$code" = "404" ]; then
             # 并发/重跑导致已存在：再确认一次
             code2="$(api GET "/repos/$REPO/releases/tags/$TAG" "$TMP/one.json")"
             if [ "$code2" = "200" ]; then
-                ok "Release $TAG 已存在（422 后确认，幂等）"; CREATED=0
+                verify_exact_target "$TMP/one.json" || exit 1
+                ok "Release $TAG 已存在且绑定当前提交（422 后确认，幂等）"; CREATED=0
             else
                 err_ann "创建 Release 被拒（HTTP 422，且复查 HTTP $code2）：$(head -c 300 "$TMP/create.json" 2>/dev/null)"
                 exit 1
@@ -186,6 +210,12 @@ elif [ "$code" = "404" ]; then
             exit 1
             ;;
     esac
+    code="$(api GET "/repos/$REPO/releases/tags/$TAG" "$TMP/one.json")"
+    if [ "$code" != "200" ]; then
+        err_ann "创建后读取 Release $TAG 失败（HTTP $code）"
+        exit 1
+    fi
+    verify_exact_target "$TMP/one.json" || exit 1
 else
     err_ann "查询 Release $TAG 失败（HTTP $code）：$(head -c 300 "$TMP/one.json" 2>/dev/null)"
     exit 1

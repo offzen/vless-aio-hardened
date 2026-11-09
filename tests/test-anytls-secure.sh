@@ -18,7 +18,7 @@ extract_fn() { # $1=fn_name $2=out  $3=wrap
     !f && index($0, fn "()") == 1 { f = 1 }
     f { print }
     f && /^}/ { exit }
-  ' vless-server.sh > "$out"
+  ' "$(dirname "$0")/../vless-server.sh" > "$out"
   # 抽取失败要当场报错，别把 "函数不存在" 留到几十行之后变成 command not found
   if [[ ! -s "$out" ]] || ! grep -q "^$fn()" "$out"; then
     echo "FAIL: 无法从 vless-server.sh 抽取函数 $fn（awk 抽取结果为空或不完整）" >&2

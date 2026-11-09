@@ -1,8 +1,15 @@
 # FIXES — 改动清单与验证记录
 
-基线：`vless-all-in-one` v3.4.10 服务端脚本（上游 24898 行）→ 本补丁 **25362 行**；当前修订 `3.4.10-h5`。
+基线：`vless-all-in-one` v3.4.10 服务端脚本；当前冻结修订 `3.4.10-h13`。`master` 制品仍是唯一真相源，VERSION 仅作兼容握手；本节所列 H13 结论只适用于冻结脚本 SHA `33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88`。
 
 本文件逐条列出改动、位置与验证方式，便于审核与回归。
+
+## 十二、H13 证据收敛候选（2026-11-09）
+
+- **候选身份 fail-closed**：生命周期 E2E 不再接受硬编码旧 SHA 或 dirty bypass；release gate 必须注入 64 位小写 SHA-256，并在宿主与容器内双重核对。产品或测试脚本任一字节变化后，旧收据失效。
+- **updater 部分失败返回非零**：脚本完成校验和替换后，仍依次尝试 `init_db`、Xray 重建/重载、sing-box 重建/重载；任一步失败时保留新脚本与 `.bak`，明确要求人工核对/重建，并以非零退出，不再把自动应用失败冒充完整成功。
+- **版本兼容握手**：`readonly VERSION` 单调抬升为 `3.4.10-h13`，用于 H4/H5/H12 客户端发现与防降级；同版本不同字节仍按滚动 `master` 允许更新。
+- **最终门禁结果**：冻结 H13 产品 SHA 后，16 个命名离线脚本全部通过；updater 集成 97/97；Xray 日志路径 mutation 4/4；候选身份 fail-closed 4/4；注入该精确 SHA 的 Docker 隔离生命周期 E2E 9/9，并完成真实 Xray 26.3.27 数据面与零容器/镜像遗留核验。固定 sing-box 1.13.0 对 H13 生成的 1247-byte AnyTLS 配置执行原生 `check` rc=0，私有网络命名空间 AnyTLS→SOCKS→HTTP marker 数据面通过。私有 manifest 和测试收据已绑定产品与关键测试脚本 SHA。普通 CI 中 `test-webroot-ownership.sh` 仍可能因 runner 不支持 user/mount namespace 而以 SKIP 0 退出；只有明确未跳过的受控环境运行可作为该项 required 证据。
 
 ---
 
@@ -288,20 +295,11 @@ ss -ltnpH | grep xray                                       # 端口都在听
 ### 存量迁移（老安装：anytls 在 xray 核心 + 跑 vless-anytls 独立服务）
 
 **非自动化**。本补丁默认「新装走 sing-box」；存量安装不自动迁移（避免动到正在跑的
-老配置）。迁移用本仓 `migrate-anytls-singbox.sh`：
+老配置）。先备份整个 `$CFG`，尤其是 `db.json`、证书与私钥，再按 `USAGE.md` 的迁移边界
+人工核对数据库、用当前菜单重建配置，并逐项验证服务与真实连接。
 
-```bash
-sudo bash migrate-anytls-singbox.sh --dry-run  # 只读预演（不改库、不重启）
-sudo bash migrate-anytls-singbox.sh            # 实际迁移
-```
-
-该脚本做：① 备份 `$CFG/db.json`；② 把 `xray.anytls` 对象**原子搬移**到
-`singbox.anytls`（字段兼容：`password/port/sni`，旧格式可直接复用）；③ 停用并禁用
-旧独立服务 `vless-anytls`（systemd / OpenRC 都处理）。**最后一步**——重新生成
-`singbox.json` 并重启 `vless-singbox`——因需脚本内部函数，请在脚本菜单
-「服务管理」里执行（重建 Sing-box 配置 + 重启），迁移脚本会打印该指引。
-
-> 迁移前建议手动再备份一次；先在测试机演练。
+旧的独立迁移脚本存在覆盖既有 `singbox.anytls`、先停旧服务且无法证明新服务可用等风险，
+因此不随 H13 发行。不要从旧提交复制或执行该脚本。
 
 ---
 
@@ -338,7 +336,7 @@ README §六 那句「去掉 allowInsecure 才真正受益」一直是手工步�
 
 ### 验证
 
-- `bash -n` 全过（`vless-server.sh` / `migrate-anytls-singbox.sh` / 三个测试脚本）。
+- `bash -n` 全过（`vless-server.sh` 与三个测试脚本）。
 - 单测：`test-gen-anytls.sh`（补 `_info`/`_ok` 桩 + 断言自签证书已生成，CN==sni）、
   `test-anytls-branch.sh`（不变，自签兜底分支仍走全局自签）、
   新增 `test-anytls-secure.sh`（真证书链接去 allowInsecure / 自签保留）。**全部 PASS**。
@@ -439,7 +437,7 @@ vless/xhttp/vision/ws/vmess-ws/ss2022/hy2/trojan/tuic/socks，**唯独没有 any
 GitHub Actions（`ubuntu-latest` = Ubuntu 26.04，`/usr/bin/awk` 实为 **gawk**）上，
 `syntax + anytls unit tests` 作业的 `anytls secure-link conditional unit test` 步骤
 exit 127，报 `_anytls_secure: command not found` / `gen_anytls_link: command not found`。
-同一提交在自托管 act_runner（gitpub / gitorca，awk 为 **mawk**）上全绿
+同一提交在自托管 self-hosted runner（awk 为 **mawk**）上全绿
 ⇒ 是测试脚本的 awk 实现差异，**不是被测脚本 `vless-server.sh` 的问题**。
 
 ### 根因
@@ -460,7 +458,7 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
 - `extract_fn()` 改为 `index($0, fn "()") == 1` 的字符串前缀匹配，不再使用任何正则转义；
 - 抽取结果为空或不含 `^fn()` 时**当场 FAIL 退出**，不再让问题留到几十行之后变成 `command not found`；
 - CI 新增「awk 可移植性」步骤：runner 上若有 `gawk`，就用 gawk 复跑全部单测
-  （无 gawk 则告警跳过），使 gitpub 侧的 mawk runner 也能拦住这类差异。
+  （无 gawk 则告警跳过），使 mawk runner 也能拦住这类差异。
 
 ### 验证（2026-10-30）
 
@@ -566,8 +564,8 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
   `VERSION` **单调递增**（用与脚本内 `_version_gt` 完全一致的算法比较，含 `-h<n>` 后缀）；
   变了但 `VERSION` 没动 → **CI 失败**并给出可直接照做的修复指引；
 - 基准按可用性降级：`--base`（CI 传 `push.before` / PR base sha）→ `HEAD^`
-  （gitorca 带全历史的正本）→ **仓库内最高的语义化 tag `v<X>`**
-  （gitpub / GitHub 是无父单 commit 快照，没有父提交；该 tag 由 ② 幂等维护，
+  （带全历史的正本）→ **仓库内最高的语义化 tag `v<X>`**
+  （历史发布快照曾采用无父单 commit、没有父提交；该 tag 由 ② 幂等维护，
   正好等于「上一次发布」的锚点）→ 都没有则告警放行（首次发布可接受）；
 - 额外拦住：`VERSION` 非语义化（`dev` 之类）、`VERSION` 回退或不可比、脚本缺
   `readonly VERSION=` 常量——这三种都会让客户端**永远收不到更新提示**。
@@ -576,8 +574,8 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
 
 - 读脚本 `VERSION` → tag 名 `v<VERSION>` → `/releases/tags/v<VERSION>` 已存在则 no-op，
   缺失则 `POST /releases`（`target_commitish` = 本次提交，`draft/prerelease` 均 false）；
-- 用**仓库自带 `GITHUB_TOKEN`**（`permissions: contents: write`），不需要外部 PAT；
-  作业用 `if:` 限定只在 GitHub 侧、`master` push 上跑（gitorca/gitpub 不建 Release）；
+- 历史实现使用托管 CI 的仓库级短期凭据（`permissions: contents: write`），不需要外部 PAT；
+  作业用 `if:` 限定只在对应托管 CI 的 `master` push 上跑（私有 Gitea 侧不建 Release）；
 - **纵深防御：脚本自己也判定一次**。非 `api.github.com` 时脚本**跳过并 exit 0**
   （`RELEASE_SYNC=skipped`），不依赖 `if:` 一定写对——若 `if:` 哪天被改坏，
   私有侧也不会因「这里不是 GitHub」而红；
@@ -589,7 +587,7 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
 与 `github-release` 两个作业；`bash -n`、shellcheck 硬闸门、单测清单同步扩列。
 
 > **可移植性说明（2026-10-30 实测，含一次自我纠错）**：
-> - Gitea 1.27.3 的 `if:` **是生效的**：gitpub run 86 日志明确记录
+> - Gitea 1.27.3 的 `if:` **是生效的**：私有 CI 历史 run 86 日志明确记录
 >   `expression '...' evaluated to 'false'` → `Skipping job 'GitHub Release 同步'`。
 > - 但 Gitea 的 `actions/tasks` API 在 runner 求值之前会把该作业显示为 `queued`，
 >   **不能据此判断 `if:` 失效**（本轮一度据此误判，实际是观察时机问题）。
@@ -611,7 +609,7 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
 - 真实仓库实测（`/tmp/vah-git`，非模拟）：把脚本内容改掉但 `VERSION` 不动 → 闸门 rc=1
   并给出「抬到 3.4.10-h6」的指引；再抬 `VERSION` → rc=0；
 - `bash -n` 全过；`shellcheck -S error` 与 `-S warning` 对 4 个新脚本均 0 命中；
-- CI 实跑见下方「验证结果」：gitpub run 88 与 GitHub run 41025032838 全绿，
+- CI 实跑见下方「验证结果」：私有 CI run 88 与托管 CI run 41025032838 全绿，
   Release 由 `github-release` 作业自动建成。
 
 ### 验证结果（2026-10-30 本版发布，逐条实跑取证）
@@ -635,23 +633,23 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
 
 | 仓形态 | 基准来源 | 实跑结果 |
 |---|---|---|
-| GitHub（无父单 commit 快照） | `tag v3.4.10-h5`（日志原文：`基准：tag v3.4.10-h5（c8effa5）`） | ✅ success，判定「内容未变，无需抬升」 |
-| gitpub（无父快照、无语义化 tag） | 无 → 告警跳过 | ✅ success，日志：`无法确定发布基准…跳过 VERSION 抬升校验` |
-| gitorca（全历史正本） | `HEAD^` | ⚠️ **未核 CI**（本机无 gitorca admin token）；该路径以**本地全历史仓实测**替代：改脚本不抬版本 → `rc=1` 并给出抬到 `3.4.10-h6` 的指引，抬了 → `rc=0` |
+| 托管侧（历史无父单 commit 快照） | `tag v3.4.10-h5`（日志原文：`基准：tag v3.4.10-h5（c8effa5）`） | ✅ success，判定「内容未变，无需抬升」 |
+| 私有发布侧（历史无父快照、无语义化 tag） | 无 → 告警跳过 | ✅ success，日志：`无法确定发布基准…跳过 VERSION 抬升校验` |
+| 全历史私有正本 | `HEAD^` | ⚠️ **未核 CI**；该路径以**本地全历史仓实测**替代：改脚本不抬版本 → `rc=1` 并给出抬到 `3.4.10-h6` 的指引，抬了 → `rc=0` |
 
 - 拦截能力的真实验证（本地，非模拟脚本）：把 `vless-server.sh` 改掉但 `VERSION` 不动 →
   `check-version-bump.sh --base HEAD` 返回 **rc=1**；抬到 `h6` → **rc=0**。
 
 **③ CI 全绿（本版最终快照）**
 
-- gitpub run **88**（`fab15e0`）：`syntax + anytls unit tests` ✅、`shellcheck + bashate` ✅、
-  `VERSION 抬升闸门` ✅、`GitHub Release 同步` = **skipped**（`if:` 生效）；
-- GitHub run **41025032838**（`c8effa5`）：4 个作业全部 ✅（含两个新作业）。
+- 私有 CI run **88**（`fab15e0`）：`syntax + anytls unit tests` ✅、`shellcheck + bashate` ✅、
+  `VERSION 抬升闸门` ✅、托管 Release 同步 = **skipped**（`if:` 生效）；
+- 托管 CI run **41025032838**（`c8effa5`）：4 个作业全部 ✅（含两个新作业）。
 
 **④ 发布链自身的历史（如实记录）**
 
-- gitpub run 86：4 作业全绿（该快照的 `if:` 已正确 skip 掉 release 作业）；
-- gitpub run 87：**红** —— `test-sync-release.sh` 继承了 runner 导出的 `GITHUB_API_URL`
+- 私有 CI run 86：4 作业全绿（该快照的 `if:` 已正确 skip 掉 release 作业）；
+- 私有 CI run 87：**红** —— `test-sync-release.sh` 继承了 runner 导出的 `GITHUB_API_URL`
   （私有侧指向 Gitea `/api/v1`），导致「缺 GITHUB_REPOSITORY 应 exit 2」被误判为走了
   「非 GitHub 跳过」分支。已在 run 88 前修掉（用例显式覆盖该变量），并在此留档。
 
@@ -661,8 +659,8 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
   若哪天改为分发 Release 资产或固定 tag，这条约定要跟着改（闸门本身仍然有意义）。
 - 「无父提交时用最高语义化 tag 当基准」：前提是 **② 在每次发版后确实建了 tag**。
   若 CI 的 `github-release` 作业被长期禁用（或仓库换了 GitHub 之外的主机导致 `if:` 不命中），
-  该降级路径会退化成「无基准 → 告警放行」，闸门在 gitpub/GitHub 侧就**只剩告警**，
-  真正的强制点回到 gitorca（有父提交，始终有效）。
+  该降级路径会退化成「无基准 → 告警放行」，闸门在无父发布快照侧就**只剩告警**，
+  真正的强制点回到带父提交的全历史正本。
 - 「Release 与 VERSION 恒一致」：由 `sync-release.sh` 保证，但它只在 GitHub 侧跑。
   **手工在 GitHub 网页上建/改 Release 会绕过该保证**——要改版本必须走发版流程（改脚本 VERSION）。
 - 「安全阀拦住超前 Release」：只看非 draft / 非 prerelease。若有人把超前版本以
@@ -672,3 +670,228 @@ gawk 把字符串里的 `\(` `\{` 当作普通 `(` `{`（并打印
   而最后一个提交又抬了版本，净效果是「脚本变了 + 版本抬了」⇒ 闸门放行。
   这是有意的取舍（刻意不用 `github.event.before` 这类表达式，换三端可移植性）；
   真要逐提交校验，就在本地跑 `bash check-version-bump.sh --base <每个父提交>`。
+
+---
+
+## 历史正本延续：h6–h11
+
+> 以下章节从私有历史正本提交 `b582338` 恢复。它们保留 h6–h11 的问题、修复、实测与失效条件；H13 新证据见本文开头的 H13 章节，两者不得互相替代。旧发布平台操作文字仅作历史证据，不构成当前写入入口。
+
+### 十一、HTTP-01 失败后切换 DNS-01 报 `command not found`（h6）
+
+#### 症状与根因
+
+用户先选 HTTP-01；当 80 端口被其他服务占用、申请失败后，在错误处理菜单选
+「使用 DNS 验证模式」，脚本调用了从未定义的 `get_acme_cert_dns "$domain" "$protocol"`，
+因此立即报 `command not found`，随后上层把失败当成证书申请失败并生成自签证书。
+这不是 DNS-01 本身失败，更不代表第二次申请成功。
+
+脚本已有唯一 DNS-01 实现 `_issue_cert_dns <domain> <cert_dir> <protocol>`；首次直接选择
+DNS 验证的分支本来就正确调用它，只有「HTTP 失败后切 DNS」这个二级入口名称和参数写错。
+
+#### 修复
+
+把错误处理菜单的调用改为：
+
+```bash
+_issue_cert_dns "$domain" "$cert_dir" "$protocol"
+```
+
+不改证书流程、服务商选择或凭据处理，属于单行最小修复。
+
+#### 回归验证
+
+新增 `test-acme-dns-fallback.sh`，静态验证三件事：
+
+1. 不再存在未定义的 `get_acme_cert_dns` 调用；
+2. 首次选择 DNS 与 HTTP 失败后切 DNS 两个入口都向 `_issue_cert_dns` 传齐三参；
+3. `_issue_cert_dns()` 定义存在且唯一。
+
+该测试已接入 CI 的 `bash -n`、功能测试和 ShellCheck error 级闸门。
+
+---
+
+### 十二、DNS-01 使用 Cloudflare Token 仍无法签发（h7）
+
+#### 现场复现与根因
+
+在隔离测试环境用 h6 继续测试发现三项独立问题：
+
+1. 脚本硬编码 `admin@example.com` 并把它注册为 ACME 联系邮箱；`example.com` 是保留示例域，Let's Encrypt 明确以 `invalidContact` 拒绝。
+2. DNS 签发命令位于 `acme.sh | tee | grep | sed` 管道中，`if` 取得的是最后一个过滤命令的状态，而不是 `acme.sh` 的真实返回码，存在失败被误判为成功的风险。
+3. Cloudflare Token `active` 只代表 token 本身有效，不代表它覆盖目标 zone。测试 token 不覆盖目标测试 zone；逐级查询成功返回空结果，因此不能为该 zone 写 TXT。
+
+隔离复现还显示 ZeroSSL 在 DNS 插件运行前即以 `rejectedIdentifier: DNS identifier is disallowed` 拒绝测试标识符；因此不能把所有失败都归因于 CF token。
+
+#### 修复
+
+- 不再使用保留示例域邮箱；支持通过 `ACME_ACCOUNT_EMAIL` 提供真实邮箱，未提供时为 Let's Encrypt 注册无邮箱账户；
+- DNS-01 明确使用 Let's Encrypt，绕开现场 ZeroSSL 对该标识符的策略拒绝；
+- Cloudflare 分支在 CA 下单前只读检查 token 状态并逐级查找目标 zone；token active 但不覆盖 zone 时给出明确错误；
+- Token 输入改为静默读取；签发后立即清空相关环境变量；
+- 先保存 `acme.sh` 退出码，再单独过滤日志展示；
+- `--install-cert` 失败不再继续写成功状态。
+
+#### 回归验证
+
+`test-acme-dns-fallback.sh` 最终扩为 7 条断言：原 h6 三项，加上返回码判据、Cloudflare zone 预检、禁止保留示例邮箱，以及禁止组合会被 acme.sh v3.1.7 解析为 production 的 `--server letsencrypt --staging` 参数。本地 h7 候选的语法、7/7 回归、19/19 VERSION 闸门、版本判定和 ShellCheck error 级均通过。
+
+隔离环境验收结论（2026-11-01）：
+
+- **verified**：错误 zone token 在 CA 下单前失败，不写 TXT、不替换证书；h7 脚本部署不重启 Reality/Caddy；
+- **verified**：使用独立的 root-only 目标 zone token 引用完成 active/zone/DNS read、临时 TXT create/read/delete/absent；
+- **verified（纠错后）**：首轮 `--server letsencrypt --staging` 实际仍命中 production，不能作为 staging 证据；经源码复核和用户确认后，改用明确 staging directory 补跑成功（issuer 含 `(STAGING)`），测试 SAN 与私钥匹配。production DNS-01 也成功；实际顺序为 production 后补验真正 staging；
+- **verified**：正式证书安装后 Reality PID 与 `NRestarts=0` 不变，端到端探针返回 HTTP 204；Caddy 未 stop/restart，邮件入口状态保持 302/200/302，challenge/probe TXT 均无残留。
+
+运维边界：该次签发使用隔离 ACME home，因此**自动续期尚未配置**；不要把这次一次性验证误写成续期已启用。现场完整证据、回滚目录与适用范围见外部审计交付物。
+
+---
+
+### 十三、订阅/Nginx 默认关闭与 Reality 多端口解耦（h8）
+
+#### 现场触发
+
+在已有 `8443` Reality 的 Debian 主机新增 `9443` Reality，并复用真实证书域名时，旧逻辑在最终安装确认前就自动生成订阅文件、写 Nginx 配置并尝试启动 Nginx。发行版默认站点要监听 `:80`，与现役共享 Web 服务冲突，留下 `nginx.service=failed`；同时新端口被生成成 `dest=127.0.0.1:8443`，把 Reality 数据面错误绑定到未运行的本机 Nginx/另一个 Xray inbound。
+
+另一个既有缺陷是：生成的独立 `watchdog.sh` 调用了只存在于主脚本作用域的 `_pgrep`，journal 每分钟出现 `command not found`。
+
+#### 修复
+
+1. 协议安装、证书复用和 ACME 路径只处理协议与证书，**不再**生成订阅、不再安装/配置/启停 Nginx；HTTP-01 发现 80 被占用时明确失败并提示 DNS-01，不自动停止共享 Web 服务。
+2. 菜单 6 是唯一订阅启用入口；进入后还需再次输入 `y` opt-in，之后才允许首次生成订阅或安装 Nginx。`generate_sub_files` / `create_fake_website` / `setup_nginx_sub` 均增加显式调用守卫。
+3. 停用订阅、卸载协议/整套脚本只删除本项目文件，并对正在运行的共享 Nginx 做语法检查后平滑 reload；不自动 stop/disable，不删除发行版默认站点。
+4. Reality target 恒为所选 `SNI:443`；删除“真证书域名 → 固定 `127.0.0.1:8443`”改写和隐式 Nginx helper。
+5. Reality 选择随机 SNI 时只影响新入站，不再删除共享 `server.crt` / `server.key` / `cert_domain`，避免破坏其它 TLS 协议与续期。
+6. 生成的 watchdog 内嵌兼容 `_pgrep`，不再依赖主脚本函数作用域。
+
+#### 回归
+
+- `test-subscription-opt-in.sh`：7 条断言覆盖证书/协议路径无 Nginx 副作用、首次生成订阅与 Nginx 的 opt-in 守卫、停用/卸载不 stop/disable 共享 Nginx、不得删除默认站点、随机 SNI 不删除共享证书。
+- `test-reality-target-watchdog.sh`：5 条断言覆盖 Reality target、不依赖本机 8443、watchdog 语法、自包含 helper 及连续两轮进程检测。
+- 两个测试均接入 CI 的 syntax、功能和 ShellCheck error 级闸门。
+
+#### 边界
+
+h8 当前只完成源码与隔离回归；尚未在干净 Debian/Alpine 真实组件环境跑完整交互式新装/订阅启停，也未修改已有生产主机的半配置状态。不能仅凭本节宣称 GA 已放行。
+
+---
+
+### 十四、卸载 Web root 所有权与第三方首页保护（h9）
+
+#### 问题与原则
+
+h8 的 `do_uninstall()` 仍无条件删除共享 `/var/www/html/index.html`，而旧 `create_fake_website()` / NaïveProxy 路径还会覆盖既存首页。这无法证明文件属于本项目，也与“共享 Nginx/默认站点保持”承诺冲突。
+
+h9 采用 fail-closed 所有权语义：
+
+1. 全部项目首页入口统一调用 `create_webroot_placeholder()`；路径已存在（含符号链接）即原样保留，不覆盖、不备份、不声称所有权。
+2. 只在路径原先不存在时以 `noclobber` 创建 placeholder，并将路径、`device:inode:size:uid:gid:mode` identity 与 SHA-256 写入 root-only 的 `$CFG/webroot-placeholder.meta`。
+3. `do_uninstall()` 只调用 `cleanup_webroot_placeholder()`；仅当记录版本/路径、identity 与 SHA-256 全部匹配且目标不是符号链接时才删除。任何修改、替换、记录损坏或工具不可用都保留文件并告警。
+4. 所有权检查后总会删除元数据，避免过期记录将未来同路径文件误判为项目资产。
+
+当前 h9 不再替换既存文件，因此新流程无需产生第三方备份。h8 及更早版本若已经覆盖第三方首页且当时未留备份，h9 无法验证或恢复原内容；这是不可逆历史状态，不能伪造恢复语义。
+
+#### 自动回归
+
+新增 `test-webroot-ownership.sh`：
+
+- 在 user/mount/network/PID namespace 中直接 source 完整正式脚本（`VLESS_SOURCE_ONLY=1` 仅跳过 CLI 入口），依次调用真实 `setup_subscription_interactive` → `manage_subscription` 停用分支 → `do_uninstall`；不再抽 helper 或手工模拟生命周期；
+- 预置第三方 marker、默认站点软链和 Nginx unit/enable-link fixture；在 before、enable、disable、uninstall 四个阶段逐次断言 marker SHA-256、真实 loopback HTTP 200 响应体 SHA、默认站点链接/目标 hash/元数据、unit hash/元数据/enable-link 全部保持，且不生成项目所有权记录；
+- 严格 nginx/systemctl spy 只允许语法检查、enable/reload 及项目自己的卸载动作，任何共享 Nginx stop/disable/restart/mask/kill 或未知调用都会留下粘性失败记录；
+- 项目 placeholder 的身份匹配删除与被替换后 fail-closed 仍由正式 helper 语义及 lifecycle 调用覆盖。
+
+同时将 `test-subscription-opt-in.sh` 扩为 8 条断言，新增“卸载不得无条件删除共享首页”；两项均接入 CI 的 syntax、功能与 ShellCheck error 级入口。
+
+#### 边界
+
+本节直接证明本地真实函数控制流、真实 loopback HTTP 内容保持及 Nginx 服务命令契约；没有运行 Debian/Alpine 真实 Nginx 组件或隔离 init/systemd，因此不把 spy/fixture 称为真实 Nginx reload 或 unit 运行态 E2E。也没有远端 CI、生产迁移或旧版本受损首页恢复。
+
+### 十五、手动禁用后空客户端入站仍保留（h9 候选补丁）
+
+`gen_xray_vmess_clients` / `gen_xray_trojan_clients` 已能返回 `[]` 防止禁用用户从顶层 UUID/密码复活，但 `add_xray_inbound_v2` 的 VMess-WS、Trojan/Trojan-WS 分支仍将空客户端 inbound 拼入最终 Xray JSON。候选修复在这些分支中与 VLESS 一致：无启用客户端时跳过该端口，不再留下可监听但没有用户的代理 inbound。
+
+`test-manual-user-disable.sh` 新增混合 enabled VLESS-WS 与 disabled VMess-WS 的完整生成器断言：修复前「disabled VMess-WS has no listener」FAIL，修复后 PASS，且 enabled peer 保留。此为合成配置回归，**不是** Xray 原生校验、实际监听或客户端数据面验收；详细测试分级保存在私有正本的分层测试计划中。
+
+### 十六、Xray 日志路径被写成字面量 shell 语法（h10）
+
+`generate_xray_config` 用四处 `jq -n '...'` 构建配置，jq 程序是**单引号**的，因此其中的 `"${VLESS_TEST_LOG_ROOT:-/var/log}/xray/access.log"` 从未被 shell 展开，而是原样写进 JSON。Xray 启动时真的去 `open()` 这个含 `${...}` 的路径，直接失败：
+
+```text
+Failed to start: main: failed to create server > app/log: failed to initialize access logger
+  > open ${VLESS_TEST_LOG_ROOT:-/var/log}/xray/access.log: no such file or directory   (rc=23)
+```
+
+与此同时第 3000 行的 `mkdir -p "${VLESS_TEST_LOG_ROOT:-/var/log}/xray"` 是 **Bash 层**、会正常展开，于是目录建在真实路径、配置指向字面量路径，两者永远不一致。这是 h9 引入 `VLESS_TEST_LOG_ROOT` 间接层时产生的回归，**影响全新安装**（新装通常无分流规则，正好走无路由分支）。
+
+修复：函数内先算 `local log_root="${VLESS_TEST_LOG_ROOT:-/var/log}/xray"`，四处 jq 增加 `--arg logroot "$log_root"` 并改为 `access: ($logroot + "/access.log")` / `error: ($logroot + "/error.log")`。`VERSION` 抬到 `3.4.10-h10`（版本闸门要求）。
+
+验证：新增 `test-xray-log-path.sh` 强制四个分支（无路由 / 有路由 / 多 IP / 用户规则）逐条断言 `log.access`、`log.error` 等于真实展开路径且生成物不含 `${`；**修复前 12 条断言全部 FAIL，修复后全 PASS**。另在隔离测试机上用真实 Xray 26.3.27 跑 `xray run -test`：`rc=0`、`Configuration OK.`，生成路径为真实临时目录。
+
+升级路径已核对：`do_update` 替换脚本后调用 `rebuild_and_reload_xray "silent"`，因此带字面量旧配置的既有安装**会在脚本升级时自动重建并治愈**，无需额外一次性补丁。
+
+#### 边界
+
+本节证明的是配置生成正确性与 Xray 原生**配置解析**通过；不含真实端口监听、客户端数据面、真实 Nginx/systemd 生命周期或完整安装器 E2E。测试环境现役服务全程未改（MainPID/NRestarts/config/db 指纹前后一致）。
+
+### 3.4.10-h11：日志路径与下载 URL 加固
+
+h10 修复了 `jq -n` 单引号内日志路径字面量的缺陷。h11 在同一缺陷类上补三项加固，并抬升版本号：
+
+1. **`generate_xray_config` 的日志目录只算一次，并检查 `mkdir` 返回值。**
+   - 先计算 `log_root="${VLESS_TEST_LOG_ROOT:-/var/log}/xray"`，再用 `mkdir -p "$log_root"` 建目录。
+   - 建目录失败时 `_err` 并 `return 1`，不用 `exit`，以免杀掉交互菜单。
+   - `VLESS_TEST_LOG_ROOT` 非空且不是绝对路径时直接拒绝。
+   - 回退语义不变：未设置或空串都回退 `/var/log`（用 `:-`，不是 `-`）。
+   - 修正了过期注释，它原先写的是 `XDG_STATE_HOME`，实际机制是 `VLESS_TEST_LOG_ROOT`。
+2. **`_install_binary` 增加"URL 不得残留占位符"断言。** 替换完成后若 `url` 仍含 `$`，报出具体残留的占位符和完整 URL，并 `return 1`，不再发起 `curl`。
+3. **`VERSION` 从 `3.4.10-h10` 抬升到 `3.4.10-h11`**，满足 `test-version-bump-gate.sh` 对"行为变更必须抬版本"的要求。
+
+**判据**
+- **为什么 `mkdir` 失败必须 fail-fast：** 忽略返回值会产出一个指向不存在目录的 `config.json`，失败被推迟到 Xray 启动期（h9 那种"跑到最后才炸"）。提前到生成期后，错误发生在最靠近原因的位置，调用方能拿到非零返回值，报错也能指向真正的路径。
+- **为什么要拒绝相对路径：** `mkdir` 按脚本 cwd 建目录，Xray 按自己的 cwd 打开文件，两者错位会造成"目录存在但服务起不来"，极难排查。
+- **为什么下载 URL 要断言无残留 `$`：** URL 模板是单引号的，靠显式替换表展开。表外的新占位符会静默拼出含字面量 `$` 的 URL，只表现为 404 和"下载失败"。这与 h10 的单引号字面量是同一缺陷类，所以让它在请求前就大声失败。
+
+**失效条件：** 若将来日志路径不再走 `VLESS_TEST_LOG_ROOT`，或 `_install_binary` 不再用单引号占位符加显式替换表，本节判据需要重写。
+
+#### 3.4.10-h11 验收证据（三轮真实 E2E，2026-11-07/08）
+
+h11 之前的验收只覆盖"函数级单测"，安装器本身因**无非交互入口**被记为 blocked。本轮用
+`pty` 驱动器把 25k 行安装器真正跑通，在三个真实环境各自验收：
+
+| 环境 | 发行版/init | 场景 | 结果 |
+|---|---|---|---|
+| 测试环境 A | Debian 13 / **systemd 257** | 覆盖现有端口重装（真实安装向导） | 通过 |
+| 测试环境 B | Alpine 3.24.4 / **OpenRC**，纯 IPv6 | **全新安装（从零）** | 通过 |
+| 测试环境 C | Alpine 3.19.1 / OpenRC | **3.4.8 → 3.4.10-h11 升级** | 通过 |
+
+**关键证据（可复现，非推断）：**
+
+1. **systemd 分支**：`vless-reality.service` / `vless-watchdog.service` 的 mtime 晚于安装时间戳
+   ⇒ 证明 `_write_systemd` 确实被执行（而非沿用旧单元）；`systemd-analyze verify` rc=0；
+   单元内容与 3.4.8 时代**字节一致**（sha12 `48b9bd326384` 未变）⇒ h11 未无意改动 systemd 单元格式。
+2. **OpenRC 全新安装**：`/etc/init.d/vless-reality` 与 `vless-watchdog` **从无到有**被创建
+   （mtime > 时间戳，`-x` 可执行），`/etc/runlevels/default/` 建出两条软链，`rc-service status`
+   报 started，xray 新 pid 监听配置端口；`xray run -test` rc=0；配置内 `${` 字面量 **0** 处。
+3. **真实 reboot 后的启动顺序**：`need net` 生效，重启后 **3 秒内**服务自启、地址恢复、数据面复测 200。
+4. **数据面（三轮全部实测）**：真客户端 → reality → 目标站点，HTTP **200**、出口 IP 与直连**一致**、
+   `generate_204` = **204**，且 `/var/log/xray/access.log` 运行时有增长（不是仅 `test -w`）。
+5. **升级不动数据**：测试环境 C 3.4.8→h11 后 `db.json` sha256 **完全未变**（私有收据保留精确值），
+   仅 `config.json` 被重建。
+
+**顺带定论：`routing.rules` 从 1 条变 3 条不是回归。**
+3.4.8 脚本内 `bittorrent` 出现 **0** 次、其生成配置只有 1 条 `api` 规则；h11 新增
+①拦私网/链路本地（`10/8,172.16/12,192.168/16,127/8,169.254/16,224/4,240/4,fc00::/7,fe80::/10`）
+②拦 `bittorrent`，属**有意加固**。注意这两条在 `generate_xray_config` 的 4 个 jq 站点
+**各自硬编码**，与 `db_get_routing_rules` 是否为 `[]` **无关**——因此"外层门"只对
+**用户自定义分流**成立，写测试时不要假设"无 routing 就没有 rules"。
+
+**本轮暴露的两个可测性/健壮性缺陷（未在本版修复，留待 h12）：**
+
+- `_write_openrc` / `_write_systemd` **嵌套在 `create_service()` 体内**，不是顶层函数。
+  `VLESS_SOURCE_ONLY=1` source 后取不到，函数级单测无法覆盖，只能靠端到端。
+  建议提升为顶层函数，直接可测。
+- 安装流程大量使用**裸 `xray` / `sing-box`** 调用（13 + 6 处），依赖调用方 `$PATH` 含
+  `/usr/local/bin`。脚本自身**从不设置 `$PATH`**。真实 Alpine/Debian 的 `/etc/profile`
+  都含该路径，故常规场景无碍；但在 `pct exec`、精简容器、非登录 shell 等环境会表现为
+  "密钥生成失败"这类**误导性报错**（真正原因是 command not found）。建议改为
+  `"$XRAY_BIN"` 之类的绝对路径变量。

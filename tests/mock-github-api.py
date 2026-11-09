@@ -40,6 +40,13 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/repos/"):
                 if path.endswith("/releases"):
                     return self._send(200, STATE["releases"])
+                if "/commits/" in path:
+                    tag = path.rsplit("/", 1)[1]
+                    for rel in STATE["releases"]:
+                        if rel.get("tag_name") == tag:
+                            sha = rel.get("tag_sha", rel.get("target_commitish", ""))
+                            return self._send(200, {"sha": sha})
+                    return self._send(404, {"message": "Not Found"})
                 if "/releases/tags/" in path:
                     tag = path.rsplit("/", 1)[1]
                     for rel in STATE["releases"]:
@@ -83,6 +90,7 @@ class Handler(BaseHTTPRequestHandler):
                     "draft": bool(data.get("draft")),
                     "prerelease": bool(data.get("prerelease")),
                     "target_commitish": data.get("target_commitish"),
+                    "tag_sha": data.get("target_commitish"),
                     "body": data.get("body", ""),
                 }
                 STATE["releases"].append(rel)

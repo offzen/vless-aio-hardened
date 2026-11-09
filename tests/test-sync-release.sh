@@ -1,14 +1,14 @@
 #!/bin/bash
 # 单元测试：.github/scripts/sync-release.sh（GitHub Release 幂等同步）
 #
-# 用本地 mock GitHub API（test/mock-github-api.py）覆盖：创建 / 幂等 / 安全阀（已存在
+# 用本地 mock GitHub API（tests/mock-github-api.py）覆盖：创建 / 幂等 / 安全阀（已存在
 # 更高版本 Release）/ 非语义化 tag 忽略 / draft 忽略 / 读回核验失败。
 # 全离线，不碰真实 GitHub（不会建出任何真 Release）。
 set -uo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SYNC="$ROOT/.github/scripts/sync-release.sh"
-MOCK="$ROOT/test/mock-github-api.py"
+MOCK="$ROOT/tests/mock-github-api.py"
 [ -f "$SYNC" ] || { echo "FAIL: 找不到 $SYNC" >&2; exit 1; }
 [ -f "$MOCK" ] || { echo "FAIL: 找不到 $MOCK" >&2; exit 1; }
 for dep in curl jq; do
@@ -78,7 +78,7 @@ post_bodies() { # 取所有 POST /repos/.../releases 的载荷
 echo "########## 1. 环境与版本校验 ##########"
 
 # 注意：本测试必须**显式控制 GITHUB_API_URL**。CI runner 自身就会导出
-# GITHUB_API_URL（gitorca/gitpub 上是 Gitea 的 /api/v1），若继承它，
+# GITHUB_API_URL（private canonical repository/sanitized private replica 上是 Gitea 的 /api/v1），若继承它，
 # 脚本会走「非 GitHub → 跳过」分支而不是报配置错误，断言就会失真。
 d="$WORK/s_env"; mk_script "$d" 3.4.10-h5
 ( cd "$d" && env -u GITHUB_REPOSITORY -u GITHUB_SHA -u GH_TOKEN -u GITHUB_TOKEN \
@@ -93,10 +93,10 @@ check "脚本 VERSION 非语义化(dev) → 1" "$(run_sync "$d")" "1"
 d="$WORK/s_nover"; mkdir -p "$d"; printf '#!/bin/bash\necho x\n' > "$d/vless-server.sh"
 check "脚本无 readonly VERSION → 1" "$(run_sync "$d")" "1"
 
-# 私有侧（gitorca/gitpub 的 act_runner）会跑到本作业：必须**跳过并成功**，不能染红 CI
+# 私有侧（private canonical repository/sanitized private replica 的 self-hosted runner）会跑到本作业：必须**跳过并成功**，不能染红 CI
 d="$WORK/s_skip"; mk_script "$d" 3.4.10-h5
 ( cd "$d" && env GITHUB_REPOSITORY=zaoz/vless-aio-hardened GITHUB_SHA="$SHA40" \
-    GH_TOKEN=dummy-token GITHUB_API_URL="https://gitpub.example.invalid/api/v1" \
+    GH_TOKEN=dummy-token GITHUB_API_URL="https://gitea.example.invalid/api/v1" \
     bash "$SYNC" >"$WORK/skip.log" 2>&1 )
 check "非 GitHub 侧（Gitea API）→ 跳过并成功(0)" "$?" "0"
 check "跳过时输出 RELEASE_SYNC=skipped" "$(grep -c 'RELEASE_SYNC=skipped' "$WORK/skip.log")" "1"
@@ -120,10 +120,16 @@ check "读回 /releases/latest 命中" \
 echo ""
 echo "########## 3. 幂等（已存在不重建） ##########"
 
-reset_mock '{"releases":[{"tag_name":"v3.4.10-h5","draft":false,"prerelease":false}]}'
-check "Release 已存在 → 0（no-op）" "$(run_sync "$d")" "0"
+reset_mock "{\"releases\":[{\"tag_name\":\"v3.4.10-h5\",\"draft\":false,\"prerelease\":false,\"target_commitish\":\"$SHA40\",\"tag_sha\":\"$SHA40\"}]}"
+check "Release 已存在且绑定当前 commit → 0（no-op）" "$(run_sync "$d")" "0"
 check "已存在时不发 POST" "$(post_bodies | head -1)" "0"
-check "输出「已存在」" "$(grep -c "已存在" "$WORK/last.log")" "1"
+check "输出 exact-commit 核验通过" "$(grep -c "exact-commit 核验通过" "$WORK/last.log")" "1"
+
+BAD_SHA="ffffffffffffffffffffffffffffffffffffffff"
+reset_mock "{\"releases\":[{\"tag_name\":\"v3.4.10-h5\",\"draft\":false,\"prerelease\":false,\"target_commitish\":\"$BAD_SHA\",\"tag_sha\":\"$BAD_SHA\"}]}"
+check "同名 Release 指向错误 commit → fail closed(1)" "$(run_sync "$d")" "1"
+check "错误绑定时不发 POST" "$(post_bodies | head -1)" "0"
+check "错误文案点明 exact commit mismatch" "$(grep -Ec "绑定错误|target_commitish=.*不一致" "$WORK/last.log")" "1"
 
 echo ""
 echo "########## 4. 安全阀：已存在更高版本 Release ##########"

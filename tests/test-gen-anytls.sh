@@ -16,7 +16,7 @@ _save_join_info() { echo "SAVE: $1 | $2 | $3" >> "$CFG/calls.log"; }
 _info() { echo "INFO: $*" >> "$CFG/calls.log"; }
 _ok() { echo "OK: $*" >> "$CFG/calls.log"; }
 
-awk '/^gen_anytls_server_config\(\)/,/^}/' vless-server.sh > /tmp/genfn.sh
+awk '/^gen_anytls_server_config\(\)/,/^}/' "$(dirname "$0")/../vless-server.sh" > /tmp/genfn.sh
 sed '1d;$d' /tmp/genfn.sh > /tmp/genbody.sh
 { echo "gen_anytls_server_config() {"; cat /tmp/genbody.sh; echo "}"; } > /tmp/genwrapped.sh
 

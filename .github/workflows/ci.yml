@@ -1,12 +1,12 @@
 # vless-aio-hardened 内部工作流 CI
-# 自托管 gitorca act_runner（gate2-gitorca, ubuntu-latest）。
+# 自托管 private canonical repository self-hosted runner（self-hosted-runner, ubuntu-latest）。
 # 验证：bash -n 语法 + anytls→sing-box 单测 + shellcheck/bashate 静态检查。
 
 name: ci
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, release/h13-converged-1]
   pull_request:
 
 permissions:
@@ -22,59 +22,90 @@ jobs:
       - name: bash -n syntax check
         run: |
           bash -n vless-server.sh
-          bash -n migrate-anytls-singbox.sh
-          bash -n test-gen-anytls.sh
-          bash -n test-anytls-branch.sh
-          bash -n test-anytls-secure.sh
-          bash -n test-singbox-users.sh
-          bash -n test-version-check.sh
+          bash -n tests/test-gen-anytls.sh
+          bash -n tests/test-anytls-branch.sh
+          bash -n tests/test-anytls-secure.sh
+          bash -n tests/test-singbox-users.sh
+          bash -n tests/test-version-check.sh
           bash -n check-version-bump.sh
-          bash -n test-version-bump-gate.sh
-          bash -n test-sync-release.sh
+          bash -n tests/test-version-bump-gate.sh
+          bash -n tests/test-sync-release.sh
+          bash -n tests/test-high-risk-repair.sh
+          bash -n tests/test-installer-e2e.sh
+          bash -n tests/test-updater-integration.sh
+          bash -n tests/test-acme-dns-fallback.sh
+          bash -n tests/test-reality-target-watchdog.sh
+          bash -n tests/test-subscription-opt-in.sh
+          bash -n tests/test-manual-user-disable.sh
+          bash -n tests/test-xray-log-path.sh
+          bash -n tests/test-log-root-guard.sh
+          bash -n tests/test-webroot-ownership.sh
+          bash -n tests/test-release-bindings.sh
           bash -n .github/scripts/sync-release.sh
 
       - name: gen_anytls_server_config unit test
-        run: bash test-gen-anytls.sh
+        run: bash tests/test-gen-anytls.sh
 
       - name: generate_singbox_config anytls-branch unit test
-        run: bash test-anytls-branch.sh
+        run: bash tests/test-anytls-branch.sh
 
       - name: anytls secure-link conditional unit test
-        run: bash test-anytls-secure.sh
+        run: bash tests/test-anytls-secure.sh
 
       - name: singbox multi-port / users / sniff functional test
-        run: bash test-singbox-users.sh
+        run: bash tests/test-singbox-users.sh
 
       - name: 脚本自升级版本判定单测（滚动 tag `dev` 不得被判为新版本）
-        run: bash test-version-check.sh
+        run: bash tests/test-version-check.sh
 
       - name: 发布闸门自测（改了 vless-server.sh 必须抬 VERSION）
-        run: bash test-version-bump-gate.sh
+        run: bash tests/test-version-bump-gate.sh
 
       - name: Release 同步作业自测（本地 mock GitHub API，不会建出真 Release）
-        run: bash test-sync-release.sh
+        run: bash tests/test-sync-release.sh
+
+      - name: H10/H11/H12 离线回归与 H13 updater 门禁
+        run: |
+          bash tests/test-high-risk-repair.sh
+          bash tests/test-acme-dns-fallback.sh
+          bash tests/test-reality-target-watchdog.sh
+          bash tests/test-subscription-opt-in.sh
+          bash tests/test-manual-user-disable.sh
+          bash tests/test-xray-log-path.sh
+          bash tests/test-xray-log-path.sh --mutation-selfcheck
+          bash tests/test-log-root-guard.sh
+          bash tests/test-webroot-ownership.sh
+          bash tests/test-updater-integration.sh
+          bash tests/test-installer-e2e.sh --identity-selftest
+
+      - name: 发行包绑定一致性（SHA256SUMS / PROVENANCE 必须与实际字节一致）
+        run: bash tests/test-release-bindings.sh
 
       - name: awk 可移植性（有 gawk 就用 gawk 复跑单测，模拟 GitHub runner）
         run: |
           # 单测靠 awk 从 vless-server.sh 抽取函数体。mawk 与 gawk 对正则转义的
-          # 处理不同：gawk 把 "\(" 当普通 "("，mawk 当字面量 "("。自托管 act_runner
-          # 多为 mawk、GitHub runner 为 gawk —— 只在 gitpub 跑 mawk 会漏掉这类问题
+          # 处理不同：gawk 把 "\(" 当普通 "("，mawk 当字面量 "("。自托管 self-hosted runner
+          # 多为 mawk、GitHub runner 为 gawk —— 只在 sanitized private replica 跑 mawk 会漏掉这类问题
           # （2026-10-30 GitHub run 41014766295 即挂于此）。故主动用 gawk 复跑。
           if ! command -v gawk >/dev/null 2>&1; then
-            echo "::warning::gawk 不可用，跳过 awk 可移植性复跑（GitHub runner 用 gawk）"
-            exit 0
+            if command -v sudo >/dev/null 2>&1; then
+              sudo apt-get update -y && sudo apt-get install -y gawk
+            else
+              apt-get update -y && apt-get install -y gawk
+            fi
           fi
+          command -v gawk >/dev/null 2>&1 || { echo "::error::gawk 不可用"; exit 1; }
           gawk --version | head -1
           shim="${RUNNER_TEMP:-/tmp}/awk-gawk"
           mkdir -p "$shim"
           ln -sf "$(command -v gawk)" "$shim/awk"
           export PATH="$shim:$PATH"
           echo "awk -> $(readlink -f "$(command -v awk)")"
-          bash test-gen-anytls.sh
-          bash test-anytls-branch.sh
-          bash test-anytls-secure.sh
-          bash test-singbox-users.sh
-          bash test-version-check.sh
+          bash tests/test-gen-anytls.sh
+          bash tests/test-anytls-branch.sh
+          bash tests/test-anytls-secure.sh
+          bash tests/test-singbox-users.sh
+          bash tests/test-version-check.sh
 
   static-analysis:
     name: shellcheck + bashate
@@ -107,33 +138,32 @@ jobs:
         run: |
           # 分文件单独跑 shellcheck 降低峰值内存（25k 行基线脚本在 runner 上
           # 与 migrate 脚本合跑曾 OOM(exit 137)，并非真检出问题）
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            echo "::warning::shellcheck 未安装，跳过该步"; exit 0
-          fi
+          command -v shellcheck >/dev/null 2>&1 || {
+            echo "::error::shellcheck 安装步骤未提供可执行文件"
+            exit 1
+          }
           fail=0
-          # 新交付文件（迁移脚本）——硬闸门：真检出 error 级问题才失败
-          shellcheck -S error migrate-anytls-singbox.sh || fail=1
           # 新交付测试脚本——硬闸门
-          shellcheck -S error test-anytls-secure.sh || fail=1
-          shellcheck -S error test-singbox-users.sh || fail=1
-          shellcheck -S error test-version-check.sh || fail=1
+          shellcheck -S error tests/test-anytls-secure.sh || fail=1
+          shellcheck -S error tests/test-singbox-users.sh || fail=1
+          shellcheck -S error tests/test-version-check.sh || fail=1
           shellcheck -S error check-version-bump.sh || fail=1
-          shellcheck -S error test-version-bump-gate.sh || fail=1
-          shellcheck -S error test-sync-release.sh || fail=1
+          shellcheck -S error tests/test-version-bump-gate.sh || fail=1
+          shellcheck -S error tests/test-sync-release.sh || fail=1
+          # Imported harness intentionally replaces cleanup_hy2_nat_rules later with a spy.
+          shellcheck -S error -e SC2218 tests/test-high-risk-repair.sh || fail=1
+          shellcheck -S error tests/test-installer-e2e.sh || fail=1
+          shellcheck -S error tests/test-updater-integration.sh || fail=1
+          shellcheck -S error tests/test-acme-dns-fallback.sh || fail=1
+          shellcheck -S error tests/test-reality-target-watchdog.sh || fail=1
+          shellcheck -S error tests/test-subscription-opt-in.sh || fail=1
+          shellcheck -S error tests/test-manual-user-disable.sh || fail=1
+          shellcheck -S error tests/test-xray-log-path.sh || fail=1
+          shellcheck -S error tests/test-log-root-guard.sh || fail=1
+          shellcheck -S error tests/test-webroot-ownership.sh || fail=1
           shellcheck -S error .github/scripts/sync-release.sh || fail=1
-          # 基线大脚本——error 级：已实测 0 命中；OOM/被杀(137)视为资源问题仅告警
-          set +e
-          shellcheck -S error vless-server.sh
-          rc=$?
-          set -e
-          if [[ $rc -ne 0 && $rc -ne 137 ]]; then
-            echo "::error::vless-server.sh 检出 error 级问题 (rc=$rc)"
-            fail=1
-          elif [[ $rc -eq 137 ]]; then
-            echo "::warning::vless-server.sh shellcheck 被杀(OOM/资源)，非真检出；run89 已实测 error 级 0 命中"
-          fi
-          # warn 级：仅报告（上游基线本就带 ~6k 行风格告警，非本补丁引入，不阻断）
-          shellcheck -S warning migrate-anytls-singbox.sh | grep -E 'migrate-anytls|anytls' || true
+          # 基线大脚本——error 级：任何非零（包括 OOM/被杀）都必须使 required job 失败
+          shellcheck -S error vless-server.sh || fail=1
           exit $fail
 
       - name: bashate（仅报告，不阻断）
@@ -148,8 +178,8 @@ jobs:
   # 发布闸门：改了 vless-server.sh 就必须抬 readonly VERSION=
   # 2026-10-30 死循环事故的成因之一就是「只改脚本/CI、VERSION 不动」——用户装的是
   # raw master 上的脚本，版本号不动 ⇒ 存量机器收不到提示、重装也拿不到新逻辑。
-  # 基准选取见 check-version-bump.sh 头部注释：优先父提交（gitorca 全历史正本），
-  # 无父提交（gitpub/GitHub 是无父单 commit 快照）时退化为「最高语义化 tag」。
+  # 基准选取见 check-version-bump.sh 头部注释：优先父提交（private canonical repository 全历史正本），
+  # 无父提交（sanitized private replica/GitHub 是无父单 commit 快照）时退化为「最高语义化 tag」。
   #
   # 刻意**不用任何 ${{ }} 表达式**：三端共用同一份 ci.yml，而 Gitea 1.27.3 的
   # act 对部分 github.* 属性支持不全，表达式一旦求值失败会让作业静默消失（闸门形同不存在）。
@@ -180,6 +210,10 @@ jobs:
   # ---------------------------------------------------------------------------
   github-release:
     name: GitHub Release 同步
+    needs:
+      - syntax-and-tests
+      - static-analysis
+      - version-bump-gate
     if: >-
       github.repository == 'offzen/vless-aio-hardened' &&
       github.ref == 'refs/heads/master' &&

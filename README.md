@@ -2,7 +2,6 @@
 
 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。
 
-本仓采用滚动 `master` 发布：`master` 中的 `vless-server.sh` 是当前交付制品，不使用独立公开版本号。菜单中的脚本更新直接比较本地与远程 `master` 制品的 SHA-256，不依赖 release 或 tag 名称。
 
 ## 功能概览
 
@@ -39,7 +38,7 @@ sudo ./vless-server.sh
 
 ```bash
 base=https://raw.githubusercontent.com/offzen/vless-aio-hardened/master
-for file in vless-server.sh README.md USAGE.md SHA256SUMS PROVENANCE.json; do
+for file in vless-server.sh README.md USAGE.md FIXES.md SHA256SUMS PROVENANCE.json; do
   wget -O "$file" "$base/$file"
 done
 sha256sum -c SHA256SUMS
@@ -47,7 +46,7 @@ chmod +x vless-server.sh
 sudo ./vless-server.sh
 ```
 
-`master` 是滚动分支。需要可复现留档时，应同时保存下载时的仓库 commit ID、全部五个文件和校验结果；不要把不同时刻下载的脚本与校验清单混用。
+`master` 是滚动分支。需要可复现留档时，应同时保存下载时的仓库 commit ID、全部六个文件和校验结果；不要把不同时刻下载的脚本、文档与校验清单混用。
 
 全新主机进入菜单后选择 `1 安装协议`，再按向导配置协议、端口、域名和用户。无参数运行脚本时，它会尝试把自身复制到 `/usr/local/bin/vless-server.sh`，并创建 `vless` 快捷命令；首次协议安装成功后也会再次确保快捷命令存在。
 
@@ -76,8 +75,21 @@ sudo /usr/local/bin/vless-server.sh --help
 - `vless-server.sh`：安装与管理脚本
 - `README.md`：项目入口和安装说明
 - `USAGE.md`：完整使用手册
-- `SHA256SUMS`：README、USAGE 与安装脚本的校验清单
-- `PROVENANCE.json`：发行包身份、上游基线与逐文件哈希；为避免递归哈希，不包含自身哈希
+- `FIXES.md`：改动清单、历史问题与验证边界
+- `SHA256SUMS`：安装脚本和三份文档的校验清单
+- `PROVENANCE.json`：发行包身份、来源提交与其余五个文件哈希；为避免递归哈希，不包含自身哈希
+
+## 发行身份与验证
+
+H13 交付身份：
+
+- 兼容握手版本：`3.4.10-h13`
+- `vless-server.sh` SHA-256：`33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88`
+- 大小：982,535 bytes
+
+该身份已通过：Bash/ShellCheck/版本门禁，16 个命名离线回归脚本，updater 集成 97/97，候选身份 fail-closed 4/4，Docker 隔离生命周期 E2E 9/9（含真实 Xray 26.3.27 客户端—服务端—HTTP 数据面），以及固定 sing-box 1.13.0 的原生 `check` 与私有网络命名空间 AnyTLS 数据面。上述结论只适用于该精确脚本 SHA；脚本或绑定测试字节变化后必须重跑对应门禁。
+
+私有 manifest、分层测试计划与测试收据包含测试环境和内部证据路径，不属于六文件发布包。发布包包含 `vless-server.sh`、三份脱敏文档、`SHA256SUMS` 与 `PROVENANCE.json`；文档中的历史结果是精确 SHA 收据摘要，不代表本次发布重新执行测试。
 
 ## 归属
 

@@ -9,14 +9,14 @@
 #   本闸门把这条发布约定变成 CI 硬失败，不再依赖人记得。
 #
 # 用法：
-#   ./check-version-bump.sh                     # 基准：HEAD^（gitorca 全历史正本）
+#   ./check-version-bump.sh                     # 基准：HEAD^（private canonical repository 全历史正本）
 #   ./check-version-bump.sh --base REF          # 基准：指定 ref（CI 传 push.before / PR base）
 #   ./check-version-bump.sh --script PATH       # 被检脚本（默认 vless-server.sh）
 #
 # 基准选取（按可用性降级）：
 #   1) 显式 --base
-#   2) HEAD^  —— gitorca 是带全历史的正本，父提交就是上一次发布
-#   3) 仓库内「最高的语义化 tag」 v<X> —— gitpub / GitHub 侧是**无父单 commit 快照**，
+#   2) HEAD^  —— private canonical repository 是带全历史的正本，父提交就是上一次发布
+#   3) 仓库内「最高的语义化 tag」 v<X> —— sanitized private replica / GitHub 侧是**无父单 commit 快照**，
 #      没有父提交；语义化 tag 由 ci.yml 的 release 作业按脚本 VERSION 幂等维护，
 #      正好是「上一次发布」的锚点，因此这条降级路径同样是可靠的
 #   4) 都没有 → 无法判定，告警放行（首次发布/浅克隆可接受，不阻断）

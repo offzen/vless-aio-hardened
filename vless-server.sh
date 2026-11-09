@@ -25,7 +25,7 @@ readonly RELEASE_CHANNEL="master"
 #   1) 3.4.10-h5 及更早的存量客户端只认语义化版本号，靠它识别本制品并放行下载；
 #   2) 本版更新器用它做"防降级"方向判断（远端更旧一律拒绝）。
 # 格式受老客户端硬约束：^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$，且必须单调递增。
-readonly VERSION="3.4.10-h12"
+readonly VERSION="3.4.10-h13"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/offzen/vless-aio-hardened"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
@@ -24883,11 +24883,18 @@ do_update() {
         _ok "已更新到最新 master 制品"
         _info "正在自动重新生成配置并重启服务以使新制品生效..."
 
-        init_db 2>/dev/null
-        rebuild_and_reload_xray "silent" 2>/dev/null
-        rebuild_and_reload_singbox "silent" 2>/dev/null
+        local apply_failed=0
+        init_db 2>/dev/null || apply_failed=1
+        rebuild_and_reload_xray "silent" 2>/dev/null || apply_failed=1
+        rebuild_and_reload_singbox "silent" 2>/dev/null || apply_failed=1
 
         echo ""
+        if [[ "$apply_failed" -ne 0 ]]; then
+            _err "脚本已更新，但自动应用失败；请人工核对并重建配置与服务。"
+            echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
+            _line
+            exit 1
+        fi
         echo -e "  ${G}✓ 更新完成；请继续核对配置、服务状态与真实连接。${NC}"
         echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
         _line

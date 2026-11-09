@@ -3,7 +3,7 @@
 # 验证 h4 修复：多端口展开 / 禁用用户过滤 / 过期用户过滤 / sniff 路由 / tag 后缀
 # 用法: bash test-singbox-users.sh [vless-server.sh 路径]
 set -uo pipefail
-SCRIPT="${1:-$(dirname "$0")/vless-server.sh}"
+SCRIPT="${1:-$(dirname "$0")/../vless-server.sh}"
 [[ -f "$SCRIPT" ]] || { echo "找不到脚本: $SCRIPT"; exit 2; }
 
 CFG="/tmp/h4-test-cfg"
