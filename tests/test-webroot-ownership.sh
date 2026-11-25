@@ -115,11 +115,12 @@ with socketserver.TCPServer(('0.0.0.0', 18080), Quiet) as server:
     server.serve_forever()
 PY
 
+cp -- "$SCRIPT" "$WORK/vless-server.sh"
+
 cat > "$WORK/inside.sh" <<'SH'
 #!/bin/bash
 set -euo pipefail
 WORK="$1"
-SCRIPT="$2"
 exec {WORK_FD}<"$WORK"
 WORK_ROOT="/proc/self/fd/$WORK_FD"
 mount --make-rprivate /
@@ -136,7 +137,7 @@ export SPY_LOG="$WORK_ROOT/spy.log" SPY_FAIL="$WORK_ROOT/spy.fail"
 unset DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy
 export VLESS_SOURCE_ONLY=1
 # shellcheck disable=SC1090
-source "$SCRIPT"
+source "$WORK_ROOT/vless-server.sh"
 WORK="$WORK_ROOT"
 
 _log() { :; }
