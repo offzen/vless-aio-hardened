@@ -193,8 +193,16 @@ run_stateful_upgrade() {
 
 run_webroot_e2e() {
     local receipt
+    local -a cmd=(bash tests/test-webroot-ownership.sh)
+    if [[ "$(id -u)" -ne 0 ]] \
+        && ! unshare --user --map-root-user --mount --pid --fork true 2>/dev/null \
+        && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        # Ubuntu 24.04 hosted runners restrict unprivileged userns via AppArmor;
+        # run the isolated namespace test under passwordless sudo when available.
+        cmd=(sudo -n bash tests/test-webroot-ownership.sh)
+    fi
     receipt=$(mktemp "${TMPDIR:-/tmp}/aio-ci-webroot-receipt.XXXXXX")
-    if ! bash tests/test-webroot-ownership.sh 2>&1 | tee "$receipt"; then
+    if ! "${cmd[@]}" 2>&1 | tee "$receipt"; then
         rm -f -- "$receipt"
         fail "Web root namespace lifecycle test failed"
     fi

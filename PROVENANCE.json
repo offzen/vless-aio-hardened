@@ -22,7 +22,7 @@
     "tests/install-ci-singbox.sh": "b1575bcb372a693311bc0f5514d919250d2f1108df8eb0fff428ac9ed0dfb345",
     "tests/install-ci-xray.sh": "54f7e975c580bbb0442d7d990f1826e805d8e483adc3cc4bcf41f7544da62a0a",
     "tests/protocol-capabilities.tsv": "a94cbbcc1122751112ff68556629dda74dc32bcd3cb15dd43517970f2ee6bc48",
-    "tests/run-ci.sh": "cbaca291eec914096f46eba85ca6511fcc72625ad034b126ea80b2e2452e97a0",
+    "tests/run-ci.sh": "f39521afe0de8560ad62751af65b3344e95f63e11d56058d876a017a9061b5a0",
     "tests/test-acme-dns-fallback.sh": "f81ca2f36685ecf5f333b7bbce4709501eb7ed3c075c23c5bd0c989ee0ff8138",
     "tests/test-anytls-branch.sh": "84471b9761cc59df8171027f5c8bd8e089955c1bc8c0acb64bc705a862bcf552",
     "tests/test-anytls-secure.sh": "aa598b4bd1cbc2553c3ac6c0c9158abe936de441dbe4b86b5257d50f2b13e3b1",
