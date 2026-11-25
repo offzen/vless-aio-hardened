@@ -20,11 +20,14 @@ BASE_LABEL="H13"
 BASE_EXPECTED_SHA="$H13_SHA256"
 if git -C "$ROOT" cat-file -e "$H13_COMMIT^{commit}" 2>/dev/null; then
     git -C "$ROOT" show "$H13_COMMIT:vless-server.sh" >"$BASE_SCRIPT"
+elif git -C "$ROOT" rev-parse --verify --quiet "v3.4.10-h13^{commit}" >/dev/null 2>&1 \
+  && git -C "$ROOT" merge-base --is-ancestor "v3.4.10-h13^{commit}" HEAD 2>/dev/null; then
+    git -C "$ROOT" show "v3.4.10-h13:vless-server.sh" >"$BASE_SCRIPT"
 else
     # The clean-history H15 repository has an exact H14 baseline, never infer it from a shallow root.
     H14_BASE_COMMIT=${H14_COMMIT:-1623626204905de4498f104ccced0022670085c8}
     if ! git -C "$ROOT" merge-base --is-ancestor "$H14_BASE_COMMIT" HEAD 2>/dev/null; then
-        echo "FAIL: H14 baseline is not available as an ancestor; checkout full history (fetch-depth: 0)" >&2
+        echo "FAIL: H13/H14 baseline is not available as an ancestor; checkout full history (fetch-depth: 0)" >&2
         exit 1
     fi
     git -C "$ROOT" show "$H14_BASE_COMMIT:vless-server.sh" >"$BASE_SCRIPT"
