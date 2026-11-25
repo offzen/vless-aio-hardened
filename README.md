@@ -1,77 +1,94 @@
-# vless-aio-hardened — H15
+# vless-aio-hardened
 
-基于上游 [vless-all-in-one](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，3.4.10）的第三方加固版服务端脚本。H15 是在 H14-rc.1 完整安全审计基础上完成 Stage 1（P0）与 Stage 2（P1）及关键 P2 修复的正式定版，项目此后进入按需小修的维护态（不再规划 H16 模块化重构）；`readonly VERSION="3.4.10-h15"` 用于旧客户端发现与防降级。
+[`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。
 
-## H15 更新了什么
+## 功能概览
 
-- **消除命令注入与路由绕过（C-1 / C-2）**：移除 `eval` 与 `source "$CFG/sub.info"`，改用 nameref、参数数组与 `0600` 纯键值读写；强制 Xray/sing-box 私网（含 `::1/128`、`100.64.0.0/10`、`0.0.0.0/8`）与 BitTorrent `block` 规则优先于用户/多 IP/WARP 放行规则。
-- **零有效用户彻底撤销与权限加固（H-1 ~ H-4）**：sing-box 零有效用户删除残留 `singbox.json` 并停服；Xray 全协议显式 `users: []` fail-closed；所有凭据与状态文件统一 `0600`、移除 `/tmp/vless-certs-backup`、缓存迁入 `$CFG/cache`、ShadowTLS 密码迁入 `EnvironmentFile=`、Telegram Token 通过 `curl -K -` 隐藏。
-- **更新器、迁移脚本与证书/订阅加固（H-5 ~ H-10）**：新增 `--apply-configs` 供更新器新进程重载；校验 Xray `.dgst`；重写 `migrate-anytls-singbox.sh`；Xray 多端口只读渲染不改写 `db.json`；`_is_real_cert` 拒绝自签伪造并在真证书场景关闭 `allowInsecure`/`skip-cert-verify`；清洗外部订阅 YAML/Surge 注入。
-- **可靠性与 CI 门禁补强（M-1 ~ M-8 / I-1 ~ I-2）**：修复 `tests/run-ci.sh` 在缺失 `.github/scripts` 时静默跳过全部语法检查的问题，新增 `test-h15-security-hardening.sh` 与 `test-migrate-anytls.sh`。
+- 单文件安装与管理脚本：`vless-server.sh`（当前版本 `3.4.10-h15`）
+- 支持 Xray、sing-box 与独立服务协议；多协议可共存，Xray / sing-box 托管协议支持多端口与逐用户管理
+- 凭据与状态文件统一最小权限（`0600`）与原子写入：唯一临时文件、带过期回收的目录锁、异常清空护栏，敏感凭据不暴露在进程命令行或 `/tmp`
+- Xray / sing-box 默认优先拦截私网目标（含 IPv4/IPv6 回环与 CGNAT）与 BitTorrent 出站流量
+- 显式空用户列表严格拒绝回退（fail-closed）；sing-box 无有效入站时自动清理配置并停服
+- AnyTLS 由 sing-box 提供实际入站，支持多用户、多端口、到期/禁用过滤与证书配置（旧独立 AnyTLS 可使用 `migrate-anytls-singbox.sh` 无损迁移）
+- 真实证书校验使用系统 CA 链验证并拒绝自签伪造；真证书场景默认关闭订阅中的 `allowInsecure` / `skip-cert-verify`，并对外部订阅字段做注入清洗
+- 内置更新器支持新进程配置重载（`--apply-configs`）、防降级检查及 Xray 下载摘要校验；通用二进制下载拒绝含未替换占位符的 URL
 
-完整审计见 [docs/AUDIT-H14-RC1.md](./docs/AUDIT-H14-RC1.md)，整改记录与（已决定不实施的）模块化评估见 [docs/REMEDIATION-AND-ARCHITECTURE.md](./docs/REMEDIATION-AND-ARCHITECTURE.md)，完整变更见 [CHANGELOG.md](./CHANGELOG.md)，部署与升级见 [RELEASE-H15.md](./RELEASE-H15.md)，日常管理见 [USAGE.md](./USAGE.md)。
+详细的支持范围、安装/升级步骤、菜单说明、用户管理、证书与排障见 [USAGE.md](USAGE.md)；H15 完整变更与升级细节见 [RELEASE-H15.md](RELEASE-H15.md) 与 [CHANGELOG.md](CHANGELOG.md)。
 
-## 交付身份与发布边界
+## 支持环境
 
-| 项目 | 本次基线（H15） |
-|---|---|
-| 兼容握手 | `3.4.10-h15` |
-| 发布标签 | `v3.4.10-h15`（此前预发布 `v3.4.10-h15-rc.1`） |
-| 产品 SHA-256 | `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a` |
-| 上游 H14-rc.1 基线 SHA-256 | `6ea18a9e5af7ca2802ee6982d478d042ffcbcd4108b3a978c26e50aaf77eaa34` |
-| 自动化验收 | `tests/run-ci.sh` 全部 9 个门禁（syntax / static / unit×mawk+gawk / Xray / auth / sing-box / stateful-upgrade / Webroot / installer 9 组）+ `check-version-bump.sh`，见 [RELEASE-H15.md](./RELEASE-H15.md) |
+- 目标环境为 Alpine、Ubuntu、Red Hat 系和 Debian-like 系统；脚本明确识别前三类，其余系统按 Debian-like 处理。Alpine 使用 OpenRC，非 Alpine 假定 systemd
+- 安装和交互式管理必须以 root 权限运行；`--help` 无需 root，以下管理示例统一使用 `sudo`
+- 下载启动脚本前需已有 `wget` 或 `curl`；安装不是离线操作，脚本会安装通用系统依赖，并按所选协议下载相应核心或组件
+- 通用下载器识别 `x86_64`、`aarch64`、`armv7l`；个别协议组件的架构支持可能更窄
+- 已有部署更新前务必先以 root-only 权限备份 `/etc/vless-reality/`（含 `db.json`、`certs/` 与私钥）及 `/usr/local/bin/vless-server.sh`
 
-校验清单见随包 [SHA256SUMS](./SHA256SUMS) 与 [PROVENANCE.json](./PROVENANCE.json)。部署请校验完整本地包或本仓 tag 制品。
+## 安装
 
-## 支持范围
-
-- 服务端可管理 Xray、sing-box 和独立核心协议，多协议可共存。
-- 当前逐用户管理支持：`vless`、`vless-xhttp`、`vless-ws`、`vmess-ws`、`vless-vision`、`trojan`、`socks`、`ss-legacy`、`Hysteria2`、`tuic`、`anytls`。它不等于所有协议都有自动流量计量或配额封禁。
-- 面向 Alpine、Ubuntu、Red Hat 系、Debian-like；Alpine 使用 OpenRC，非 Alpine 假定 systemd。不能把未知系统被识别为 Debian 当作受支持证明。
-- 交互安装/管理需要 root。安装器不是离线安装，会按协议下载核心并可能安装系统依赖；通用下载器映射 x86_64、aarch64、armv7l，个别核心范围更窄。
-- 默认阻断私网目标与 BitTorrent；共享服务、证书、NAT、Tunnel、cron 和卸载副作用请先阅读完整手册。
-
-## 使用本地校验包安装
-
-先将同一套交付文件放到目标主机。不要混用旧文档的校验清单。
+### 简易安装
 
 ```bash
-sha256sum -c SHA256SUMS
-printf '%s  %s\n' \
-  f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a \
-  vless-server.sh | sha256sum -c -
+wget -O vless-server.sh https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh
 chmod +x vless-server.sh
 sudo ./vless-server.sh
 ```
 
-全新主机在菜单选择 `1 安装协议` 并配置所需协议；无参启动会初始化数据库并同步系统脚本及快捷入口。仅 `--help` 不执行这些初始化操作。
+### 下载并校验完整性
 
-## 从旧版手工升级
+```bash
+base=https://raw.githubusercontent.com/offzen/vless-aio-hardened/master
+wget -O vless-server.sh "$base/vless-server.sh"
+wget -O SHA256SUMS "$base/SHA256SUMS"
+grep '  vless-server.sh$' SHA256SUMS | sha256sum -c -
+chmod +x vless-server.sh
+sudo ./vless-server.sh
+```
 
-1. **启动新脚本前**备份现有系统脚本、整个配置目录，包含 DB、派生配置与证书/私钥；如有 Tunnel、cron 等辅助状态一并记录。备份须 root-only，不提交凭据到发行包。
-2. 校验同一套 H15 文件与产品 SHA，手工替换脚本后从新进程启动；不要从未核对的在线源获取另一个制品。
-3. 使用菜单 `14 重建全部配置`，随后检查实际生成文件、对应服务、监听及真实客户端连接。菜单 14 的完成提示/返回值不是验收收据。
-4. updater 的部分失败合同是：三个自动应用步骤全部尝试，返回非零，保留新脚本和 `.bak`，不自动回滚。恢复旧版时须使用启动前完整备份，不只换回脚本。
+如需校验完整仓库文件，可 `git clone` 本仓或下载对应 Release 源码包后在仓库根目录执行 `sha256sum -c SHA256SUMS`。
 
-## 验证结果与限制
+全新主机进入菜单后选择 `1 安装协议`，按向导配置协议、端口、域名和用户。无参数运行脚本时，会自动同步自身到 `/usr/local/bin/vless-server.sh` 并创建 `vless` 快捷命令。
 
-run288 验证了 15 项 required：mawk/gawk 各 21 脚本及 mutation/identity、37 条产品策略断言、11 rows/110 动态断言、真实升级 13 条断言；Xray 26.3.27 auth 2/2 与 SS 3/3；固定 sing-box 1.14.4 native/data-plane 3/3；Web root 生命周期；Docker installer 9/9；34 文件 syntax 与 ShellCheck 0.9.0 error gate。required gate 无 SKIP；非 required Release job skipped，未发布。
+## 更新已有部署
 
-CI Web 的 service spy 不是宿主真实 Nginx/systemd；Docker 使用固定 leaf pin，不等于公网 CA、强安全沙箱或重启失败自动回滚，也未包含“已删除 alice 直接负向重连”断言。目标主机必须有独立运行验收。
+**启动新脚本前务必先备份** `/etc/vless-reality/` 与 `/usr/local/bin/vless-server.sh`（如有 Cloudflare Tunnel 一并备份 `/etc/cloudflared/`）。
 
-## 交付文件
+可选两种路径：
 
-- [USAGE.md](./USAGE.md)：完整使用手册；[RELEASE-H15.md](./RELEASE-H15.md)：本版本部署/升级手册（[RELEASE-H14.md](./RELEASE-H14.md) 为历史手册）。
-- [CHANGELOG.md](./CHANGELOG.md)：更新清单；[FIXES.md](./FIXES.md)：当前修复摘要。
-- [SHA256SUMS](./SHA256SUMS)、[PROVENANCE.json](./PROVENANCE.json)：发行包一致性与代码来源。
-- 测试及 CI 文件只在私有源码树，不参与此可安装交付包。
+1. **菜单更新**：运行 `sudo vless`，选择 `12 检查脚本更新`。脚本拉取远端版本并校验语法后替换自身，随后通过新进程执行 `--apply-configs` 重建并重载核心配置。
+2. **手动替换**：下载并校验新版 `vless-server.sh`，原子替换 `/usr/local/bin/vless-server.sh` 后执行：
+   ```bash
+   sudo /usr/local/bin/vless-server.sh --apply-configs
+   ```
+   或进入菜单选择 `14 重建全部配置`。
 
-版权与主要设计归上游作者；请遵守适用许可与当地法律法规，仅用于合法用途。
+更新完成后建议手动检查核心配置与服务状态（`xray run -test`、`sing-box check`、`systemctl is-active` 及实际客户端连接）。
 
-## 派生来源
+安装或更新后常用命令：
 
-DO NOT EDIT — derived from the exact private source snapshot recorded in PROVENANCE.json. 本去敏可安装包含六个 payload 与两个 identity 文件，不携带私有 Git 历史、测试/CI、WIKI 或运维收据。代码 CI 证据与后补文档哈希分别绑定；此快照尚未晋升 canonical 发布入口。
+```bash
+sudo vless
+sudo /usr/local/bin/vless-server.sh --help
+```
 
-## Rolling distribution
+## 文件
 
-This is a generated clean-history source distribution. Download `vless-server.sh` and `SHA256SUMS` from this repository’s `master`. The bundled script retains its existing built-in updater; publishing this copy does not change that updater.
+- `vless-server.sh`：安装与管理主脚本
+- `migrate-anytls-singbox.sh`：独立 AnyTLS 到 sing-box 托管模式的迁移脚本
+- `README.md`：项目入口与安装说明
+- `USAGE.md`：完整使用手册
+- `RELEASE-H15.md`：H15 正式版发布与升级手册
+- `CHANGELOG.md` / `FIXES.md`：版本更新清单与修复摘要
+- `SHA256SUMS` / `PROVENANCE.json`：文件哈希清单与版本来源记录
+
+## 发行身份与验证
+
+H15 正式版交付身份：
+
+- 发布版本 / Tag：`v3.4.10-h15`（脚本 `readonly VERSION="3.4.10-h15"`）
+- `vless-server.sh` SHA-256：`f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`
+
+本仓通过自动化 CI 覆盖 Bash 语法、ShellCheck 静态检查、版本抬升闸门、`mawk`/`gawk` 双引擎单元测试、状态升级回归、Xray/sing-box 原生配置与数据面 E2E 以及隔离安装器测试。
+
+## 归属
+
+本仓为第三方加固维护副本，版权与主要设计归上游作者；请遵守适用许可与当地法律法规，仅用于合法用途。
