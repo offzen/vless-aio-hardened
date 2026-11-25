@@ -41,14 +41,20 @@ identity_selftest() {
 }
 
 host_main() {
-  local root product name tmp image
+  local root product name tmp image xray_bin xray_assets
   root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
   product="$root/vless-server.sh"
   validate_candidate_identity "$EXPECTED_SHA" "$product" || return $?
   command -v docker >/dev/null || { echo "FAIL: docker missing" >&2; return 1; }
-  [[ -x /usr/local/bin/xray ]] || { echo "FAIL: /usr/local/bin/xray missing" >&2; return 1; }
+  xray_bin="${XRAY_BIN:-$(command -v xray || true)}"
+  [[ -n "$xray_bin" && -x "$xray_bin" ]] || { echo "FAIL: executable xray missing" >&2; return 1; }
+  xray_assets="${XRAY_LOCATION_ASSET:-$(dirname -- "$xray_bin")}"
+  [[ -f "$xray_assets/geoip.dat" && -f "$xray_assets/geosite.dat" ]] || {
+    echo "FAIL: Xray assets missing from $xray_assets" >&2
+    return 1
+  }
 
-  name="aio-h12-e2e-$$-$RANDOM"
+  name="aio-h14-e2e-$$-$RANDOM"
   image="aio-h12-e2e-deps:$$-$RANDOM"
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/aio-h12-e2e.XXXXXX")
   cleanup_host() {
@@ -62,7 +68,7 @@ host_main() {
 FROM python:3.12-bookworm
 RUN apt-get update \
  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      ca-certificates curl iproute2 jq openssl procps \
+      ca-certificates curl iproute2 jq openssl procps shellcheck \
  && rm -rf /var/lib/apt/lists/*
 EOF
   echo "[host] building disposable dependency image"
@@ -70,18 +76,42 @@ EOF
   echo "[host] running isolated lifecycle E2E: $name"
   local rc=0
   docker run --rm --name "$name" \
-    --network none --cap-drop ALL --security-opt no-new-privileges \
+    --network none --cap-drop ALL --cap-add NET_ADMIN --security-opt no-new-privileges \
     --pids-limit 256 --memory 768m --cpus 2 \
     --mount "type=bind,src=$root,dst=/repo,readonly" \
-    --mount "type=bind,src=/usr/local/bin/xray,dst=/usr/local/bin/xray,readonly" \
+    --mount "type=bind,src=$xray_bin,dst=/usr/local/bin/xray,readonly" \
+    --mount "type=bind,src=$xray_assets/geoip.dat,dst=/usr/local/bin/geoip.dat,readonly" \
+    --mount "type=bind,src=$xray_assets/geosite.dat,dst=/usr/local/bin/geosite.dat,readonly" \
     -e AIO_E2E_EXPECTED_SHA="$EXPECTED_SHA" \
+    -e XRAY_LOCATION_ASSET=/usr/local/bin \
     "$image" bash /repo/tests/test-installer-e2e.sh --inside || rc=$?
   cleanup_host
   trap - EXIT INT TERM
   return "$rc"
 }
 
+# Only the bootstrap holds NET_ADMIN, in the container's disconnected namespace.
+inside_network_setup() {
+  [[ $(ip -o link show | wc -l) == 1 ]] || { echo 'FAIL: expected loopback-only network' >&2; return 1; }
+  ip address add 192.0.2.1/32 dev lo
+  exec python3 -c '
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+header = (ctypes.c_uint32 * 2)(0x20080522, 0)
+data = (ctypes.c_uint32 * 6)()
+if libc.capset(header, data) != 0:
+    raise OSError(ctypes.get_errno(), "capset failed")
+os.execvp("bash", ["bash", sys.argv[1], "--inside-unprivileged"])
+' "$0"
+}
+
 inside_main() {
+  awk '/^Cap(Eff|Prm|Inh|Amb):/ { n++; if ($2 != "0000000000000000") exit 1 }
+       /^NoNewPrivs:/ { n++; if ($2 != 1) exit 1 }
+       END { if (n != 5) exit 1 }' /proc/self/status || {
+    echo 'FAIL: test payload retained capabilities or lacks no-new-privileges' >&2
+    return 1
+  }
   set +u
   local sandbox=/sandbox product=/repo/vless-server.sh patched=/sandbox/product.sh
   local server_port=18443 http_port=18080 socks_port=20808
@@ -107,23 +137,19 @@ inside_main() {
 
   mkdir -p "$sandbox/etc/vless-reality" "$sandbox/logs" "$sandbox/run" "$sandbox/www"
   validate_candidate_identity "$EXPECTED_SHA" "$product" || fail "container candidate identity rejected"
+  shellcheck -S error /repo/tests/test-webroot-ownership.sh /repo/tests/test-installer-e2e.sh || fail "changed fixture ShellCheck error gate"
+  echo "PASS: changed fixture ShellCheck error gate (2 files; disposable image only)"
   cp "$product" "$patched"
-  python3 - "$patched" <<'PY'
-from pathlib import Path
-import sys
-p=Path(sys.argv[1]); s=p.read_text()
-old='readonly CFG="/etc/vless-reality"'
-assert s.count(old)==1
-p.write_text(s.replace(old, 'readonly CFG="/sandbox/etc/vless-reality"'))
-PY
+  cmp -s "$product" "$patched" || fail "container source copy differs from the SHA-bound candidate"
   chmod +x "$patched"
-  ok "candidate hash locked and only CFG constant patched"
+  ok "candidate hash locked and source copy preserved"
 
-  export VLESS_SOURCE_ONLY=1
+  export VLESS_SOURCE_ONLY=1 VLESS_TEST_CFG="$sandbox/etc/vless-reality"
   export VLESS_TEST_LOG_ROOT="$sandbox/logs"
   export WEBROOT_INDEX="$sandbox/www/index.html"
   # shellcheck disable=SC1090
   source "$patched"
+  [[ "$CFG" == "$sandbox/etc/vless-reality" ]] || fail "VLESS_TEST_CFG isolation"
   BASH_ARGV0="$patched"
 
   SVC_LOG="$sandbox/svc.log"
@@ -150,6 +176,9 @@ PY
   ensure_dual_stack_listen() { return 0; }
   install_deps() { return 0; }
   install_xray() { [[ -x /usr/local/bin/xray ]]; }
+  # Offline private TLS only: keep real certificate generation and server rendering.
+  setup_cert_and_nginx() { CERT_DOMAIN=""; gen_self_cert localhost; }
+  ask_sni_config() { printf '%s\n' localhost; }
   warp_status() { echo "not_configured"; }
   check_cmd() {
     case "$1" in xray|jq|curl|openssl|python3) command -v "$1" >/dev/null ;; *) return 1 ;; esac
@@ -246,7 +275,11 @@ PY
 
   data_plane() {
     local uuid="$1" nonce="$2" client="$sandbox/client.json"
-    local http_pid client_pid output="" pid
+    local http_pid client_pid output="" pid rc config_hash
+    local target="http://192.0.2.1:$http_port/" blocked="http://127.0.0.1:$http_port/"
+    local -a direct=(curl --noproxy '*' -fsS --max-time 2)
+    local -a proxy=(curl --noproxy '' -fsS --max-time 2 --socks5-hostname "127.0.0.1:$socks_port")
+    config_hash=$(sha256sum "$CFG/config.json")
     _stop_xray
     /usr/local/bin/xray run -test -c "$CFG/config.json" >/dev/null 2>&1 || fail "runtime server config invalid"
     /usr/local/bin/xray run -c "$CFG/config.json" >"$sandbox/runtime-server.log" 2>&1 &
@@ -259,28 +292,46 @@ class H(http.server.BaseHTTPRequestHandler):
  def log_message(self,*a): pass
 http.server.ThreadingHTTPServer(("0.0.0.0",int(os.environ["HTTP_PORT"])),H).serve_forever()' >"/sandbox/http.log" 2>&1 &
     http_pid=$!
-    jq -n --arg id "$uuid" --argjson sp "$server_port" --argjson lp "$socks_port" --arg path "/e2e" '{
+    # Xray 26.3.27 requires an exact leaf pin; never disable TLS verification.
+    local cert_pin parse_log="$sandbox/client-parse.log"
+    cert_pin=$(openssl x509 -in "$CFG/certs/server.crt" -outform DER | sha256sum | awk '{print $1}')
+    [[ "$cert_pin" =~ ^[0-9a-f]{64}$ ]] || fail "invalid private certificate pin"
+    jq -n --arg id "$uuid" --arg pin "$cert_pin" --argjson sp "$server_port" --argjson lp "$socks_port" --arg path "/e2e" '{
       log:{loglevel:"warning"},
       inbounds:[{listen:"127.0.0.1",port:$lp,protocol:"socks",settings:{auth:"noauth",udp:false}}],
-      outbounds:[{protocol:"vless",settings:{vnext:[{address:"127.0.0.1",port:$sp,users:[{id:$id,encryption:"none"}]}]},streamSettings:{network:"ws",security:"none",wsSettings:{path:$path}}}]
+      outbounds:[{protocol:"vless",settings:{vnext:[{address:"127.0.0.1",port:$sp,users:[{id:$id,encryption:"none"}]}]},streamSettings:{network:"ws",security:"tls",tlsSettings:{serverName:"localhost",pinnedPeerCertSha256:$pin},wsSettings:{path:$path}}}]
     }' >"$client"
-    /usr/local/bin/xray run -test -c "$client" >/dev/null 2>&1 || fail "client config invalid"
+    /usr/local/bin/xray run -test -c "$client" >"$parse_log" 2>&1 || {
+      sed -n '1,40p' "$parse_log" >&2
+      fail "client config invalid"
+    }
     /usr/local/bin/xray run -c "$client" >"$sandbox/client.log" 2>&1 &
     client_pid=$!
     for _ in $(seq 1 40); do
-      output=$(NO_PROXY= no_proxy= curl -fsS --noproxy '' --socks5-hostname "127.0.0.1:$socks_port" \
-        "http://0.0.0.0:$http_port/" 2>/dev/null || true)
+      output=$("${proxy[@]}" "$target" 2>/dev/null || true)
       [[ "$output" == "$nonce" ]] && break
       sleep 0.2
     done
-    kill_exact "$client_pid"; kill_exact "$http_pid"
     [[ "$output" == "$nonce" ]] || fail "real Xray data plane did not return nonce"
+    [[ $("${direct[@]}" "$blocked") == "$nonce" ]] || fail "loopback negative-control fixture is not reachable directly"
+    rc=0
+    "${proxy[@]}" "$blocked" >/dev/null 2>"$sandbox/loopback-proxy.log" || rc=$?
+    case "$rc" in
+      52|56|97) ;;
+      *) fail "expected proxy rejection of loopback, got curl status $rc" ;;
+    esac
+    [[ $("${proxy[@]}" "$target") == "$nonce" ]] || fail "positive data plane failed after loopback rejection"
+    [[ $(sha256sum "$CFG/config.json") == "$config_hash" ]] || fail "data-plane probe changed the generated config"
+    kill_exact "$client_pid"; kill_exact "$http_pid"
     [[ -f "$SERVICE_PID" ]] && kill -0 "$(cat "$SERVICE_PID")" 2>/dev/null || fail "runtime Xray server died"
   }
 
-  do_install_server <<< $'2\n/e2e\n\nY\n'
-  assert_jq "$DB_FILE" '.xray["vless-ws-notls"].port == 18443 and .xray["vless-ws-notls"].uuid == "11111111-1111-4111-8111-111111111111"' "installer DB record wrong"
+  do_install_server <<< $'1\n/e2e\nY\n'
+  assert_jq "$DB_FILE" '.xray["vless-ws"].port == 18443 and .xray["vless-ws"].uuid == "11111111-1111-4111-8111-111111111111" and .xray["vless-ws"].sni == "localhost" and .xray["vless-ws"].path == "/e2e" and .xray["vless-ws-notls"] == null' "installer DB record wrong"
+  assert_file "$CFG/certs/server.crt"
+  assert_file "$CFG/certs/server.key"
   assert_file "$CFG/config.json"
+  assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-18443" and .streamSettings.network=="ws" and .streamSettings.security=="tls")] | length == 1' "installer did not render supported WS+TLS"
   /usr/local/bin/xray run -test -c "$CFG/config.json" >/dev/null 2>&1 || fail "generated production config invalid"
   assert_file /etc/systemd/system/vless-reality.service
   grep -Fq -- "$CFG/config.json" /etc/systemd/system/vless-reality.service || fail "unit does not point to private config"
@@ -293,35 +344,35 @@ http.server.ThreadingHTTPServer(("0.0.0.0",int(os.environ["HTTP_PORT"])),H).serv
 
   local before after
   before=$(count_svc restart vless-reality)
-  db_add_user xray vless-ws-notls alice "$uuid1" 0
+  db_add_user xray vless-ws alice "$uuid1" 0
   after=$(count_svc restart vless-reality)
   assert_eq "$after" "$((before + 1))" "add alice did not trigger exactly one restart"
-  assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-notls-18443") | .settings.clients[] | select(.id=="22222222-2222-4222-8222-222222222222")] | length == 1' "alice missing from config"
+  assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-18443") | .settings.clients[] | select(.id=="22222222-2222-4222-8222-222222222222")] | length == 1' "alice missing from config"
   data_plane "$uuid1" nonce-alice
   ok "db_add_user rebuilt/restarted once and alice data plane passed"
 
   before=$(count_svc restart vless-reality)
-  db_add_user xray vless-ws-notls bob "$uuid2" 0
+  db_add_user xray vless-ws bob "$uuid2" 0
   after=$(count_svc restart vless-reality)
   assert_eq "$after" "$((before + 1))" "add bob did not trigger exactly one restart"
   before=$after
-  db_del_user xray vless-ws-notls alice
+  db_del_user xray vless-ws alice
   after=$(count_svc restart vless-reality)
   assert_eq "$after" "$((before + 1))" "delete alice did not trigger exactly one restart"
-  assert_jq "$DB_FILE" '([.xray["vless-ws-notls"].users[] | select(.name=="bob")] | length == 1) and ([.xray["vless-ws-notls"].users[] | select(.name=="alice")] | length == 0)' "user DB mutation wrong"
+  assert_jq "$DB_FILE" '([.xray["vless-ws"].users[] | select(.name=="bob")] | length == 1) and ([.xray["vless-ws"].users[] | select(.name=="alice")] | length == 0)' "user DB mutation wrong"
   data_plane "$uuid2" nonce-bob
   ok "db_del_user rebuilt/restarted once and remaining bob data plane passed"
 
   FAIL_NEXT_RESTART=1
   set +e
-  db_add_user xray vless-ws-notls failcase "$uuid_fail" 0
+  db_add_user xray vless-ws failcase "$uuid_fail" 0
   local failure_rc=$?
   set -e
   [[ "$failure_rc" -ne 0 ]] || fail "restart failure was reported as success"
-  assert_jq "$DB_FILE" '[.xray["vless-ws-notls"].users[] | select(.name=="failcase" and .uuid=="44444444-4444-4444-8444-444444444444")] | length == 1' "failed restart lost durable DB mutation"
-  assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-notls-18443") | .settings.clients[] | select(.id=="44444444-4444-4444-8444-444444444444")] | length == 1' "failed restart lost generated config"
+  assert_jq "$DB_FILE" '[.xray["vless-ws"].users[] | select(.name=="failcase" and .uuid=="44444444-4444-4444-8444-444444444444")] | length == 1' "failed restart lost durable DB mutation"
+  assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-18443") | .settings.clients[] | select(.id=="44444444-4444-4444-8444-444444444444")] | length == 1' "failed restart lost generated config"
   [[ -f "$SERVICE_PID" ]] && kill -0 "$(cat "$SERVICE_PID")" 2>/dev/null || fail "restart failure killed prior service"
-  db_del_user xray vless-ws-notls failcase
+  db_del_user xray vless-ws failcase
   ok "restart failure returned nonzero while preserving DB/config and prior process"
 
   local hy1='{"port":31001,"password":"hy-pass-1","sni":"example.com","hop_enable":1,"hop_start":32001,"hop_end":32010}'
@@ -385,7 +436,8 @@ EOF
 }
 
 case "${1:-}" in
-  --inside) inside_main ;;
+  --inside) inside_network_setup ;;
+  --inside-unprivileged) inside_main ;;
   --identity-selftest) identity_selftest ;;
   "") host_main ;;
   *) echo "Usage: AIO_E2E_EXPECTED_SHA=<sha256> $0 [--identity-selftest]" >&2; exit 2 ;;

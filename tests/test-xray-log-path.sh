@@ -190,12 +190,11 @@ if [[ "$MODE" == selfcheck ]]; then
 fi
 
 # --------------------------------------------------------------------------
-# Normal mode: isolation scaffold (sed-rewrite CFG -> source copy -> stub -> call)
+# Normal mode: isolation scaffold (exact source copy -> explicit test CFG -> stub -> call)
 # --------------------------------------------------------------------------
-sed -e "s@^readonly CFG=\"/etc/vless-reality\"@readonly CFG=\"$WORK/cfg\"@" "$SRC" > "$WORK/script.sh"
-[[ "$(grep -cF "readonly CFG=\"$WORK/cfg\"" "$WORK/script.sh")" == 1 ]] || { echo 'FAIL: CFG rewrite' >&2; exit 2; }
+cp "$SRC" "$WORK/script.sh"
 
-export VLESS_SOURCE_ONLY=1 VLESS_TEST_LOG_ROOT="$WORK/log" HOME="$WORK/home" TMPDIR="$WORK"
+export VLESS_SOURCE_ONLY=1 VLESS_TEST_CFG="$WORK/cfg" VLESS_TEST_LOG_ROOT="$WORK/log" HOME="$WORK/home" TMPDIR="$WORK"
 export XDG_STATE_HOME="$WORK" XDG_CACHE_HOME="$WORK" XDG_CONFIG_HOME="$WORK"
 
 # Gate-stub inputs (read by the stubs below); each fixture sets all three explicitly.
@@ -206,6 +205,7 @@ FX_DB='[]'   # db_get_routing_rules: the OUTER gate of the whole routing block
 DB_RULES='[{"outbound":"direct","ip_version":"prefer_ipv4","domain":"geosite:cn"}]'
 
 source "$WORK/script.sh" || { echo 'FAIL: source' >&2; exit 2; }
+[[ "$CFG" == "$VLESS_TEST_CFG" ]] || { echo 'FAIL: VLESS_TEST_CFG isolation' >&2; exit 2; }
 # The product script re-enables errexit (and may arm an ERR trap / clobber our vars): undo, re-arm.
 set +e
 trap - ERR

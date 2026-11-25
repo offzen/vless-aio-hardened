@@ -5,22 +5,20 @@ set -uo pipefail
 
 SCRIPT="${1:-$(dirname "$0")/../vless-server.sh}"
 [[ -f "$SCRIPT" ]] || { echo "missing script: $SCRIPT" >&2; exit 2; }
-for dep in jq sed awk grep; do
+for dep in jq awk grep; do
     command -v "$dep" >/dev/null 2>&1 || { echo "missing dependency: $dep" >&2; exit 2; }
 done
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/aio-high-risk.XXXXXX")
+TMP=$(cd -- "$TMP" && pwd -P) || exit 2
 trap '[[ "$TMP" == /tmp/* ]] && rm -rf -- "$TMP"' EXIT
 SCRIPT_COPY="$TMP/vless-server.sh"
-sed -e 's@^readonly VERSION="[^"]*"@readonly VERSION="test-fixture"@' \
-    -e 's@^readonly CFG="/etc/vless-reality"@readonly CFG="'"$TMP"'/cfg"@' \
-    -e 's@^readonly CLOUDFLARED_BIN="/usr/local/bin/cloudflared"@readonly CLOUDFLARED_BIN="'"$TMP"'/bin/cloudflared"@' \
-    -e 's@^readonly CLOUDFLARED_DIR="/etc/cloudflared"@readonly CLOUDFLARED_DIR="'"$TMP"'/cloudflared"@' \
-    "$SCRIPT" > "$SCRIPT_COPY"
+cp "$SCRIPT" "$SCRIPT_COPY"
 mkdir -p "$TMP/cfg" "$TMP/bin" "$TMP/cloudflared"
-export VLESS_SOURCE_ONLY=1 VLESS_TEST_LOG_ROOT="$TMP/log"
+export VLESS_SOURCE_ONLY=1 VLESS_TEST_CFG="$TMP/cfg" VLESS_TEST_LOG_ROOT="$TMP/log"
 # shellcheck disable=SC1090
 source "$SCRIPT_COPY"
+[[ "$CFG" == "$TMP/cfg" ]] || { echo 'FAIL: VLESS_TEST_CFG isolation' >&2; exit 2; }
 set +e
 
 pass=0

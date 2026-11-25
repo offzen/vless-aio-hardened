@@ -11,6 +11,7 @@ for dep in awk grep sed sha256sum; do
 done
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/aio-updater.XXXXXX") || exit 2
+TMP=$(cd -- "$TMP" && pwd -P) || exit 2
 cleanup() { rm -rf -- "$TMP"; }
 trap cleanup EXIT INT TERM
 
@@ -47,8 +48,11 @@ EOF
 make_source_copy() {
   local dir="$1" target="$2"
   sed -e 's@^readonly VERSION_CACHE_DIR=.*@readonly VERSION_CACHE_DIR="'"$dir"'/cache"@' \
-      -e 's@^readonly CFG="/etc/vless-reality"@readonly CFG="'"$dir"'/cfg"@' \
       "$PRODUCT" >"$target"
+  [[ "$(grep -cF "readonly VERSION_CACHE_DIR=\"$dir/cache\"" "$target")" == 1 ]] || {
+    echo "FAIL: VERSION_CACHE_DIR fixture rewrite missed: $target" >&2
+    return 1
+  }
   bash -n "$target"
 }
 
@@ -57,9 +61,10 @@ make_runner() {
   cat >"$runner" <<EOF
 #!/usr/bin/env bash
 set -uo pipefail
-export VLESS_SOURCE_ONLY=1
+export VLESS_SOURCE_ONLY=1 VLESS_TEST_CFG="$dir/cfg" VLESS_TEST_LOG_ROOT="$dir/log"
 # shellcheck disable=SC1090
 source "$source_copy"
+[[ "\$CFG" == "\$VLESS_TEST_CFG" ]] || { echo 'FAIL: VLESS_TEST_CFG isolation' >&2; exit 2; }
 FETCH_COUNT_FILE="$dir/fetch.count"
 REBUILD_LOG="$dir/rebuild.log"
 : >"\$FETCH_COUNT_FILE"
@@ -145,21 +150,21 @@ run_case() {
 printf '########## 1. real do_update success/no-op paths ##########\n'
 run_case same-bytes same-bytes '' '' 0 preserved normal normal ''
 run_case higher valid 3.4.10-h99 '' 0 replaced normal normal 'init_db,xray,singbox,'
-run_case same-version-different valid 3.4.10-h13 '' 0 replaced normal normal 'init_db,xray,singbox,'
+run_case same-version-different valid "$LOCAL_VERSION" '' 0 replaced normal normal 'init_db,xray,singbox,'
 
 printf '\n########## 2. rejection and failure preservation ##########\n'
 run_case lower valid 3.4.10-h12 '' 1 preserved normal normal ''
 run_case missing-version missing-version '' '' 1 preserved normal normal ''
 run_case html html '' '' 1 preserved normal normal ''
-run_case syntax-broken truncated 3.4.10-h13 '' 1 preserved normal normal ''
-run_case explicit-no valid 3.4.10-h13 n 0 preserved normal normal ''
-run_case replacement-failure valid 3.4.10-h13 '' 1 preserved normal fail ''
+run_case syntax-broken truncated "$LOCAL_VERSION" '' 1 preserved normal normal ''
+run_case explicit-no valid "$LOCAL_VERSION" n 0 preserved normal normal ''
+run_case replacement-failure valid "$LOCAL_VERSION" '' 1 preserved normal fail ''
 
 printf '\n########## 3. auto-apply failure returns nonzero after replacement ##########\n'
-run_case apply-failure valid 3.4.10-h13 '' 1 replaced fail normal 'init_db,xray,singbox,'
-run_case apply-init-failure valid 3.4.10-h13 '' 1 replaced fail-init normal 'init_db,xray,singbox,'
-run_case apply-xray-failure valid 3.4.10-h13 '' 1 replaced fail-xray normal 'init_db,xray,singbox,'
-run_case apply-singbox-failure valid 3.4.10-h13 '' 1 replaced fail-singbox normal 'init_db,xray,singbox,'
+run_case apply-failure valid "$LOCAL_VERSION" '' 1 replaced fail normal 'init_db,xray,singbox,'
+run_case apply-init-failure valid "$LOCAL_VERSION" '' 1 replaced fail-init normal 'init_db,xray,singbox,'
+run_case apply-xray-failure valid "$LOCAL_VERSION" '' 1 replaced fail-xray normal 'init_db,xray,singbox,'
+run_case apply-singbox-failure valid "$LOCAL_VERSION" '' 1 replaced fail-singbox normal 'init_db,xray,singbox,'
 
 printf '\n########## 4. startup prompt default is no ##########\n'
 startup_dir="$TMP/startup-default-no"
@@ -170,8 +175,9 @@ make_source_copy "$startup_dir" "$startup_source"
 cat >"$startup_runner" <<EOF
 #!/usr/bin/env bash
 set -uo pipefail
-export VLESS_SOURCE_ONLY=1
+export VLESS_SOURCE_ONLY=1 VLESS_TEST_CFG="$startup_dir/cfg" VLESS_TEST_LOG_ROOT="$startup_dir/log"
 source "$startup_source"
+[[ "\$CFG" == "\$VLESS_TEST_CFG" ]] || { echo 'FAIL: VLESS_TEST_CFG isolation' >&2; exit 2; }
 HIT="$startup_dir/do-update.hit"
 check_root() { :; }
 init_log() { :; }

@@ -1,0 +1,22 @@
+# proto_id	engine	user_contract	uri_family	renderer_family	auth_cluster
+vless	xray	supported	vless-reality	xray-vless-clients	xray-uuid
+vless-xhttp	xray	supported	vless-xhttp	xray-vless-clients	xray-uuid
+vless-xhttp-cdn	xray	unsupported	vless-xhttp-cdn	xray-vless-clients	xray-uuid
+vless-ws	xray	supported	vless-ws	xray-vless-clients	xray-uuid
+vless-ws-notls	xray	unsupported	vless-ws-notls	xray-vless-clients	xray-uuid
+vmess-ws	xray	supported	vmess-ws	xray-vmess-clients	xray-vmess
+vless-vision	xray	supported	vless-vision	xray-vless-clients	xray-uuid
+trojan	xray	supported	trojan	xray-trojan-clients	xray-password
+trojan-ws	xray	unsupported	trojan-ws	xray-trojan-clients	xray-password
+socks	xray	supported	socks	xray-socks-accounts	xray-userpass
+ss2022	xray	unsupported	ss2022	xray-top-password	xray-ss2022
+ss-legacy	xray	supported	ss-legacy	xray-ss-clients	xray-ss-legacy
+hy2	singbox	supported	hy2	singbox-password-users	singbox-password
+tuic	singbox	supported	tuic	singbox-tuic-users	singbox-dual
+anytls	singbox	supported	anytls	singbox-password-users	singbox-password
+snell	standalone	rejected	none	none	none
+snell-v5	standalone	rejected	none	none	none
+snell-shadowtls	standalone	rejected	none	none	none
+snell-v5-shadowtls	standalone	rejected	none	none	none
+ss2022-shadowtls	standalone	rejected	none	none	none
+naive	standalone	rejected	none	none	none

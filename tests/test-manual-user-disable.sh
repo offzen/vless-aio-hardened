@@ -3,12 +3,15 @@
 set -uo pipefail
 SCRIPT="${1:-$(dirname "$0")/../vless-server.sh}"
 TMP=$(mktemp -d)
+TMP=$(cd -- "$TMP" && pwd -P) || exit 2
 trap '[[ "$TMP" == /tmp/* ]] && rm -rf -- "$TMP"' EXIT
-export VLESS_SOURCE_ONLY=1
+mkdir -p "$TMP/cfg"
+export VLESS_SOURCE_ONLY=1 VLESS_TEST_CFG="$TMP/cfg"
 export VLESS_TEST_LOG_ROOT="$TMP/var/log"
 SCRIPT_COPY="$TMP/vless-server.sh"
-sed -e 's@^readonly CFG="/etc/vless-reality"@readonly CFG="'"$TMP"'"@' "$SCRIPT" > "$SCRIPT_COPY"
+cp "$SCRIPT" "$SCRIPT_COPY"
 source "$SCRIPT_COPY"
+[[ "$CFG" == "$TMP/cfg" ]] || { echo 'FAIL: VLESS_TEST_CFG isolation' >&2; exit 2; }
 _listen_addr() { printf '127.0.0.1\n'; }
 svc() { return 1; }
 _ok() { :; }
@@ -93,16 +96,17 @@ JSON
 check 'disabled VMess clients do not fall back to top-level UUID' "$(gen_xray_vmess_clients vmess | jq -e 'length == 0' >/dev/null && echo true || echo false)"
 check 'disabled Trojan clients do not fall back to top-level password' "$(gen_xray_trojan_clients trojan | jq -e 'length == 0' >/dev/null && echo true || echo false)"
 check 'disabled SOCKS accounts do not fall back to top-level credentials' "$(gen_xray_socks_accounts socks | jq -e 'length == 0' >/dev/null && echo true || echo false)"
-check 'disabled multi-port VMess clients do not fall back' "$(gen_xray_vmess_clients vmess-multi | jq -e 'length == 0' >/dev/null && echo true || echo false)"
-check 'disabled multi-port Trojan clients do not fall back' "$(gen_xray_trojan_clients trojan-multi | jq -e 'length == 0' >/dev/null && echo true || echo false)"
-check 'disabled multi-port SOCKS accounts do not fall back' "$(gen_xray_socks_accounts socks-multi | jq -e 'length == 0' >/dev/null && echo true || echo false)"
+check 'disabled multi-port VMess clients do not fall back' "$(gen_xray_vmess_clients vmess_multi | jq -e 'length == 0' >/dev/null && echo true || echo false)"
+check 'disabled multi-port Trojan clients do not fall back' "$(gen_xray_trojan_clients trojan_multi | jq -e 'length == 0' >/dev/null && echo true || echo false)"
+check 'disabled multi-port SOCKS accounts do not fall back' "$(gen_xray_socks_accounts socks_multi | jq -e 'length == 0' >/dev/null && echo true || echo false)"
 cat > "$DB_FILE" <<'JSON'
 {"singbox":{"hy2":{"port":20443,"password":"fixture-hy2","users":[{"name":"alice","uuid":"fixture-hy2-disabled","enabled":false}]},"tuic":{"port":30443,"uuid":"fixture-tuic-disabled","password":"fixture-tuic-password","users":[{"name":"alice","uuid":"fixture-tuic-disabled","password":"fixture-tuic-password","enabled":false}]}}}
 JSON
-rm -f "$CFG/singbox.json"
+# 预置旧 singbox.json 证明全禁用时会主动清除陈旧配置而非依赖测试前手工 rm
+printf '{"inbounds":[{"type":"hysteria2","users":[{"name":"stale","password":"stale-secret"}]}]}\n' > "$CFG/singbox.json"
 if generate_singbox_config; then sb_empty_rc=0; else sb_empty_rc=1; fi
 check 'all-disabled Sing-box configuration is safely rejected' "$([[ "$sb_empty_rc" -ne 0 ]] && echo true || echo false)"
-check 'all-disabled Sing-box leaves no stale configuration file' "$([[ ! -e "$CFG/singbox.json" ]] && echo true || echo false)"
+check 'all-disabled Sing-box removes pre-existing stale configuration file' "$([[ ! -e "$CFG/singbox.json" ]] && echo true || echo false)"
 
 # The full Xray generator must skip an all-disabled VMess-WS inbound, not just
 # return [] from its client helper. Keep an enabled peer so this is not vacuous.

@@ -23,11 +23,11 @@ for dep in unshare mount python3 curl sha256sum awk; do
     command -v "$dep" >/dev/null 2>&1 || fail "缺少隔离测试依赖: $dep"
 done
 
-# 依赖存在 ≠ 有权使用：容器化 runner（Gitea self-hosted runner 的 docker 容器、
+# 依赖存在 ≠ 有权使用：容器化 runner（Gitea act_runner 的 docker 容器、
 # 未加 --privileged / 无 CAP_SYS_ADMIN 的 CI）里 unshare 会以
 #   unshare: unshare failed: Operation not permitted
 # 失败。那是**环境能力缺失**，不是被测代码的缺陷，不能让整个作业染红
-# （private canonical repository run 245 job 901 即因此失败，其余 13 个套件全过）。
+# （gitorca run 245 job 901 即因此失败，其余 13 个套件全过）。
 # 所以先探一次能力；不可用就显式 skip 并给可操作的说明，退出码 0。
 if ! unshare --user --map-root-user --mount --pid --fork true 2>/dev/null; then
     echo "SKIP: 当前环境不允许 unshare(CLONE_NEWUSER) —— 跳过 Web root 所有权隔离回归"
@@ -50,7 +50,14 @@ mkdir -p "$WORK/root/etc/nginx/sites-available" \
          "$WORK/root/run" \
          "$WORK/root/tmp" \
          "$WORK/root/home" \
+         "$WORK/root/usr-local-bin" \
+         "$WORK/root/usr-bin" \
          "$WORK/bin"
+# Shortcut cleanup must not inherit host /usr state (including read-only outer mounts).
+for shortcut in vless vless.sh vless-server.sh; do
+    printf '%s\n' 'isolated-project-shortcut' > "$WORK/root/usr-local-bin/$shortcut"
+done
+printf '%s\n' 'isolated-project-shortcut' > "$WORK/root/usr-bin/vless"
 # Bind whole parents in the namespace; never create missing absolute targets on the host.
 cp /etc/os-release "$WORK/root/etc/os-release"
 
@@ -121,6 +128,7 @@ for path in etc var/log run tmp home; do
 done
 mkdir -p /var/www/html
 mount --bind "$WORK_ROOT/root/var/html" /var/www/html
+mount --bind "$WORK_ROOT/root/usr-local-bin" /usr/local/bin
 mount -t proc proc /proc
 export HOME=/home PATH="$WORK_ROOT/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 hash -r
@@ -168,6 +176,20 @@ stop_services() { :; }
 warp_status() { printf '%s\n' not_configured; }
 force_cleanup() { :; }
 get_installed_protocols() { :; }
+rm() {
+    # /usr/bin contains required system tools: shadow only the exact project shortcut.
+    # Every call still reaches real rm; no failures or other deletion targets are swallowed.
+    local arg
+    local -a args=()
+    for arg in "$@"; do
+        if [[ "$arg" == /usr/bin/vless ]]; then
+            args+=("$WORK_ROOT/root/usr-bin/vless")
+        else
+            args+=("$arg")
+        fi
+    done
+    command rm "${args[@]}"
+}
 find() {
     # do_uninstall only: preserve command flow while avoiding recursive host-visible traversal.
     [[ " $* " == *" $CFG "* ]] && return 0
@@ -236,6 +258,9 @@ snapshot disable
 printf '%s\n' 'project-owned-residual' > /etc/nginx/conf.d/vless-residual.conf
 printf '%s\n' y | do_uninstall
 [[ ! -e /etc/nginx/conf.d/vless-residual.conf ]] || { echo 'FAIL: uninstall did not remove project residual' >&2; exit 1; }
+for shortcut in /usr/local/bin/vless /usr/local/bin/vless.sh /usr/local/bin/vless-server.sh "$WORK_ROOT/root/usr-bin/vless"; do
+    [[ ! -e "$shortcut" && ! -L "$shortcut" ]] || { echo "FAIL: uninstall left isolated shortcut: $shortcut" >&2; exit 1; }
+done
 snapshot uninstall
 
 grep -qx 'systemctl enable nginx' "$SPY_LOG" || { echo 'FAIL: enable did not request nginx enable' >&2; exit 1; }

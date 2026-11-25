@@ -1,7 +1,7 @@
 #!/bin/bash
-# 单元测试：h13 滚动 master 的 SHA-256 更新判定与版本防降级。
+# 单元测试：滚动 master 的 SHA-256 更新判定与版本防降级。
 #
-# h13 不从 Release/tag 取更新制品身份；菜单提示比较远端/本地脚本哈希，同时用脚本内
+# 滚动 master 不从 Release/tag 取更新制品身份；菜单提示比较远端/本地脚本哈希，同时用脚本内
 # readonly VERSION 做方向闸门：远端更高或同版本不同字节可更新，远端更旧拒绝。
 # 全离线（下载与本地脚本哈希均用 stub），可在无外网 runner 上运行。
 set -uo pipefail
@@ -32,7 +32,7 @@ for fn in _script_sha256 _is_sha256 _is_semver_version _extract_script_version \
   extract_fn "$fn"
 done
 
-VERSION="3.4.10-h13"
+VERSION=$(sed -n 's/^readonly VERSION="\([^"]*\)"/\1/p' "$(dirname "$0")/../vless-server.sh" | head -n1)
 RELEASE_CHANNEL="master"
 VERSION_CACHE_DIR="$CFG/cache"
 SCRIPT_HASH_CACHE_FILE="$VERSION_CACHE_DIR/.script_hash"
@@ -70,15 +70,15 @@ is_update() { _has_script_update && echo yes || echo no; }
 update_info() { _get_script_update_info 2>/dev/null || true; }
 
 echo "########## 1. 语义化版本与方向比较 ##########"
-for v in "3.4.10-h13" "3.4.10" "10.0.0-h1"; do
+for v in "$VERSION" "3.4.10" "10.0.0-h1"; do
   check "接受 '$v'" "$(_is_semver_version "$v" && echo yes || echo no)" "yes"
 done
-for v in "dev" "latest" "v3.4.10-h13" "3.4.10-h" ""; do
+for v in "dev" "latest" "v${VERSION}" "3.4.10-h" ""; do
   check "拒绝 '$v'" "$(_is_semver_version "$v" && echo yes || echo no)" "no"
 done
-check "h13 > h12" "$(_version_gt "3.4.10-h13" "3.4.10-h12" && echo gt || echo le)" "gt"
-check "h12 不大于 h13" "$(_version_gt "3.4.10-h12" "3.4.10-h13" && echo gt || echo le)" "le"
-check "同版本不大于自身" "$(_version_gt "3.4.10-h13" "3.4.10-h13" && echo gt || echo le)" "le"
+check "当前版本 > h12" "$(_version_gt "$VERSION" "3.4.10-h12" && echo gt || echo le)" "gt"
+check "h12 不大于当前版本" "$(_version_gt "3.4.10-h12" "$VERSION" && echo gt || echo le)" "le"
+check "同版本不大于自身" "$(_version_gt "$VERSION" "$VERSION" && echo gt || echo le)" "le"
 
 echo ""
 echo "########## 2. 远端制品哈希与缓存 ##########"
@@ -119,7 +119,7 @@ printf '3.4.10-h99\n' > "$SCRIPT_VERSION_CACHE_FILE"
 check "远端合成高版本且字节不同可更新" "$(is_update)" "yes"
 check "更新提示返回滚动通道" "$(update_info)" "master"
 
-printf '3.4.10-h13\n' > "$SCRIPT_VERSION_CACHE_FILE"
+printf '%s\n' "$VERSION" > "$SCRIPT_VERSION_CACHE_FILE"
 check "同版本滚动制品字节变化可更新" "$(is_update)" "yes"
 
 printf '3.4.10-h12\n' > "$SCRIPT_VERSION_CACHE_FILE"
@@ -134,7 +134,7 @@ check "缺少远端哈希缓存时不提示" "$(is_update)" "no"
 
 echo ""
 if [[ $fail -eq 0 ]]; then
-  echo "PASS: h13 SHA 更新判定正确（高版本/同版本可更新，低版本拒绝）"
+  echo "PASS: rolling SHA 更新判定正确（高版本/同版本可更新，低版本拒绝）"
 else
   echo "FAIL: 有断言未通过"
   exit 1

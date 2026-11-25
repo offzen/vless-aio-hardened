@@ -25,11 +25,16 @@ readonly RELEASE_CHANNEL="master"
 #   1) 3.4.10-h5 及更早的存量客户端只认语义化版本号，靠它识别本制品并放行下载；
 #   2) 本版更新器用它做"防降级"方向判断（远端更旧一律拒绝）。
 # 格式受老客户端硬约束：^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$，且必须单调递增。
-readonly VERSION="3.4.10-h13"
+readonly VERSION="3.4.10-h15"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/offzen/vless-aio-hardened"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
-readonly CFG="/etc/vless-reality"
+if [[ "${VLESS_SOURCE_ONLY:-0}" == "1" && "${VLESS_TEST_CFG:-}" == /* && \
+      "${VLESS_TEST_CFG:-}" != "/" && "${VLESS_TEST_CFG:-}" != "/etc" && "${VLESS_TEST_CFG:-}" != /etc/* ]]; then
+    readonly CFG="${VLESS_TEST_CFG}"
+else
+    readonly CFG="/etc/vless-reality"
+fi
 readonly ACME_DEFAULT_EMAIL=""
 
 # curl 超时常量
@@ -172,15 +177,18 @@ init_db() {
     local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
-    tmp=$(mktemp) || return 1
+    tmp=$(mktemp "${DB_FILE}.init.XXXXXX") || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
     if jq -n --arg v "4.0.0" --arg t "$now" \
       '{version:$v,xray:{},singbox:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE"
+        chmod 600 "$DB_FILE" 2>/dev/null || true
         return 0
     fi
     # jq 失败时使用简单方式创建
-    echo '{"version":"4.0.0","xray":{},"singbox":{},"meta":{}}' > "$DB_FILE"
     rm -f "$tmp"
+    ( umask 077; echo '{"version":"4.0.0","xray":{},"singbox":{},"meta":{}}' > "$DB_FILE" )
+    chmod 600 "$DB_FILE" 2>/dev/null || true
     return 0
 }
 
@@ -190,9 +198,11 @@ _db_touch() {
     local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
-    tmp=$(mktemp) || return 1
+    tmp=$(mktemp "${DB_FILE}.touch.XXXXXX") || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
     if jq --arg t "$now" '.meta.updated=$t' "$DB_FILE" >"$tmp"; then
         mv "$tmp" "$DB_FILE"
+        chmod 600 "$DB_FILE" 2>/dev/null || true
     else
         rm -f "$tmp"
         return 1
@@ -201,9 +211,11 @@ _db_touch() {
 
 _db_apply() { # _db_apply [jq args...] 'filter'
     [[ -f "$DB_FILE" ]] || init_db || return 1
-    local tmp; tmp=$(mktemp) || return 1
+    local tmp; tmp=$(mktemp "${DB_FILE}.apply.XXXXXX") || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
     if jq "$@" "$DB_FILE" >"$tmp" 2>/dev/null; then
         mv "$tmp" "$DB_FILE"
+        chmod 600 "$DB_FILE" 2>/dev/null || true
         _db_touch
         return 0
     fi
@@ -228,17 +240,31 @@ _db_safe_write() {
     shift 2
     [[ -f "$DB_FILE" ]] || init_db || return 1
 
-    # 便携互斥锁：mkdir 是原子的；最多等 5 秒
+    # 便携互斥锁：mkdir 是原子的；记录持锁 PID 并支持自动清理死锁（防崩溃永久锁死）
     local lock_dir="${DB_FILE}.lock"
     local locked=0
     for _ in $(seq 1 50); do
-        if mkdir "$lock_dir" 2>/dev/null; then locked=1; break; fi
+        if mkdir "$lock_dir" 2>/dev/null; then
+            printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || true
+            locked=1
+            break
+        fi
+        # 若持锁进程已不存在，回收遗留陈旧锁
+        if [[ -f "$lock_dir/pid" ]]; then
+            local _lock_pid
+            _lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+            if [[ "$_lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
+                rm -rf "$lock_dir" 2>/dev/null || true
+                continue
+            fi
+        fi
         sleep 0.1 2>/dev/null || sleep 1
     done
     if [[ "$locked" != "1" ]]; then
         _err "数据库写入锁等待超时，已跳过本次写入"
         return 1
     fi
+    _release_db_lock() { rm -rf "$lock_dir" 2>/dev/null || true; }
 
     # 计算守卫 key 下写入前的用户总数
     local before_users=0
@@ -262,17 +288,17 @@ _db_safe_write() {
     fi
 
     local tmp
-    tmp=$(mktemp "${DB_FILE}.tmp.XXXXXX") || { rmdir "$lock_dir" 2>/dev/null; return 1; }
+    tmp=$(mktemp "${DB_FILE}.tmp.XXXXXX") || { _release_db_lock; return 1; }
 
     if ! jq "$@" "$DB_FILE" >"$tmp" 2>/dev/null; then
         rm -f "$tmp"
-        rmdir "$lock_dir" 2>/dev/null
+        _release_db_lock
         return 1
     fi
     # jq 空输出（例如 db.json 被并发置空）也算失败
     if [[ ! -s "$tmp" ]]; then
         rm -f "$tmp"
-        rmdir "$lock_dir" 2>/dev/null
+        _release_db_lock
         _err "数据库写入产生空结果，已中止"
         return 1
     fi
@@ -297,20 +323,22 @@ _db_safe_write() {
         done
         if [[ "$after_users" -eq 0 ]]; then
             rm -f "$tmp"
-            rmdir "$lock_dir" 2>/dev/null
+            _release_db_lock
             _err "检测到用户列表将全部清空，已中止写入（${guard_core}）"
             return 2
         fi
     fi
 
     local rc=0
+    chmod 600 "$tmp" 2>/dev/null || true
     if mv "$tmp" "$DB_FILE"; then
+        chmod 600 "$DB_FILE" 2>/dev/null || true
         _db_touch 2>/dev/null
     else
         rm -f "$tmp"
         rc=1
     fi
-    rmdir "$lock_dir" 2>/dev/null
+    _release_db_lock
     return $rc
 }
 
@@ -685,6 +713,19 @@ is_standalone_protocol() {
     [[ " $STANDALONE_PROTOCOLS " == *" $proto "* ]]
 }
 
+# 逐用户管理采用正向白名单；未知、独立和能力不完整的协议默认拒绝。
+# 测试将此列表与 protocol-capabilities.tsv 的 supported 行双向对账。
+supports_per_user_management() {
+    case "${1:-}" in
+        vless|vless-xhttp|vless-ws|vmess-ws|vless-vision|trojan|socks|ss-legacy|hy2|tuic|anytls)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  多用户配置生成辅助函数
 #═══════════════════════════════════════════════════════════════════════════════
@@ -714,8 +755,13 @@ gen_xray_vless_clients() {
         if [[ -n "$config" && "$config" != "null" ]]; then
             # 检查是否为数组
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                # 多端口：任一实例已进入显式 users 管理时，不回退合成默认用户。
-                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
+                # 多端口：目标实例（或任意实例）存在显式 users 数组（含空表）时，不回退顶层 UUID。
+                if [[ -n "$filter_port" ]]; then
+                    if jq -e --arg port "$filter_port" 'any(.[]; ((.port | tostring) == $port) and ((.users | type) == "array"))' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                elif jq -e 'any(.[]; (.users | type) == "array")' <<< "$config" >/dev/null 2>&1; then
                     echo "[]"
                     return
                 fi
@@ -728,24 +774,24 @@ gen_xray_vless_clients() {
                 fi
                 if [[ -n "$uuid" ]]; then
                     if [[ -n "$flow" ]]; then
-                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\",\"flow\":\"$flow\"}]"
+                        jq -cn --arg id "$uuid" --arg e "default@${proto}" --arg f "$flow" '[{id:$id,email:$e,flow:$f}]'
                     else
-                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\"}]"
+                        jq -cn --arg id "$uuid" --arg e "default@${proto}" '[{id:$id,email:$e}]'
                     fi
                     return
                 fi
             else
-                # 单端口：显式 users 表（包括全禁用/过期）不再回退顶层 UUID。
-                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                # 单端口：显式 users 数组（包括空表、全禁用/过期）不再回退顶层 UUID。
+                if jq -e '(.users | type) == "array"' <<< "$config" >/dev/null 2>&1; then
                     echo "[]"
                     return
                 fi
                 local uuid=$(echo "$config" | jq -r '.uuid // empty')
                 if [[ -n "$uuid" ]]; then
                     if [[ -n "$flow" ]]; then
-                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\",\"flow\":\"$flow\"}]"
+                        jq -cn --arg id "$uuid" --arg e "default@${proto}" --arg f "$flow" '[{id:$id,email:$e,flow:$f}]'
                     else
-                        echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\"}]"
+                        jq -cn --arg id "$uuid" --arg e "default@${proto}" '[{id:$id,email:$e}]'
                     fi
                     return
                 fi
@@ -755,10 +801,12 @@ gen_xray_vless_clients() {
         return
     fi
     
-    local clients="[]"
+    local clients="[]" today
+    today=$(date '+%Y-%m-%d')
     declare -A seen_emails=()
-    while IFS='|' read -r name uuid used quota enabled port routing; do
+    while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
         [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$expire_date" && "$expire_date" < "$today" ]] && continue
         [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
         local email="${name}@${proto}"
         [[ -n "${seen_emails[$email]+x}" ]] && continue
@@ -776,7 +824,7 @@ gen_xray_vless_clients() {
 
 # 生成 Xray VMess 多用户 clients 数组
 gen_xray_vmess_clients() {
-    local proto="$1"
+    local proto="$1" filter_port="${2:-}"
     
     local users=$(db_get_users_stats "xray" "$proto")
     if [[ "$users" == "[]" ]]; then echo "[]"; return; fi
@@ -785,20 +833,28 @@ gen_xray_vmess_clients() {
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
-                    echo "[]"
-                    return
+                if [[ -n "$filter_port" ]]; then
+                    if jq -e --arg port "$filter_port" 'any(.[]; ((.port | tostring) == $port) and ((.users | type) == "array"))' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                    local uuid=$(echo "$config" | jq -r --arg port "$filter_port" '.[] | select((.port | tostring) == $port) | .uuid // empty' | head -n1)
+                else
+                    if jq -e 'any(.[]; (.users | type) == "array")' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                    local uuid=$(echo "$config" | jq -r '.[0].uuid // empty')
                 fi
-                local uuid=$(echo "$config" | jq -r '.[0].uuid // empty')
             else
-                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                if jq -e '(.users | type) == "array"' <<< "$config" >/dev/null 2>&1; then
                     echo "[]"
                     return
                 fi
                 local uuid=$(echo "$config" | jq -r '.uuid // empty')
             fi
             if [[ -n "$uuid" ]]; then
-                echo "[{\"id\":\"$uuid\",\"email\":\"default@${proto}\",\"alterId\":0}]"
+                jq -cn --arg id "$uuid" --arg e "default@${proto}" '[{id:$id,email:$e,alterId:0}]'
                 return
             fi
         fi
@@ -806,9 +862,12 @@ gen_xray_vmess_clients() {
         return
     fi
     
-    local clients="[]"
-    while IFS='|' read -r name uuid used quota enabled port routing; do
+    local clients="[]" today
+    today=$(date '+%Y-%m-%d')
+    while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
         [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$expire_date" && "$expire_date" < "$today" ]] && continue
+        [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
         local email="${name}@${proto}"
         clients=$(echo "$clients" | jq --arg id "$uuid" --arg e "$email" '. + [{id: $id, email: $e, alterId: 0}]')
     done <<< "$users"
@@ -818,7 +877,7 @@ gen_xray_vmess_clients() {
 
 # 生成 Xray Trojan 多用户 clients 数组
 gen_xray_trojan_clients() {
-    local proto="$1"
+    local proto="$1" filter_port="${2:-}"
     
     local users=$(db_get_users_stats "xray" "$proto")
     if [[ "$users" == "[]" ]]; then echo "[]"; return; fi
@@ -827,20 +886,28 @@ gen_xray_trojan_clients() {
         local config=$(db_get "xray" "$proto")
         if [[ -n "$config" && "$config" != "null" ]]; then
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
-                    echo "[]"
-                    return
+                if [[ -n "$filter_port" ]]; then
+                    if jq -e --arg port "$filter_port" 'any(.[]; ((.port | tostring) == $port) and ((.users | type) == "array"))' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                    local password=$(echo "$config" | jq -r --arg port "$filter_port" '.[] | select((.port | tostring) == $port) | .password // empty' | head -n1)
+                else
+                    if jq -e 'any(.[]; (.users | type) == "array")' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                    local password=$(echo "$config" | jq -r '.[0].password // empty')
                 fi
-                local password=$(echo "$config" | jq -r '.[0].password // empty')
             else
-                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                if jq -e '(.users | type) == "array"' <<< "$config" >/dev/null 2>&1; then
                     echo "[]"
                     return
                 fi
                 local password=$(echo "$config" | jq -r '.password // empty')
             fi
             if [[ -n "$password" ]]; then
-                echo "[{\"password\":\"$password\",\"email\":\"default@${proto}\"}]"
+                jq -cn --arg pw "$password" --arg e "default@${proto}" '[{password:$pw,email:$e}]'
                 return
             fi
         fi
@@ -848,9 +915,12 @@ gen_xray_trojan_clients() {
         return
     fi
     
-    local clients="[]"
-    while IFS='|' read -r name uuid used quota enabled port routing; do
+    local clients="[]" today
+    today=$(date '+%Y-%m-%d')
+    while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
         [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$expire_date" && "$expire_date" < "$today" ]] && continue
+        [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
         local email="${name}@${proto}"
         # Trojan 使用 password 字段，这里 uuid 实际存储的是 password
         clients=$(echo "$clients" | jq --arg pw "$uuid" --arg e "$email" '. + [{password: $pw, email: $e}]')
@@ -882,9 +952,52 @@ gen_xray_ss2022_clients() {
     echo "$clients"
 }
 
+# 生成 Xray 传统 Shadowsocks 多用户 clients 数组。
+# Xray 的 JSON 字段名是 clients（不是内部数据库使用的 users）。
+# 项目的用户模型把协议凭据统一存入 uuid；method 属于端口实例，不能按用户漂移，
+# 否则服务端认证集合会与分享链接（使用实例 method）不一致。
+gen_xray_ss_legacy_clients() {
+    local proto="$1" filter_port="${2:-}"
+    local config
+    config=$(db_get "xray" "$proto")
+    [[ -z "$config" || "$config" == "null" ]] && { echo "[]"; return; }
+
+    local users="[]"
+    users=$(echo "$config" | jq -c --arg port "$filter_port" --arg proto "$proto" --arg today "$(date '+%Y-%m-%d')" '
+        def active:
+            select((if .enabled == null then true else .enabled end) == true) |
+            select((.expire_date // "") == "" or .expire_date >= $today) |
+            select((.uuid // "") != "");
+        def user_name:
+            if ((.name // "") | length) > 0 then .name else "default" end;
+        if type == "array" then
+            [ .[] |
+              select($port == "" or (.port | tostring) == $port) |
+              . as $cfg |
+              ($cfg.users // [])[] | active |
+              {
+                  password: .uuid,
+                  method: $cfg.method,
+                  email: (user_name + "@" + $proto)
+              }
+            ]
+        else
+            . as $cfg |
+            [ ($cfg.users // [])[] | active |
+              {
+                  password: .uuid,
+                  method: $cfg.method,
+                  email: (user_name + "@" + $proto)
+              }
+            ]
+        end
+    ')
+    echo "$users"
+}
+
 # 生成 Xray SOCKS5 多用户 accounts 数组
 gen_xray_socks_accounts() {
-    local proto="$1"
+    local proto="$1" filter_port="${2:-}"
     
     local users=$(db_get_users_stats "xray" "$proto")
     if [[ "$users" == "[]" ]]; then echo "[]"; return; fi
@@ -894,14 +1007,23 @@ gen_xray_socks_accounts() {
         if [[ -n "$config" && "$config" != "null" ]]; then
             local username password
             if echo "$config" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                if jq -e 'any(.[]; ((.users // []) | length) > 0)' <<< "$config" >/dev/null 2>&1; then
-                    echo "[]"
-                    return
+                if [[ -n "$filter_port" ]]; then
+                    if jq -e --arg port "$filter_port" 'any(.[]; ((.port | tostring) == $port) and ((.users | type) == "array"))' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                    username=$(echo "$config" | jq -r --arg port "$filter_port" '.[] | select((.port | tostring) == $port) | .username // empty' | head -n1)
+                    password=$(echo "$config" | jq -r --arg port "$filter_port" '.[] | select((.port | tostring) == $port) | .password // empty' | head -n1)
+                else
+                    if jq -e 'any(.[]; (.users | type) == "array")' <<< "$config" >/dev/null 2>&1; then
+                        echo "[]"
+                        return
+                    fi
+                    username=$(echo "$config" | jq -r '.[0].username // empty')
+                    password=$(echo "$config" | jq -r '.[0].password // empty')
                 fi
-                username=$(echo "$config" | jq -r '.[0].username // empty')
-                password=$(echo "$config" | jq -r '.[0].password // empty')
             else
-                if jq -e '((.users // []) | length) > 0' <<< "$config" >/dev/null 2>&1; then
+                if jq -e '(.users | type) == "array"' <<< "$config" >/dev/null 2>&1; then
                     echo "[]"
                     return
                 fi
@@ -909,7 +1031,7 @@ gen_xray_socks_accounts() {
                 password=$(echo "$config" | jq -r '.password // empty')
             fi
             if [[ -n "$username" && -n "$password" ]]; then
-                echo "[{\"user\":\"$username\",\"pass\":\"$password\"}]"
+                jq -cn --arg u "$username" --arg p "$password" '[{user:$u,pass:$p}]'
                 return
             fi
         fi
@@ -917,9 +1039,12 @@ gen_xray_socks_accounts() {
         return
     fi
     
-    local accounts="[]"
-    while IFS='|' read -r name uuid used quota enabled port routing; do
+    local accounts="[]" today
+    today=$(date '+%Y-%m-%d')
+    while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
         [[ -z "$name" || -z "$uuid" || "$enabled" != "true" ]] && continue
+        [[ -n "$expire_date" && "$expire_date" < "$today" ]] && continue
+        [[ -n "$filter_port" && "$port" != "$filter_port" ]] && continue
         # SOCKS5: name 是 username，uuid 是 password
         accounts=$(echo "$accounts" | jq --arg u "$name" --arg p "$uuid" '. + [{user: $u, pass: $p}]')
     done <<< "$users"
@@ -961,13 +1086,11 @@ db_add_user() {
         return 1
     fi
     
-    # 检查是否为独立协议（不支持多用户）
-    if is_standalone_protocol "$proto"; then
-        _err "独立协议 $proto 不支持添加用户"
+    # 只有已完成 DB→URI→renderer 合同的协议才能进入逐用户管理。
+    if ! supports_per_user_management "$proto"; then
+        _err "协议 $proto 不支持逐用户管理"
         return 1
     fi
-    
-
     
     # 检查用户名是否已存在 (支持多端口)
     local exists=$(jq -r --arg c "$core" --arg p "$proto" --arg n "$name" '
@@ -1603,19 +1726,30 @@ db_set_tg_config() {
     jq --arg f "$field" --arg v "$value" '.telegram[$f] = $v' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
 }
 
-# 发送 Telegram 消息
+# 发送 Telegram 消息（优先读取统一的 $CFG/telegram.json，兼容旧 db.json .telegram）
 send_tg_message() {
     local message="$1"
-    local bot_token=$(db_get_tg_config "bot_token")
-    local chat_id=$(db_get_tg_config "chat_id")
+    local bot_token="" chat_id=""
+    if [[ -f "$TG_CONFIG_FILE" ]]; then
+        local enabled
+        enabled=$(tg_get_config "enabled")
+        if [[ "$enabled" == "true" ]]; then
+            bot_token=$(tg_get_config "bot_token")
+            chat_id=$(tg_get_config "chat_id")
+        fi
+    fi
+    [[ -z "$bot_token" ]] && bot_token=$(db_get_tg_config "bot_token")
+    [[ -z "$chat_id" ]] && chat_id=$(db_get_tg_config "chat_id")
     
     [[ -z "$bot_token" || -z "$chat_id" ]] && return 1
     
-    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
+    curl -s -X POST -K - \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
         -d "parse_mode=Markdown" \
-        --connect-timeout 10 >/dev/null 2>&1
+        --connect-timeout 10 >/dev/null 2>&1 <<EOF
+url = "https://api.telegram.org/bot${bot_token}/sendMessage"
+EOF
 }
 
 # 发送用户即将过期提醒
@@ -1754,9 +1888,16 @@ ensure_expire_check_cron() {
     fi
 }
 
-# 卸载过期检查 cron
+# 卸载过期检查 cron（保护现有 crontab，读取失败时不覆盖清空）
 uninstall_expire_check_cron() {
-    crontab -l 2>/dev/null | grep -v "check-expire" | crontab -
+    local current_cron filtered_cron
+    current_cron=$(crontab -l 2>/dev/null) || { _warn "当前无 crontab 或读取失败，未修改"; return 0; }
+    filtered_cron=$(printf '%s\n' "$current_cron" | grep -v "check-expire" || true)
+    if [[ -n "$filtered_cron" ]]; then
+        printf '%s\n' "$filtered_cron" | crontab -
+    else
+        crontab -r 2>/dev/null || true
+    fi
     _ok "已移除过期检查 cron"
 }
 
@@ -1773,9 +1914,9 @@ db_get_users_stats() {
         if $cfg == null then
             empty
         elif ($cfg | type) == "array" then
-            # 多端口数组
+            # 多端口数组：显式 users 数组（含空表）不再回退顶层默认凭据
             $cfg[] | . as $port_cfg |
-            if (.users | length) > 0 then
+            if (.users | type) == "array" then
                 .users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(if .enabled == null then true else .enabled end)|\($port_cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif (.uuid != null or .password != null or .username != null) then
                 # 无 users 数组，生成默认用户（与 Xray email 格式一致使用 "default"）
@@ -1784,8 +1925,8 @@ db_get_users_stats() {
                 empty
             end
         else
-            # 单端口对象
-            if ($cfg.users | length) > 0 then
+            # 单端口对象：显式 users 数组（含空表）不再回退顶层默认凭据
+            if ($cfg.users | type) == "array" then
                 $cfg.users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(if .enabled == null then true else .enabled end)|\($cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif ($cfg.uuid != null or $cfg.password != null or $cfg.username != null) then
                 "default|\($cfg.uuid // $cfg.password // $cfg.username)|0|0|true|\($cfg.port)||"
@@ -1821,10 +1962,11 @@ db_migrate_to_multiuser() {
     
     local migrated=false
     
-    # 检查是否需要迁移 (检查 xray.vless 是否有 users 字段)
+    # 检查是否需要迁移 (仅对支持逐用户管理的协议迁移，避免污染 partial/独立协议)
     for core in xray singbox; do
         local protocols=$(db_list_protocols "$core")
         for proto in $protocols; do
+            supports_per_user_management "$proto" || continue
             local has_users=$(jq -r --arg p "$proto" ".${core}[\$p].users // \"none\"" "$DB_FILE" 2>/dev/null)
             if [[ "$has_users" == "none" ]]; then
                 # 需要迁移：将现有配置转为默认用户
@@ -1906,6 +2048,10 @@ rebuild_and_reload_singbox() {
             return 0
         fi
     else
+        # 若因全部用户被禁用/过期导致无有效配置，停止运行中的服务，避免内存中残留旧凭据继续生效
+        if [[ ! -f "$CFG/singbox.json" ]] && svc status vless-singbox 2>/dev/null; then
+            svc stop vless-singbox 2>/dev/null || true
+        fi
         [[ -z "$silent" ]] && _err "Sing-box 配置重建失败"
         return 1
     fi
@@ -1921,14 +2067,15 @@ readonly TG_CONFIG_FILE="$CFG/telegram.json"
 # 初始化 TG 配置
 init_tg_config() {
     [[ -f "$TG_CONFIG_FILE" ]] && return 0
-    echo '{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false}' > "$TG_CONFIG_FILE"
+    ( umask 077; echo '{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false}' > "$TG_CONFIG_FILE" )
+    chmod 600 "$TG_CONFIG_FILE" 2>/dev/null || true
 }
 
 # 获取 TG 配置
 tg_get_config() {
     local field="$1"
     [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
-    jq -r ".$field // empty" "$TG_CONFIG_FILE" 2>/dev/null
+    jq -r --arg f "$field" '.[$f] // empty' "$TG_CONFIG_FILE" 2>/dev/null
 }
 
 # 设置 TG 配置
@@ -1936,13 +2083,17 @@ tg_set_config() {
     local field="$1" value="$2"
     [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
     
-    local tmp=$(mktemp)
+    local tmp
+    tmp=$(mktemp "${TG_CONFIG_FILE}.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
     if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
-        jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
+        jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     else
-        jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
+        jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     fi
+    [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$TG_CONFIG_FILE"
+    chmod 600 "$TG_CONFIG_FILE" 2>/dev/null || true
 }
 
 # 发送 TG 消息
@@ -1955,12 +2106,14 @@ tg_send_message() {
     [[ "$enabled" != "true" ]] && return 0
     [[ -z "$bot_token" || -z "$chat_id" ]] && return 1
     
-    curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
+    curl -s -X POST -K - \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
         -d "parse_mode=Markdown" \
         --connect-timeout 10 \
-        >/dev/null 2>&1
+        >/dev/null 2>&1 <<EOF
+url = "https://api.telegram.org/bot${bot_token}/sendMessage"
+EOF
 }
 
 # 发送流量告警
@@ -2124,11 +2277,11 @@ xray_api_query() {
         return 1
     fi
     
-    local cmd="xray api statsquery --server=127.0.0.1:${XRAY_API_PORT}"
-    [[ "$reset" == "true" ]] && cmd+=" -reset"
-    [[ -n "$pattern" ]] && cmd+=" -pattern \"$pattern\""
+    local -a cmd=(xray api statsquery "--server=127.0.0.1:${XRAY_API_PORT}")
+    [[ "$reset" == "true" ]] && cmd+=(-reset)
+    [[ -n "$pattern" ]] && cmd+=(-pattern "$pattern")
     
-    eval "$cmd" 2>/dev/null
+    "${cmd[@]}" 2>/dev/null
 }
 
 # 获取用户流量 (上行+下行)
@@ -2209,7 +2362,8 @@ sync_all_user_traffic() {
         local users=$(db_list_users "xray" "$proto")
         [[ -z "$users" ]] && continue
         
-        for user in $users; do
+        while IFS= read -r user; do
+            [[ -z "$user" ]] && continue
             local email="${user}@${proto}"
             
             # 从临时文件中提取流量值
@@ -2269,15 +2423,18 @@ sync_all_user_traffic() {
                     fi
                 fi
             fi
-        done
+        done <<< "$users"
     done
     
     rm -f "$tmp_stats"
     
-    # 批量处理完成后统一重载配置（避免循环内多次重启）
+    # 批量处理完成后统一重载配置（仅当配置生成成功后才重启服务）
     if [[ "$need_reload" == "true" ]]; then
-        generate_xray_config 2>/dev/null
-        svc restart vless-reality 2>/dev/null
+        if generate_xray_config 2>/dev/null; then
+            svc restart vless-reality 2>/dev/null || true
+        else
+            _err "配额禁用后 Xray 配置重建失败，未重启服务"
+        fi
     fi
     
     # 注：Sing-box 协议 (hy2/tuic) 暂不支持流量统计（需要完整版编译）
@@ -2421,6 +2578,7 @@ _save_join_info() {
     local join_file="$CFG/${protocol}.join"
     local link_prefix; link_prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol")
     : >"$join_file"
+    chmod 600 "$join_file" 2>/dev/null || true
 
     local label ip ipfmt data code cmd link
     for label in V4 V6; do
@@ -2440,6 +2598,39 @@ _save_join_info() {
     for line in "$@"; do
         printf '%s\n' "$line" >>"$join_file"
     done
+    chmod 600 "$join_file" 2>/dev/null || true
+}
+
+# 安全读写订阅配置 $CFG/sub.info（禁止 source 执行任意 shell 代码）
+_write_sub_info() {
+    local _uuid="${1//$'\n'/}" _port="${2//$'\n'/}" _domain="${3//$'\n'/}" _https="${4//$'\n'/}"
+    _uuid="${_uuid//$'\r'/}"; _port="${_port//$'\r'/}"
+    _domain="${_domain//$'\r'/}"; _https="${_https//$'\r'/}"
+    [[ "$_port" =~ ^[0-9]+$ ]] || return 1
+    [[ "$_https" == "true" || "$_https" == "false" ]] || _https="false"
+    mkdir -p "$CFG" || return 1
+    local _tmp
+    _tmp=$(mktemp "$CFG/sub.info.tmp.XXXXXX") || return 1
+    chmod 600 "$_tmp" 2>/dev/null || true
+    printf 'sub_uuid=%s\nsub_port=%s\nsub_domain=%s\nsub_https=%s\n' \
+        "$_uuid" "$_port" "$_domain" "$_https" > "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mv -f "$_tmp" "$CFG/sub.info" || { rm -f "$_tmp"; return 1; }
+    chmod 600 "$CFG/sub.info" 2>/dev/null || true
+}
+
+_load_sub_info() {
+    local _file="${1:-$CFG/sub.info}"
+    [[ -f "$_file" ]] || return 1
+    local _k _v
+    while IFS='=' builtin read -r _k _v; do
+        _v="${_v%$'\r'}"
+        case "$_k" in
+            sub_uuid) sub_uuid="$_v" ;;
+            sub_port) sub_port="$_v" ;;
+            sub_domain) sub_domain="$_v" ;;
+            sub_https) sub_https="$_v" ;;
+        esac
+    done < "$_file"
 }
 
 
@@ -2480,13 +2671,22 @@ _has_master_protocol() {
     [[ "$master_port" == "8443" ]]
 }
 
-# 检查证书是否为 CA 签发的真实证书
+# 检查证书是否为 CA 签发的真实证书（优先使用 openssl verify 验证系统信任链，回退 issuer 校验）
 _is_real_cert() {
     [[ ! -f "$CFG/certs/server.crt" ]] && return 1
+    if openssl verify "$CFG/certs/server.crt" >/dev/null 2>&1; then
+        return 0
+    fi
     local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
+    local subject=$(openssl x509 -in "$CFG/certs/server.crt" -noout -subject 2>/dev/null)
+    # 自签证书（issuer == subject）一律判定非 CA 证书，防止伪造 CN 含 R3/E1 绕过
+    [[ -n "$issuer" && -n "$subject" && "${issuer#issuer=}" == "${subject#subject=}" ]] && return 1
     [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || \
     [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || \
-    [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]
+    [[ "$issuer" == *"R12"* ]] || [[ "$issuer" == *"R13"* ]] || [[ "$issuer" == *"R14"* ]] || \
+    [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"E5"* ]] || [[ "$issuer" == *"E6"* ]] || \
+    [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]] || \
+    [[ "$issuer" == *"Google Trust Services"* ]]
 }
 
 # 配置 Nginx 反代 XHTTP (h2c 模式，用于 TLS+CDN)
@@ -3255,33 +3455,17 @@ generate_xray_config() {
         if echo "$outbounds" | jq -e '.[] | select(.tag | startswith("warp"))' >/dev/null 2>&1; then
             local warp_mode=$(db_get_warp_mode)
             
-            # 只有 WireGuard 模式需要保护性规则
+            # 只有 WireGuard 模式需要保护性规则（仅放行 WARP 域名；私网仍由默认规则拦截）
             if [[ "$warp_mode" == "wgcf" ]]; then
-                # 生成保护性规则：WARP 服务器和私有 IP 必须直连
                 local warp_protection_rules='[
                     {
                         "type": "field",
                         "domain": ["engage.cloudflareclient.com"],
                         "outboundTag": "direct"
-                    },
-                    {
-                        "type": "field",
-                        "ip": [
-                            "10.0.0.0/8",
-                            "172.16.0.0/12",
-                            "192.168.0.0/16",
-                            "127.0.0.0/8",
-                            "169.254.0.0/16",
-                            "224.0.0.0/4",
-                            "240.0.0.0/4",
-                            "fc00::/7",
-                            "fe80::/10"
-                        ],
-                        "outboundTag": "direct"
                     }
                 ]'
                 
-                # 将保护性规则放在最前面
+                # 将保护性规则放在用户/全局规则之前（仍位于默认私网/BT 拦截之后）
                 if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
                     routing_rules=$(echo "$warp_protection_rules" | jq --argjson user_rules "$routing_rules" '. + $user_rules')
                 else
@@ -3289,21 +3473,11 @@ generate_xray_config() {
                 fi
                 has_routing=true
             elif [[ "$warp_mode" == "official" ]]; then
-                # SOCKS5 模式：UDP 必须直连（warp-cli SOCKS5 不支持 UDP），私有 IP 直连
+                # SOCKS5 模式：UDP 走 direct（warp-cli SOCKS5 不支持 UDP）；私网仍由默认规则拦截
                 local warp_protection_rules='[
                     {
                         "type": "field",
                         "network": "udp",
-                        "outboundTag": "direct"
-                    },
-                    {
-                        "type": "field",
-                        "ip": [
-                            "10.0.0.0/8",
-                            "172.16.0.0/12",
-                            "192.168.0.0/16",
-                            "127.0.0.0/8"
-                        ],
                         "outboundTag": "direct"
                     }
                 ]'
@@ -3337,7 +3511,7 @@ generate_xray_config() {
         # 默认拦截：私有 IP 段与 BitTorrent 协议一律走 blackhole（tag=block）
         local default_rules='[
             {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
-            {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+            {"type": "field", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
             {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
         ]'
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
@@ -3458,7 +3632,7 @@ generate_xray_config() {
             # 添加默认拦截规则（API + 私有 IP + BitTorrent）到用户路由规则前面
             local default_rules='[
                 {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
-                {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+                {"type": "field", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
                 {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
             ]'
             local all_rules=$(echo "$user_routing_rules" | jq --argjson defaults "$default_rules" '$defaults + .')
@@ -3502,7 +3676,7 @@ generate_xray_config() {
                     outbounds: $outbounds,
                     routing: {domainStrategy: "IPIfNonMatch", rules: [
                         {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
-                        {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+                        {"type": "field", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
                         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
                     ]}
                 }' > "$CFG/config.json"
@@ -3520,7 +3694,7 @@ generate_xray_config() {
                         {protocol: "blackhole", tag: "api"}],
                     routing: {domainStrategy: "IPIfNonMatch", rules: [
                         {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
-                        {"type": "field", "ip": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
+                        {"type": "field", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
                         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
                     ]}
                 }' > "$CFG/config.json"
@@ -3547,17 +3721,11 @@ generate_xray_config() {
                 local single_cfg=$(echo "$cfg" | jq ".[$i]")
                 local port=$(echo "$single_cfg" | jq -r '.port')
 
-                # 临时存储单端口配置
+                # 直接以内存参数传入单端口配置，渲染期对 db.json 严格只读（禁止写入临时键）
                 local tmp_protocol="${p}_port_${port}"
-                db_add "xray" "$tmp_protocol" "$single_cfg"
-
-                # 调用原有函数处理
-                if add_xray_inbound_v2 "$tmp_protocol"; then
+                if add_xray_inbound_v2 "$tmp_protocol" "$single_cfg"; then
                     ((port_success++))
                 fi
-
-                # 清理临时配置
-                db_del "xray" "$tmp_protocol"
 
                 ((i++))
             done
@@ -3609,15 +3777,20 @@ generate_xray_config() {
         local ip_routing_rules=$(gen_xray_ip_routing_rules "$inbounds_json")
         
         if [[ -n "$ip_routing_rules" && "$ip_routing_rules" != "[]" ]]; then
-            local tmp=$(mktemp)
-            # 将多IP路由规则放在 routing.rules 最前面（在 api 规则之后）
+            local tmp=$(mktemp "$CFG/config.json.tmp.XXXXXX")
+            chmod 600 "$tmp" 2>/dev/null || true
+            # 将多IP路由规则放在默认拦截规则（api + 私网 block + bittorrent block）之后，防止绕过 SSRF/BT 拦截
             jq --argjson ip_rules "$ip_routing_rules" '
-                .routing.rules = (
-                    [.routing.rules[0]] + $ip_rules + .routing.rules[1:]
-                )
+                (.routing.rules // []) as $r |
+                ([$r[] | select(.outboundTag == "api" or .outboundTag == "block")]) as $guard |
+                ([$r[] | select(.outboundTag != "api" and .outboundTag != "block")]) as $rest |
+                .routing.rules = ($guard + $ip_rules + $rest)
             ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            chmod 600 "$CFG/config.json" 2>/dev/null || true
         fi
     fi
+
+    chmod 600 "$CFG/config.json" 2>/dev/null || true
     
     if [[ -n "$failed_protocols" ]]; then
         _warn "以下协议配置失败: $failed_protocols"
@@ -3642,13 +3815,16 @@ _add_single_xray_inbound() {
     return 0
 }
 
-# 使用 jq 动态构建 inbound (重构版 - 只从数据库读取)
+# 使用 jq 动态构建 inbound (重构版 - 只从数据库或内存覆盖对象只读)
 add_xray_inbound_v2() {
     local protocol=$1
+    local cfg_override="${2:-}"
     
-    # 从数据库读取配置
+    # 优先使用调用方传入的内存单端口配置（避免渲染期篡改 db.json）
     local cfg=""
-    if db_exists "xray" "$protocol"; then
+    if [[ -n "$cfg_override" ]]; then
+        cfg="$cfg_override"
+    elif db_exists "xray" "$protocol"; then
         cfg=$(db_get "xray" "$protocol")
     else
         _err "协议 $protocol 在数据库中不存在 (xray 分类)"
@@ -3976,7 +4152,7 @@ add_xray_inbound_v2() {
             ;;
         vmess-ws)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_vmess_clients "$base_protocol")
+            local clients=$(gen_xray_vmess_clients "$base_protocol" "$port")
             if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "VMess inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             if [[ "$has_master" == "true" ]]; then
@@ -4028,7 +4204,7 @@ add_xray_inbound_v2() {
             ;;
         trojan)
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_trojan_clients "$base_protocol")
+            local clients=$(gen_xray_trojan_clients "$base_protocol" "$port")
             if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "Trojan inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             jq -n \
@@ -4060,7 +4236,7 @@ add_xray_inbound_v2() {
             local sni=$(echo "$cfg" | jq -r '.sni // "bing.com"')
             
             # 获取完整的用户列表（包含子用户和 email，用于流量统计）
-            local clients=$(gen_xray_trojan_clients "$base_protocol")
+            local clients=$(gen_xray_trojan_clients "$base_protocol" "$port")
             if [[ -z "$clients" || "$clients" == "[]" ]]; then rm -f "$tmp_inbound"; _warn "Trojan inbound $base_protocol/$port 无启用用户，跳过该端口"; return 0; fi
             
             # Trojan-WS 作为回落协议或独立运行
@@ -4121,13 +4297,21 @@ add_xray_inbound_v2() {
             local socks_listen_addr="${listen_addr:-}"
             [[ -z "$socks_listen_addr" ]] && socks_listen_addr=$(_listen_addr)
             [[ -n "$config_listen_addr" ]] && socks_listen_addr="$config_listen_addr"
+            local accounts="[]"
+            if [[ "$auth_mode" != "noauth" ]]; then
+                accounts=$(gen_xray_socks_accounts "$base_protocol" "$port")
+                if [[ -z "$accounts" || "$accounts" == "[]" ]]; then
+                    rm -f "$tmp_inbound"
+                    _warn "SOCKS inbound $base_protocol/$port 无启用用户，跳过该端口"
+                    return 0
+                fi
+            fi
             
             if [[ "$use_tls" == "true" ]]; then
                 # SOCKS5 + TLS
                 jq -n \
                     --argjson port "$port" \
-                    --arg username "$username" \
-                    --arg password "$password" \
+                    --argjson accounts "$accounts" \
                     --arg cert "$CFG/certs/server.crt" \
                     --arg key "$CFG/certs/server.key" \
                     --arg tag "$inbound_tag" \
@@ -4140,7 +4324,7 @@ add_xray_inbound_v2() {
                     settings: ({
                         auth: $auth_mode,
                         udp: true
-                    } + (if $auth_mode == "noauth" then {} else {accounts: [{user: $username, pass: $password}]} end)),
+                    } + (if $auth_mode == "noauth" then {} else {accounts: $accounts} end)),
                     streamSettings: {
                         network: "tcp",
                         security: "tls",
@@ -4154,8 +4338,7 @@ add_xray_inbound_v2() {
                 # SOCKS5 无 TLS
                 jq -n \
                     --argjson port "$port" \
-                    --arg username "$username" \
-                    --arg password "$password" \
+                    --argjson accounts "$accounts" \
                     --arg tag "$inbound_tag" \
                     --arg listen_addr "$socks_listen_addr" \
                     --arg auth_mode "$auth_mode" \
@@ -4166,12 +4349,12 @@ add_xray_inbound_v2() {
                     settings: ({
                         auth: $auth_mode,
                         udp: true
-                    } + (if $auth_mode == "noauth" then {} else {accounts: [{user: $username, pass: $password}]} end)),
+                    } + (if $auth_mode == "noauth" then {} else {accounts: $accounts} end)),
                     tag: $tag
                 }' > "$tmp_inbound"
             fi
             ;;
-        ss2022|ss-legacy)
+        ss2022)
             jq -n \
                 --argjson port "$port" \
                 --arg method "$method" \
@@ -4187,6 +4370,51 @@ add_xray_inbound_v2() {
                     password: $password,
                     network: "tcp,udp"
                 },
+                tag: $tag
+            }' > "$tmp_inbound"
+            ;;
+        ss-legacy)
+            # 数据库沿用通用 users 数组；Xray 传统 Shadowsocks 的配置字段必须是 clients。
+            # 写成 settings.users 会被配置加载器静默忽略，并退回顶层 password，造成只有
+            # default 凭据可用的假多用户配置。旧单用户配置继续保留顶层 password 语义。
+            # 多端口生成时 cfg 是临时单实例，base_protocol 才是数据库里的正本键。
+            local source_cfg="$cfg"
+            if db_exists "xray" "$base_protocol"; then
+                source_cfg=$(db_get "xray" "$base_protocol")
+                if echo "$source_cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                    source_cfg=$(echo "$source_cfg" | jq --arg port "$port" '[.[] | select((.port | tostring) == $port)][0] // empty')
+                fi
+            fi
+            local has_legacy_clients=false
+            local legacy_clients="[]"
+            # users 字段一旦显式存在即进入多用户模式；空数组、全禁用或全过期都应
+            # fail closed 跳过 inbound，不能重新启用遗留顶层 password。
+            if echo "$source_cfg" | jq -e '(.users | type) == "array"' >/dev/null 2>&1; then
+                has_legacy_clients=true
+                legacy_clients=$(gen_xray_ss_legacy_clients "$base_protocol" "$port")
+                if [[ -z "$legacy_clients" || "$legacy_clients" == "[]" ]]; then
+                    rm -f "$tmp_inbound"
+                    _warn "Shadowsocks inbound $base_protocol/$port 无启用用户，跳过该端口"
+                    return 0
+                fi
+            fi
+
+            jq -n \
+                --argjson port "$port" \
+                --arg method "$method" \
+                --arg password "$password" \
+                --arg tag "$inbound_tag" \
+                --arg listen_addr "$listen_addr" \
+                --argjson has_clients "$has_legacy_clients" \
+                --argjson clients "$legacy_clients" \
+            '{
+                port: $port,
+                listen: $listen_addr,
+                protocol: "shadowsocks",
+                settings: ({
+                    method: $method,
+                    network: "tcp,udp"
+                } + (if $has_clients then {clients: $clients} else {password: $password} end)),
                 tag: $tag
             }' > "$tmp_inbound"
             ;;
@@ -4560,27 +4788,27 @@ cleanup_protocol_cert_if_unused() {
 sync_time() {
     _info "同步系统时间..."
     
-    # 方法1: 使用HTTP获取时间 (最快最可靠)
-    local http_time=$(timeout 5 curl -sI --connect-timeout 3 --max-time 5 http://www.baidu.com 2>/dev/null | grep -i "^date:" | cut -d' ' -f2-)
-    if [[ -n "$http_time" ]]; then
-        if date -s "$http_time" &>/dev/null; then
-            _ok "时间同步完成 (HTTP)"
+    # 方法1: 使用 timedatectl (systemd 系统)
+    if command -v timedatectl &>/dev/null; then
+        if timeout 5 timedatectl set-ntp true &>/dev/null; then
+            _ok "时间同步完成 (systemd)"
             return 0
         fi
     fi
-    
-    # 方法2: 使用ntpdate (如果可用)
+
+    # 方法2: 使用 ntpdate (如果可用)
     if command -v ntpdate &>/dev/null; then
         if timeout 5 ntpdate -s pool.ntp.org &>/dev/null; then
             _ok "时间同步完成 (NTP)"
             return 0
         fi
     fi
-    
-    # 方法3: 使用timedatectl (systemd系统)
-    if command -v timedatectl &>/dev/null; then
-        if timeout 5 timedatectl set-ntp true &>/dev/null; then
-            _ok "时间同步完成 (systemd)"
+
+    # 方法3: 仅通过已校验 TLS 的 HTTPS 响应头兜底（禁止使用明文 HTTP Date 头防 MITM 篡改时间）
+    local https_time=$(timeout 5 curl -fsI --connect-timeout 3 --max-time 5 https://www.cloudflare.com 2>/dev/null | grep -i "^date:" | head -1 | cut -d' ' -f2-)
+    if [[ -n "$https_time" ]]; then
+        if date -s "$https_time" &>/dev/null; then
+            _ok "时间同步完成 (HTTPS)"
             return 0
         fi
     fi
@@ -5500,12 +5728,7 @@ EOF
             use_https="true"
         fi
         
-        cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$nginx_port
-sub_domain=$domain
-sub_https=$use_https
-EOF
+        _write_sub_info "$sub_uuid" "$nginx_port" "$domain" "$use_https"
         _log "INFO" "订阅配置已保存: UUID=${sub_uuid:0:8}..., 端口=$nginx_port, 域名=$domain"
     fi
     
@@ -5612,13 +5835,15 @@ gen_vmess_ws_link() {
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}VMess-WS${ip_suffix:+-${ip_suffix}}"
 
-    # VMess ws 链接：vmess://base64(json)
-    # 注意：allowInsecure 必须是字符串 "true"，不是布尔值
+    # VMess ws 链接：vmess://base64(json)（用 jq 安全序列化，真实证书时关闭 allowInsecure）
+    local allow_insecure="true"
+    _anytls_secure "$sni" && allow_insecure="false"
     local json
-    json=$(cat <<EOF
-{"v":"2","ps":"${name}","add":"${clean_ip}","port":"${port}","id":"${uuid}","aid":"0","scy":"auto","net":"ws","type":"none","host":"${sni}","path":"${path}","tls":"tls","sni":"${sni}","allowInsecure":"true"}
-EOF
-)
+    json=$(jq -cn \
+        --arg ps "$name" --arg add "$clean_ip" --arg port "$port" \
+        --arg id "$uuid" --arg host "$sni" --arg path "$path" \
+        --arg sni "$sni" --arg insecure "$allow_insecure" \
+        '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:"ws",type:"none",host:$host,path:$path,tls:"tls",sni:$sni,allowInsecure:$insecure}')
     printf 'vmess://%s\n' "$(echo -n "$json" | base64 -w 0 2>/dev/null || echo -n "$json" | base64 | tr -d '\n')"
 }
 
@@ -5644,34 +5869,42 @@ _can_gen_qr() {
 
 
 
-# 生成各协议分享链接
+# 生成各协议分享链接（真实 CA 证书匹配 SNI 时去掉 insecure/allowInsecure 参数）
 gen_hy2_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}Hysteria2${ip_suffix:+-${ip_suffix}}"
+    local insecure="&insecure=1"
+    _anytls_secure "$sni" && insecure=""
     # 链接始终使用实际端口，端口跳跃需要客户端手动配置
-    printf '%s\n' "hysteria2://${password}@${ip}:${port}?sni=${sni}&insecure=1#${name}"
+    printf '%s\n' "hysteria2://${password}@${ip}:${port}?sni=${sni}${insecure}#${name}"
 }
 
 gen_trojan_link() {
     local ip="$1" port="$2" password="$3" sni="$4" country="${5:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}Trojan${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=tcp&allowInsecure=1#${name}"
+    local insecure="&allowInsecure=1"
+    _anytls_secure "$sni" && insecure=""
+    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=tcp${insecure}#${name}"
 }
 
 gen_trojan_ws_link() {
     local ip="$1" port="$2" password="$3" sni="$4" path="${5:-/trojan}" country="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}Trojan-WS${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=1#${name}"
+    local insecure="&allowInsecure=1"
+    _anytls_secure "$sni" && insecure=""
+    printf '%s\n' "trojan://${password}@${ip}:${port}?security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")${insecure}#${name}"
 }
 
 gen_vless_ws_link() {
     local ip="$1" port="$2" uuid="$3" sni="$4" path="${5:-/}" country="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}VLESS-WS${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")&allowInsecure=1#${name}"
+    local insecure="&allowInsecure=1"
+    _anytls_secure "$sni" && insecure=""
+    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=$(urlencode "$path")${insecure}#${name}"
 }
 
 # VLESS-WS (无TLS) 分享链接 - 用于 CF Tunnel
@@ -5689,7 +5922,9 @@ gen_vless_vision_link() {
     local ip="$1" port="$2" uuid="$3" sni="$4" country="${5:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}VLESS-Vision${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=tcp&flow=xtls-rprx-vision&allowInsecure=1#${name}"
+    local insecure="&allowInsecure=1"
+    _anytls_secure "$sni" && insecure=""
+    printf '%s\n' "vless://${uuid}@${ip}:${port}?encryption=none&security=tls&sni=${sni}&type=tcp&flow=xtls-rprx-vision${insecure}#${name}"
 }
 
 gen_ss2022_link() {
@@ -5720,7 +5955,9 @@ gen_tuic_link() {
     local ip="$1" port="$2" uuid="$3" password="$4" sni="$5" country="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}TUIC${ip_suffix:+-${ip_suffix}}"
-    printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native&allow_insecure=1#${name}"
+    local insecure="&allow_insecure=1"
+    _anytls_secure "$sni" && insecure=""
+    printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native${insecure}#${name}"
 }
 
 # 判断给定 SNI 是否正由真实 ACME 证书服务（返回 0=真证书 / 1=自签兜底）。
@@ -5822,8 +6059,9 @@ test_latency() {
             else
                 echo "超时"
             fi
-        # 回退到 bash /dev/tcp（某些系统可能不支持）
-        elif timeout 3 bash -c "echo >/dev/tcp/$ip/$port" 2>/dev/null; then
+        # 回退到 bash /dev/tcp（严格校验并按位置参数传递，杜绝命令注入）
+        elif [[ "$ip" =~ ^[0-9A-Za-z.:-]+$ && "$port" =~ ^[0-9]+$ ]] && \
+             timeout 3 bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$ip" "$port" 2>/dev/null; then
             end=$(date +%s%3N 2>/dev/null || echo $(($(date +%s)*1000)))
             echo "$((end-start))ms"
         else
@@ -5938,17 +6176,20 @@ install_acme_tool() {
         fi
     fi
     
-    # 方法2: 使用 git clone
+    # 方法2: 使用 git clone（隔离临时目录，防 /tmp 固定路径竞态）
     if command -v git &>/dev/null; then
         _info "尝试使用 git 安装..."
-        if git clone --depth 1 https://github.com/acmesh-official/acme.sh.git /tmp/acme.sh 2>/dev/null; then
-            cd /tmp/acme.sh && ./acme.sh --install -m "$ACME_DEFAULT_EMAIL" 2>/dev/null
-            cd - >/dev/null
-            rm -rf /tmp/acme.sh
+        local acme_git_tmp
+        acme_git_tmp=$(mktemp -d) || acme_git_tmp=""
+        if [[ -n "$acme_git_tmp" ]] && git clone --depth 1 https://github.com/acmesh-official/acme.sh.git "$acme_git_tmp/acme.sh" 2>/dev/null; then
+            ( cd "$acme_git_tmp/acme.sh" && ./acme.sh --install -m "$ACME_DEFAULT_EMAIL" 2>/dev/null )
+            rm -rf "$acme_git_tmp"
             if [[ -f "$HOME/.acme.sh/acme.sh" ]]; then
                 _ok "acme.sh 安装成功 (git)"
                 return 0
             fi
+        else
+            [[ -n "$acme_git_tmp" ]] && rm -rf "$acme_git_tmp"
         fi
     fi
     
@@ -6068,7 +6309,7 @@ _issue_cert_dns() {
     read -rp "  请选择 DNS 服务商 [1-4]: " dns_choice
     
     local dns_api=""
-    local dns_env=""
+    local cf_token="" ali_key="" ali_secret="" dp_id="" dp_key=""
     
     case "$dns_choice" in
         1)
@@ -6082,7 +6323,6 @@ _issue_cert_dns() {
             [[ -z "$cf_token" ]] && { _err "Token 不能为空"; return 1; }
             _preflight_cloudflare_token "$domain" "$cf_token" || return 1
             dns_api="dns_cf"
-            dns_env="CF_Token=$cf_token"
             ;;
         2)
             echo ""
@@ -6090,10 +6330,10 @@ _issue_cert_dns() {
             echo -e "  ${D}https://ram.console.aliyun.com/manage/ak${NC}"
             echo ""
             read -rp "  请输入 Ali_Key: " ali_key
-            read -rp "  请输入 Ali_Secret: " ali_secret
+            read -rsp "  请输入 Ali_Secret: " ali_secret
+            echo ""
             [[ -z "$ali_key" || -z "$ali_secret" ]] && { _err "Key/Secret 不能为空"; return 1; }
             dns_api="dns_ali"
-            dns_env="Ali_Key=$ali_key Ali_Secret=$ali_secret"
             ;;
         3)
             echo ""
@@ -6101,10 +6341,10 @@ _issue_cert_dns() {
             echo -e "  ${D}https://console.dnspod.cn/account/token/token${NC}"
             echo ""
             read -rp "  请输入 DP_Id: " dp_id
-            read -rp "  请输入 DP_Key: " dp_key
+            read -rsp "  请输入 DP_Key: " dp_key
+            echo ""
             [[ -z "$dp_id" || -z "$dp_key" ]] && { _err "ID/Key 不能为空"; return 1; }
             dns_api="dns_dp"
-            dns_env="DP_Id=$dp_id DP_Key=$dp_key"
             ;;
         4)
             # 手动 DNS 验证
@@ -6125,20 +6365,25 @@ _issue_cert_dns() {
     _info "正在通过 DNS 验证申请证书..."
     echo ""
     
-    # 设置环境变量并申请证书。保留 acme.sh 自身返回码；grep/sed 只负责展示，
-    # 否则无匹配行或过滤成功会把真实签发失败误判为成功。
-    eval "export $dns_env"
+    # 按服务商直接导出环境变量（禁止 eval），保留 acme.sh 自身返回码。
+    case "$dns_api" in
+        dns_cf)  export CF_Token="$cf_token" ;;
+        dns_ali) export Ali_Key="$ali_key" Ali_Secret="$ali_secret" ;;
+        dns_dp)  export DP_Id="$dp_id" DP_Key="$dp_key" ;;
+    esac
 
-    local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt"
+    local reload_cmd="chmod 600 '$cert_dir/server.key'; chmod 644 '$cert_dir/server.crt'"
     local acme_rc=0
+    local acme_dns_log
+    acme_dns_log=$(mktemp) || { unset CF_Token Ali_Key Ali_Secret DP_Id DP_Key; return 1; }
 
     "$acme_sh" --issue -d "$domain" --dns "$dns_api" --server letsencrypt --force \
-        > /tmp/acme_dns.log 2>&1
+        > "$acme_dns_log" 2>&1
     acme_rc=$?
-    grep -E "^\[|Verify finished|Cert success|error|Error" /tmp/acme_dns.log | sed 's/^/  /' || true
+    grep -E "^\[|Verify finished|Cert success|error|Error" "$acme_dns_log" | sed 's/^/  /' || true
 
     unset CF_Token Ali_Key Ali_Secret DP_Id DP_Key
-    cf_token=""; ali_key=""; ali_secret=""; dp_id=""; dp_key=""; dns_env=""
+    cf_token=""; ali_key=""; ali_secret=""; dp_id=""; dp_key=""
 
     if [[ "$acme_rc" -eq 0 ]]; then
         echo ""
@@ -6149,14 +6394,14 @@ _issue_cert_dns() {
             --fullchain-file "$cert_dir/server.crt" \
             --reloadcmd      "$reload_cmd" >/dev/null 2>&1; then
             _err "证书已签发，但安装到目标目录失败"
-            rm -f /tmp/acme_dns.log
+            rm -f "$acme_dns_log"
             return 1
         fi
 
         # 保存域名
         echo "$domain" > "$CFG/cert_domain"
 
-        rm -f /tmp/acme_dns.log
+        rm -f "$acme_dns_log"
 
         # 证书签发与订阅服务解耦：这里只安装证书，不自动安装/配置/启停 Nginx。
         _ok "证书已配置到 $cert_dir"
@@ -6166,8 +6411,8 @@ _issue_cert_dns() {
 
     echo ""
     _err "DNS 验证失败！(acme.sh rc=$acme_rc)"
-    grep -E "(error|Error|invalid|Invalid|unauthorized|Unauthorized|disallowed)" /tmp/acme_dns.log 2>/dev/null | head -5 || true
-    rm -f /tmp/acme_dns.log
+    grep -E "(error|Error|invalid|Invalid|unauthorized|Unauthorized|disallowed)" "$acme_dns_log" 2>/dev/null | head -5 || true
+    rm -f "$acme_dns_log"
     return 1
 }
 
@@ -6189,9 +6434,14 @@ _issue_cert_dns_manual() {
     local txt_record=$("$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p")
     
     if [[ -z "$txt_record" ]]; then
-        # 尝试另一种方式获取
-        "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee /tmp/acme_manual.log
-        txt_record=$(sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p" "/tmp/acme_manual.log" 2>/dev/null)
+        # 尝试另一种方式获取（使用 mktemp 避免固定 /tmp 路径）
+        local acme_manual_log
+        acme_manual_log=$(mktemp) || acme_manual_log=""
+        if [[ -n "$acme_manual_log" ]]; then
+            "$acme_sh" --issue -d "$domain" --dns --yes-I-know-dns-manual-mode-enough-go-ahead-please --force 2>&1 | tee "$acme_manual_log"
+            txt_record=$(sed -n "s/.*TXT value: '\([^']*\)'.*/\1/p" "$acme_manual_log" 2>/dev/null)
+            rm -f "$acme_manual_log"
+        fi
     fi
     
     if [[ -z "$txt_record" ]]; then
@@ -6354,8 +6604,9 @@ get_acme_cert() {
     # 构建 reloadcmd（兼容 systemd 和 OpenRC）
     local reload_cmd="chmod 600 $cert_dir/server.key; chmod 644 $cert_dir/server.crt; chown root:root $cert_dir/server.key $cert_dir/server.crt; if command -v systemctl >/dev/null 2>&1; then systemctl restart vless-reality vless-singbox 2>/dev/null || true; elif command -v rc-service >/dev/null 2>&1; then rc-service vless-reality restart 2>/dev/null || true; rc-service vless-singbox restart 2>/dev/null || true; fi"
     
-    # 使用 standalone 模式申请证书，显示实时进度
-    local acme_log="/tmp/acme_output.log"
+    # 使用 standalone 模式申请证书，显示实时进度（使用 mktemp 避免固定 /tmp 路径）
+    local acme_log
+    acme_log=$(mktemp) || { _err "创建临时日志失败"; return 1; }
     
     # 直接执行 acme.sh，不使用 timeout（避免某些系统兼容性问题）
     if "$acme_sh" --issue -d "$domain" --standalone --httpport 80 --force 2>&1 | tee "$acme_log" | grep -E "^\[|Verify finished|Cert success|error|Error" | sed 's/^/  /'; then
@@ -6859,7 +7110,7 @@ fix_selinux_context() {
 
 # GitHub API 请求配置
 readonly GITHUB_API_PER_PAGE=10
-readonly VERSION_CACHE_DIR="/tmp/vless-version-cache"
+readonly VERSION_CACHE_DIR="$CFG/cache"
 readonly VERSION_CACHE_TTL=3600  # 缓存1小时
 readonly SCRIPT_HASH_CACHE_FILE="$VERSION_CACHE_DIR/.script_master_sha256"
 readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_master_version"
@@ -6886,9 +7137,10 @@ _get_file_mtime() {
     return 1
 }
 
-# 初始化版本缓存目录
+# 初始化版本缓存目录（置于 root 私有目录，避免 /tmp 符号链接与缓存投毒）
 _init_version_cache() {
-    mkdir -p "$VERSION_CACHE_DIR" 2>/dev/null || true
+    mkdir -p -m 700 "$VERSION_CACHE_DIR" 2>/dev/null || true
+    chmod 700 "$VERSION_CACHE_DIR" 2>/dev/null || true
 }
 
 _is_cache_fresh() {
@@ -7675,8 +7927,8 @@ _install_binary() {
         return 1
     fi
 
-    # 验证版本号，防止命令注入
-    if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ ]]; then
+    # 验证版本号，防止命令注入与路径穿越
+    if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ || "$version" == *".."* ]]; then
         _err "无效的版本号格式: $version"
         return 1
     fi
@@ -7701,6 +7953,7 @@ _install_binary() {
         else
             _unresolved='$'
         fi
+        rm -rf "$tmp"
         _err "下载 URL 含未替换的占位符 ${_unresolved}：${url}"
         return 1
     fi
@@ -7710,6 +7963,20 @@ _install_binary() {
         rm -rf "$tmp"
         _err "下载 $name 失败: $url"
         return 1
+    fi
+
+    # 若官方提供了 .dgst 校验文件（如 Xray-core），强制核对 SHA-256 防止供应链篡改
+    if [[ "$repo" == "XTLS/Xray-core" ]]; then
+        if curl -fsSL --connect-timeout 15 -o "$tmp/pkg.dgst" "${url}.dgst" 2>/dev/null; then
+            local expected_sha actual_sha
+            expected_sha=$(awk '/^SHA2-256=/ {print $2; exit} /^SHA256=/ {print $2; exit}' "$tmp/pkg.dgst" 2>/dev/null)
+            actual_sha=$(_script_sha256 "$tmp/pkg" 2>/dev/null)
+            if [[ -n "$expected_sha" && "$actual_sha" != "$expected_sha" ]]; then
+                rm -rf "$tmp"
+                _err "$name 校验和验证失败（预期 $expected_sha，实际 ${actual_sha:-空}）"
+                return 1
+            fi
+        fi
     fi
 
     # 执行解压安装（仍需 eval 但在受控环境）
@@ -7735,8 +8002,10 @@ install_xray() {
     fi
     _install_binary "xray" "XTLS/Xray-core" \
         'https://github.com/XTLS/Xray-core/releases/download/v$version/Xray-linux-${xarch}.zip' \
-        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null; fix_selinux_context' \
-        "$channel" "$force" "$version_override"
+        'unzip -oq "$tmp/pkg" -d "$tmp/" && install -m 755 "$tmp/xray" /usr/local/bin/xray && mkdir -p /usr/local/share/xray && (cp "$tmp"/*.dat /usr/local/share/xray/ 2>/dev/null || true)' \
+        "$channel" "$force" "$version_override" || return 1
+    fix_selinux_context 2>/dev/null || true
+    return 0
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -8744,6 +9013,8 @@ generate_singbox_config() {
     [[ -z "$singbox_protocols" ]] && return 1
     
     mkdir -p "$CFG"
+    # 重建前先移除陈旧配置，避免全部用户禁用/过期时保留旧凭据继续生效
+    rm -f "$CFG/singbox.json"
     
     # 读取直连出口 IP 版本设置（默认 AsIs）
     local direct_ip_version="as_is"
@@ -9011,35 +9282,19 @@ generate_singbox_config() {
             has_routing=true
         fi
         
-        # 检测是否使用了 WARP，如果是，添加保护性直连规则
+        # 检测是否使用了 WARP，如果是，添加保护性直连规则（私网仍由最前方的默认拦截规则阻断）
         if [[ "$warp_has_endpoint" == "true" ]] || echo "$outbounds" | jq -e '.[] | select(.tag | startswith("warp"))' >/dev/null 2>&1; then
             local warp_mode=$(db_get_warp_mode)
             
-            # 只有 WireGuard 模式需要保护性规则
+            # 只有 WireGuard 模式需要放行 WARP 端点域名
             if [[ "$warp_mode" == "wgcf" ]]; then
-                # 生成保护性规则：WARP 服务器和私有 IP 必须直连
                 local warp_protection_rules='[
                     {
                         "outbound": "direct",
                         "domain": ["engage.cloudflareclient.com"]
-                    },
-                    {
-                        "outbound": "direct",
-                        "ip_cidr": [
-                            "10.0.0.0/8",
-                            "172.16.0.0/12",
-                            "192.168.0.0/16",
-                            "127.0.0.0/8",
-                            "169.254.0.0/16",
-                            "224.0.0.0/4",
-                            "240.0.0.0/4",
-                            "fc00::/7",
-                            "fe80::/10"
-                        ]
                     }
                 ]'
                 
-                # 将保护性规则放在最前面
                 if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
                     routing_rules=$(echo "$warp_protection_rules" | jq --argjson user_rules "$routing_rules" '. + $user_rules')
                 else
@@ -9047,20 +9302,11 @@ generate_singbox_config() {
                 fi
                 has_routing=true
             elif [[ "$warp_mode" == "official" ]]; then
-                # SOCKS5 模式：UDP 必须直连（warp-cli SOCKS5 不支持 UDP），私有 IP 直连
+                # SOCKS5 模式：UDP 走 direct（warp-cli SOCKS5 不支持 UDP）；私网仍由最前方默认规则拦截
                 local warp_protection_rules='[
                     {
                         "network": "udp",
                         "outbound": "direct"
-                    },
-                    {
-                        "outbound": "direct",
-                        "ip_cidr": [
-                            "10.0.0.0/8",
-                            "172.16.0.0/12",
-                            "192.168.0.0/16",
-                            "127.0.0.0/8"
-                        ]
                     }
                 ]'
                 
@@ -9074,28 +9320,23 @@ generate_singbox_config() {
         fi
     fi
     
-    # 默认拦截（无条件生效）：私有 IP 段与 BitTorrent 协议一律走 block。
-    # 放在 WARP 保护规则之后、用户规则之前；sing-box 无 geoip:private，直接列出私网 CIDR。
-    if ! echo "$routing_rules" | jq -e 'any(.outbound == "block" and (.protocol // []) == ["bittorrent"])' >/dev/null 2>&1; then
-        local sb_default_block_rules='[
-            {"action": "route", "outbound": "block", "ip_cidr": [
-                "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
-                "fc00::/7", "fe80::/10"
-            ]},
-            {"action": "route", "outbound": "block", "protocol": ["bittorrent"]}
-        ]'
-        if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
-            routing_rules=$(echo "$routing_rules" | jq --argjson block_rules "$sb_default_block_rules" '. + $block_rules')
-        else
-            routing_rules="$sb_default_block_rules"
-        fi
-        has_routing=true
-    fi
-
-    # 嗅探：sing-box >=1.11 需显式 action:sniff 才能识别 bittorrent 协议与 auth_user 用户级路由
+    # 默认拦截（无条件生效）：私有 IP 段（含 IPv6 ::1/128、CGNAT）与 BitTorrent 一律走 block，
+    # 必须排在 sniff 之后、所有用户/全局路由规则之前，防止 SSRF 与 BT 绕过。
+    local sb_default_block_rules='[
+        {"action": "route", "outbound": "block", "ip_cidr": [
+            "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+            "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+            "224.0.0.0/4", "240.0.0.0/4",
+            "::/128", "::1/128", "fc00::/7", "fe80::/10"
+        ]},
+        {"action": "route", "outbound": "block", "protocol": ["bittorrent"]}
+    ]'
     [[ -z "$routing_rules" || "$routing_rules" == "null" ]] && routing_rules="[]"
-    routing_rules=$(echo "$routing_rules" | jq '([{action: "sniff"}] + (if type == "array" then . else [] end))')
+    # 暂存全局规则，最终合并顺序：sniff -> 默认私网/BT block -> 用户级路由 -> 全局路由
+    local global_routing_rules="$routing_rules"
+    routing_rules=$(jq -n --argjson block_rules "$sb_default_block_rules" --argjson global_rules "$global_routing_rules" '
+        [{action: "sniff"}] + $block_rules + (if ($global_rules | type) == "array" then $global_rules else [] end)
+    ')
     has_routing=true
     
     # 构建基础配置
@@ -9256,7 +9497,7 @@ generate_singbox_config() {
             ss2022|ss-legacy)
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local default_method="2022-blake3-aes-128-gcm"
-                [[ "$p" == "ss-legacy" ]] && default_method="aes-256-gcm"
+                [[ "$proto" == "ss-legacy" ]] && default_method="aes-256-gcm"
                 local method=$(echo "$cfg" | jq -r '.method // empty')
                 [[ -z "$method" ]] && method="$default_method"
                 
@@ -9264,7 +9505,7 @@ generate_singbox_config() {
                     --argjson port "$port" \
                     --arg method "$method" \
                     --arg password "$password" \
-                    --arg tag "${p}-in${tag_sfx}" \
+                    --arg tag "${proto}-in${tag_sfx}" \
                     --arg listen_addr "$listen_addr" \
                 '{
                     type: "shadowsocks",
@@ -9339,23 +9580,25 @@ generate_singbox_config() {
     done
     
     if [[ $success_count -eq 0 ]]; then
+        rm -f "$CFG/singbox.json"
         _err "没有有效的 Sing-box 协议配置"
         return 1
     fi
     
-    # 生成用户级路由规则 (auth_user) 和所需的 outbounds
+    # 生成用户级路由规则 (auth_user) 和所需的 outbounds（仅限启用用户）
     local user_routing_rules="[]"
     local user_outbounds="[]"
     local chain_outbounds_added=""  # 跟踪已添加的链式代理 outbound
+    local user_needs_warp=false
     
     for proto in $singbox_protocols; do
         local db_users=$(jq -r --arg p "$proto" '
             .singbox[$p] as $cfg |
             if $cfg == null then empty
             elif ($cfg | type) == "array" then
-                [$cfg[].users // [] | .[]] | unique_by(.name) | .[]
+                [$cfg[].users // [] | .[] | select(.enabled != false)] | unique_by(.name) | .[]
             else
-                $cfg.users // [] | .[]
+                $cfg.users // [] | .[] | select(.enabled != false)
             end | @json
         ' "$DB_FILE" 2>/dev/null)
         
@@ -9371,6 +9614,7 @@ generate_singbox_config() {
             case "$urouting" in
                 warp|warp-wireguard|warp-official)
                     outbound_name="warp"
+                    user_needs_warp=true
                     ;;
                 direct)
                     outbound_name="direct"
@@ -9380,8 +9624,8 @@ generate_singbox_config() {
                     local node_name="${urouting#chain:}"
                     outbound_name="chain-${node_name}"
                     
-                    # 检查该链式代理 outbound 是否已添加
-                    if [[ ! " $chain_outbounds_added " =~ " $outbound_name " ]]; then
+                    # 检查该链式代理 outbound 是否已添加（使用子串精确匹配而非正则）
+                    if [[ " $chain_outbounds_added " != *" $outbound_name "* ]]; then
                         # 生成链式代理 outbound
                         local chain_out=$(gen_singbox_chain_outbound "$node_name" "$outbound_name" "prefer_ipv4")
                         if [[ -n "$chain_out" && "$chain_out" != "null" ]]; then
@@ -9406,31 +9650,52 @@ generate_singbox_config() {
                 '. + [{auth_user: [$user], outbound: $outbound}]')
         done <<< "$db_users"
     done
+
+    # 若用户级路由需要 WARP 但全局规则为空导致尚未生成 warp outbound/endpoint，则自动补全
+    if [[ "$user_needs_warp" == "true" && "$warp_has_endpoint" != "true" ]]; then
+        if ! echo "$base_config" | jq -e '.outbounds[]? | select(.tag == "warp")' >/dev/null 2>&1; then
+            local uw_out=$(gen_singbox_warp_outbound)
+            if [[ -n "$uw_out" ]]; then
+                if echo "$uw_out" | jq -e '.endpoint' >/dev/null 2>&1; then
+                    local uw_ep=$(echo "$uw_out" | jq '.endpoint')
+                    base_config=$(echo "$base_config" | jq --argjson ep "$uw_ep" '.endpoints = ((.endpoints // []) + [$ep])')
+                else
+                    local uw_def=$(echo "$uw_out" | jq '.tag = "warp"')
+                    user_outbounds=$(echo "$user_outbounds" | jq --argjson out "$uw_def" '. + [$out]')
+                fi
+            fi
+        fi
+    fi
     
     # 将用户路由所需的 outbounds 添加到 base_config
     if [[ "$user_outbounds" != "[]" ]]; then
         base_config=$(echo "$base_config" | jq --argjson outs "$user_outbounds" '.outbounds = ($outs + (.outbounds // []))')
     fi
     
-    # 将用户路由规则添加到 base_config
+    # 将用户路由规则插入到 sniff + 默认私网/BT block 规则之后、全局路由规则之前，确保无法绕过私网与 BT 拦截
     if [[ "$user_routing_rules" != "[]" ]]; then
-        if echo "$base_config" | jq -e '.route' >/dev/null 2>&1; then
-            base_config=$(echo "$base_config" | jq --argjson ur "$user_routing_rules" '.route.rules = ($ur + .route.rules)')
-        else
-            base_config=$(echo "$base_config" | jq --argjson ur "$user_routing_rules" '. + {route: {rules: $ur, final: "direct"}}')
-        fi
+        base_config=$(echo "$base_config" | jq --argjson ur "$user_routing_rules" --argjson block_rules "$sb_default_block_rules" --argjson global_rules "$global_routing_rules" '
+            .route = (.route // {final: "direct"}) |
+            .route.rules = ([{action: "sniff"}] + $block_rules + $ur + (if ($global_rules | type) == "array" then $global_rules else [] end))
+        ')
     fi
     
-    # 合并配置并写入文件（不生成 v2ray_api：官方 sing-box 二进制未编译 with_v2ray_api，故无 per-user 流量统计）
+    # 合并配置并原子写入文件（0600 保护密钥，不生成 v2ray_api）
+    local sb_tmp
+    sb_tmp=$(mktemp "$CFG/singbox.json.tmp.XXXXXX") || { _err "Sing-box 临时文件创建失败"; return 1; }
+    chmod 600 "$sb_tmp" 2>/dev/null || true
     echo "$base_config" | jq \
         --argjson ibs "$inbounds" \
-        '.inbounds = $ibs' > "$CFG/singbox.json"
+        '.inbounds = $ibs' > "$sb_tmp"
     
     # 验证配置
-    if ! jq empty "$CFG/singbox.json" 2>/dev/null; then
+    if ! jq empty "$sb_tmp" 2>/dev/null; then
+        rm -f "$sb_tmp"
         _err "Sing-box 配置 JSON 格式错误"
         return 1
     fi
+    mv -f "$sb_tmp" "$CFG/singbox.json"
+    chmod 600 "$CFG/singbox.json" 2>/dev/null || true
     
     _ok "Sing-box 配置生成成功 ($success_count 个协议)"
     return 0
@@ -9488,6 +9753,11 @@ ExecStart=$exec_cmd
 Restart=always
 RestartSec=3
 LimitNOFILE=51200
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
 
 [Install]
 WantedBy=multi-user.target
@@ -9506,15 +9776,16 @@ install_snell() {
     fi
     _info "安装 Snell v4..."
     local tmp=$(mktemp -d)
-    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "https://dl.nssurge.com/snell/snell-server-v4.1.1-linux-${sarch}.zip"; then
-        unzip -oq "$tmp/snell.zip" -d "$tmp/" && install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server
+    if curl -fsSLo "$tmp/snell.zip" --connect-timeout 60 "https://dl.nssurge.com/snell/snell-server-v4.1.1-linux-${sarch}.zip" && \
+       unzip -oq "$tmp/snell.zip" -d "$tmp/" && \
+       install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server; then
         # Alpine: 解压 UPX 压缩 (Snell 官方二进制使用 UPX，musl 不兼容 UPX stub)
         if [[ "$DISTRO" == "alpine" ]] && command -v upx &>/dev/null; then
             upx -d /usr/local/bin/snell-server &>/dev/null || true
         fi
         rm -rf "$tmp"; _ok "Snell v4 已安装"; return 0
     fi
-    rm -rf "$tmp"; _err "下载失败"; return 1
+    rm -rf "$tmp"; _err "下载或解压安装 Snell v4 失败"; return 1
 }
 
 # 安装 Snell v5
@@ -9556,20 +9827,21 @@ install_snell_v5() {
         fi
     fi
     [[ -z "$version" ]] && version="$SNELL_DEFAULT_VERSION"
-    if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ ]]; then
+    if [[ ! "$version" =~ ^[0-9A-Za-z._-]+$ || "$version" == *".."* ]]; then
         _err "无效的版本号格式: $version"
         return 1
     fi
     local tmp=$(mktemp -d)
-    if curl -sLo "$tmp/snell.zip" --connect-timeout 60 "https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"; then
-        unzip -oq "$tmp/snell.zip" -d "$tmp/" && install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5
+    if curl -fsSLo "$tmp/snell.zip" --connect-timeout 60 "https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip" && \
+       unzip -oq "$tmp/snell.zip" -d "$tmp/" && \
+       install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server-v5; then
         # Alpine: 解压 UPX 压缩 (Snell 官方二进制使用 UPX，musl 不兼容 UPX stub)
         if [[ "$DISTRO" == "alpine" ]] && command -v upx &>/dev/null; then
             upx -d /usr/local/bin/snell-server-v5 &>/dev/null || true
         fi
         rm -rf "$tmp"; _ok "Snell v$version 已安装"; return 0
     fi
-    rm -rf "$tmp"; _err "下载失败"; return 1
+    rm -rf "$tmp"; _err "下载或解压安装 Snell v5 失败"; return 1
 }
 
 # 安装 AnyTLS
@@ -10130,6 +10402,7 @@ gen_naive_server_config() {
     }
 }
 EOF
+    chmod 600 "$CFG/Caddyfile" 2>/dev/null || true
     
     # 创建日志目录；共享 Web root 只在首页缺失时创建并登记 placeholder。
     mkdir -p /var/log/caddy
@@ -10405,11 +10678,23 @@ get_all_services() {
     
     [[ ! -f "$DB_FILE" ]] && { echo ""; return; }
     
-    # 检查 Xray 协议
+    # 检查 Xray 与独立协议（register_protocol 将独立协议也存在 .xray 下，必须按协议名分类）
     local xray_protos=$(jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null)
-    [[ -n "$xray_protos" ]] && services+="vless-reality:xray "
+    local has_xray=false
+    for proto in $xray_protos; do
+        case "$proto" in
+            snell) services+="vless-snell:snell-server " ;;
+            snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
+            naive) services+="vless-naive:caddy " ;;
+            snell-shadowtls) services+="vless-snell-shadowtls:shadow-tls " ;;
+            snell-v5-shadowtls) services+="vless-snell-v5-shadowtls:shadow-tls " ;;
+            ss2022-shadowtls) services+="vless-ss2022-shadowtls:shadow-tls " ;;
+            *) has_xray=true ;;
+        esac
+    done
+    [[ "$has_xray" == "true" ]] && services+="vless-reality:xray "
     
-    # 检查 Sing-box 协议 (hy2/tuic 由 vless-singbox 统一管理)
+    # 检查 Sing-box 协议 (hy2/tuic/anytls 由 vless-singbox 统一管理)
     local singbox_protos=$(jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null)
     local has_singbox=false
     for proto in $singbox_protos; do
@@ -10417,6 +10702,7 @@ get_all_services() {
             hy2|tuic|anytls) has_singbox=true ;;
             snell) services+="vless-snell:snell-server " ;;
             snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
+            naive) services+="vless-naive:caddy " ;;
             snell-shadowtls) services+="vless-snell-shadowtls:shadow-tls " ;;
             snell-v5-shadowtls) services+="vless-snell-v5-shadowtls:shadow-tls " ;;
             ss2022-shadowtls) services+="vless-ss2022-shadowtls:shadow-tls " ;;
@@ -10458,41 +10744,32 @@ if ! command -v iptables &>/dev/null; then
     exit 1
 fi
 
-# 从数据库读取配置
-port=$(jq -r '.singbox.hy2.port // empty' "$DB_FILE" 2>/dev/null)
-hop_enable=$(jq -r '.singbox.hy2.hop_enable // empty' "$DB_FILE" 2>/dev/null)
-hop_start=$(jq -r '.singbox.hy2.hop_start // empty' "$DB_FILE" 2>/dev/null)
-hop_end=$(jq -r '.singbox.hy2.hop_end // empty' "$DB_FILE" 2>/dev/null)
+# 从数据库读取配置（兼容单对象与多端口数组）
+jq -c '.singbox.hy2 | if type == "array" then .[] elif type == "object" then . else empty end' "$DB_FILE" 2>/dev/null | while IFS= read -r row; do
+    port=$(jq -r '.port // empty' <<< "$row")
+    hop_enable=$(jq -r '.hop_enable // 0' <<< "$row")
+    hop_start=$(jq -r '.hop_start // 20000' <<< "$row")
+    hop_end=$(jq -r '.hop_end // 50000' <<< "$row")
+    [[ "$port" =~ ^[0-9]+$ && "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ && "$hop_start" -lt "$hop_end" ]] || continue
 
-[[ -z "$port" ]] && exit 0
+    # 清理旧规则 (IPv4/IPv6)
+    iptables -t nat -D PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    iptables -t nat -D OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    ip6tables -t nat -D OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
 
-hop_start="${hop_start:-20000}"
-hop_end="${hop_end:-50000}"
+    [[ "$hop_enable" == "1" ]] || continue
 
-if ! [[ "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ ]] || [[ "$hop_start" -ge "$hop_end" ]]; then
-  exit 0
-fi
-
-# 清理旧规则 (IPv4)
-iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-iptables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-# 清理旧规则 (IPv6)
-ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-ip6tables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-
-[[ "${hop_enable:-0}" != "1" ]] && exit 0
-
-# 添加规则 (IPv4)
-iptables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
-iptables -t nat -C OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || iptables -t nat -A OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
-
-# 添加规则 (IPv6)
-ip6tables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
-ip6tables -t nat -C OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || ip6tables -t nat -A OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
+    # 添加规则 (IPv4/IPv6)
+    iptables -t nat -C PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || iptables -t nat -A PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port"
+    iptables -t nat -C OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || iptables -t nat -A OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port"
+    ip6tables -t nat -C PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || ip6tables -t nat -A PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    ip6tables -t nat -C OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || ip6tables -t nat -A OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+done
 EOFSCRIPT
     fi
 
@@ -10511,41 +10788,32 @@ if ! command -v iptables &>/dev/null; then
     exit 1
 fi
 
-# 从数据库读取配置
-port=$(jq -r '.singbox.tuic.port // empty' "$DB_FILE" 2>/dev/null)
-hop_enable=$(jq -r '.singbox.tuic.hop_enable // empty' "$DB_FILE" 2>/dev/null)
-hop_start=$(jq -r '.singbox.tuic.hop_start // empty' "$DB_FILE" 2>/dev/null)
-hop_end=$(jq -r '.singbox.tuic.hop_end // empty' "$DB_FILE" 2>/dev/null)
+# 从数据库读取配置（兼容单对象与多端口数组）
+jq -c '.singbox.tuic | if type == "array" then .[] elif type == "object" then . else empty end' "$DB_FILE" 2>/dev/null | while IFS= read -r row; do
+    port=$(jq -r '.port // empty' <<< "$row")
+    hop_enable=$(jq -r '.hop_enable // 0' <<< "$row")
+    hop_start=$(jq -r '.hop_start // 20000' <<< "$row")
+    hop_end=$(jq -r '.hop_end // 50000' <<< "$row")
+    [[ "$port" =~ ^[0-9]+$ && "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ && "$hop_start" -lt "$hop_end" ]] || continue
 
-[[ -z "$port" ]] && exit 0
+    # 清理旧规则 (IPv4/IPv6)
+    iptables -t nat -D PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    iptables -t nat -D OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    ip6tables -t nat -D PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    ip6tables -t nat -D OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
 
-hop_start="${hop_start:-20000}"
-hop_end="${hop_end:-50000}"
+    [[ "$hop_enable" == "1" ]] || continue
 
-if ! [[ "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ ]] || [[ "$hop_start" -ge "$hop_end" ]]; then
-  exit 0
-fi
-
-# 清理旧规则 (IPv4)
-iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-iptables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-# 清理旧规则 (IPv6)
-ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-ip6tables -t nat -D OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null
-
-[[ "${hop_enable:-0}" != "1" ]] && exit 0
-
-# 添加规则 (IPv4)
-iptables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
-iptables -t nat -C OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || iptables -t nat -A OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
-
-# 添加规则 (IPv6)
-ip6tables -t nat -C PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
-ip6tables -t nat -C OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port 2>/dev/null \
-  || ip6tables -t nat -A OUTPUT -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port
+    # 添加规则 (IPv4/IPv6)
+    iptables -t nat -C PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || iptables -t nat -A PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port"
+    iptables -t nat -C OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || iptables -t nat -A OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port"
+    ip6tables -t nat -C PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || ip6tables -t nat -A PREROUTING -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+    ip6tables -t nat -C OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null \
+      || ip6tables -t nat -A OUTPUT -p udp --dport "${hop_start}:${hop_end}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+done
 EOFSCRIPT
     fi
 
@@ -10602,13 +10870,22 @@ create_service() {
                 snell_backend_port=$(db_get_field "$cfg_core" "$protocol" "snell_backend_port")
             fi
             local lh=$(_listen_addr)
-            exec_cmd="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$lh" "$port") --server 127.0.0.1:${ss_backend_port:-$snell_backend_port} --tls ${sni}:443 --password ${stls_password}"
+            # 将 ShadowTLS 密码写入 0600 私有环境文件，避免在 0644 unit 文件中明文暴露
+            local stls_env_file="$CFG/shadowtls-${protocol}.env"
+            mkdir -p "$CFG"
+            ( umask 077; printf 'STLS_PASSWORD=%s\n' "$stls_password" > "$stls_env_file" )
+            chmod 600 "$stls_env_file" 2>/dev/null || true
+            if [[ "$DISTRO" == "alpine" ]]; then
+                exec_cmd="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$lh" "$port") --server 127.0.0.1:${ss_backend_port:-$snell_backend_port} --tls ${sni}:443 --password \${STLS_PASSWORD}"
+            else
+                exec_cmd="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$lh" "$port") --server 127.0.0.1:${ss_backend_port:-$snell_backend_port} --tls ${sni}:443 --password \${STLS_PASSWORD}"
+            fi
             exec_name="shadow-tls"
             ;;
     esac
 
-    _write_openrc() { # name desc cmd args [env]
-        local name="$1" desc="$2" cmd="$3" args="$4" env="$5"
+    _write_openrc() { # name desc cmd args [env] [env_file]
+        local name="$1" desc="$2" cmd="$3" args="$4" env="$5" env_file="${6:-}"
         cat >"/etc/init.d/${name}" <<EOF
 #!/sbin/openrc-run
 name="${desc}"
@@ -10617,13 +10894,14 @@ command_args="${args}"
 command_background="yes"
 pidfile="/run/${name}.pid"
 ${env:+export ${env}}
+${env_file:+[ -f "${env_file}" ] && . "${env_file}"}
 depend() { need net; }
 EOF
         chmod +x "/etc/init.d/${name}"
     }
 
-    _write_systemd() { # name desc exec pre before env [requires] [after]
-        local name="$1" desc="$2" exec="$3" pre="$4" before="$5" env="$6" requires="${7:-}" after="${8:-}"
+    _write_systemd() { # name desc exec pre before env [requires] [after] [env_file]
+        local name="$1" desc="$2" exec="$3" pre="$4" before="$5" env="$6" requires="${7:-}" after="${8:-}" env_file="${9:-}"
         cat >"/etc/systemd/system/${name}.service" <<EOF
 [Unit]
 Description=${desc}
@@ -10634,11 +10912,17 @@ ${requires:+Requires=${requires}}
 [Service]
 Type=simple
 ${env:+Environment=${env}}
+${env_file:+EnvironmentFile=${env_file}}
 ${pre:+ExecStartPre=${pre}}
 ExecStart=${exec}
 Restart=always
 RestartSec=3
 LimitNOFILE=51200
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
 
 [Install]
 WantedBy=multi-user.target
@@ -10647,10 +10931,13 @@ EOF
 
     if [[ "$DISTRO" == "alpine" ]]; then
         local cmd="${exec_cmd%% *}" args=""; [[ "$exec_cmd" == *" "* ]] && args="${exec_cmd#* }"
-        local env=""
+        local env="" env_file=""
         # ShadowTLS CPU 100% 修复: 高版本内核 io_uring 问题
-        [[ "$kind" == "shadowtls" ]] && env="MONOIO_FORCE_LEGACY_DRIVER=1"
-        _write_openrc "$service_name" "Proxy Server ($protocol)" "$cmd" "$args" "$env"
+        if [[ "$kind" == "shadowtls" ]]; then
+            env="MONOIO_FORCE_LEGACY_DRIVER=1"
+            env_file="$CFG/shadowtls-${protocol}.env"
+        fi
+        _write_openrc "$service_name" "Proxy Server ($protocol)" "$cmd" "$args" "$env" "$env_file"
 
         if [[ "$kind" == "shadowtls" ]]; then
             _write_openrc "${BACKEND_NAME[$protocol]}" "${BACKEND_DESC[$protocol]}" "${BACKEND_EXEC[$protocol]%% *}" "${BACKEND_EXEC[$protocol]#* }" ""
@@ -10658,17 +10945,18 @@ EOF
 
         _write_openrc "vless-watchdog" "VLESS Watchdog" "/bin/bash" "$CFG/watchdog.sh" ""
     else
-        local pre="" env="" requires="" after=""
+        local pre="" env="" requires="" after="" env_file=""
         [[ "$kind" == "hy2" ]] && pre="-/bin/bash $CFG/hy2-nat.sh"
         [[ "$kind" == "tuic" ]] && pre="-/bin/bash $CFG/tuic-nat.sh"
         # ShadowTLS CPU 100% 修复: 高版本内核 io_uring 问题
         if [[ "$kind" == "shadowtls" ]]; then
             env="MONOIO_FORCE_LEGACY_DRIVER=1"
+            env_file="$CFG/shadowtls-${protocol}.env"
             # 主服务依赖 backend 服务
             requires="${BACKEND_NAME[$protocol]}.service"
             after="${BACKEND_NAME[$protocol]}.service"
         fi
-        _write_systemd "$service_name" "Proxy Server ($protocol)" "$exec_cmd" "$pre" "" "$env" "$requires" "$after"
+        _write_systemd "$service_name" "Proxy Server ($protocol)" "$exec_cmd" "$pre" "" "$env" "$requires" "$after" "$env_file"
 
         if [[ "$kind" == "shadowtls" ]]; then
             # backend 服务在主服务之前启动
@@ -10697,8 +10985,17 @@ EOF
 
 
 svc() { # svc action service_name
-    local action="$1" name="$2" err=/tmp/svc_error.log
-    _svc_try() { : >"$err"; "$@" 2>"$err" || { [[ -s "$err" ]] && { _err "服务${action}失败:"; cat "$err"; }; rm -f "$err"; return 1; }; rm -f "$err"; }
+    local action="$1" name="$2"
+    _svc_try() {
+        local err
+        err=$(mktemp) || err="/dev/null"
+        "$@" 2>"$err" || {
+            [[ "$err" != "/dev/null" && -s "$err" ]] && { _err "服务${action}失败:"; cat "$err"; }
+            [[ "$err" != "/dev/null" ]] && rm -f "$err"
+            return 1
+        }
+        [[ "$err" != "/dev/null" ]] && rm -f "$err"
+    }
 
     if [[ "$DISTRO" == "alpine" ]]; then
         case "$action" in
@@ -10936,27 +11233,34 @@ _auto_update_system_script() {
         real_path="$(cd "$(dirname "$current_script")" 2>/dev/null && pwd)/$(basename "$current_script")"
     fi
     
-    # 如果当前脚本不是系统脚本，检查是否需要更新
+    # 如果当前脚本不是系统脚本，检查是否需要更新（禁止旧版本静默降级覆盖新版）
     if [[ -n "$real_path" && -f "$real_path" && "$real_path" != "$system_script" ]]; then
         local need_update=false
         
         if [[ ! -f "$system_script" ]]; then
             need_update=true
         else
-            # 用 md5 校验文件内容是否不同
-            local cur_md5 sys_md5
-            cur_md5=$(md5sum "$real_path" 2>/dev/null | cut -d' ' -f1)
-            sys_md5=$(md5sum "$system_script" 2>/dev/null | cut -d' ' -f1)
-            [[ "$cur_md5" != "$sys_md5" ]] && need_update=true
+            local sys_ver cur_sha sys_sha
+            sys_ver=$(_extract_script_version "$system_script" 2>/dev/null)
+            if _is_semver_version "$sys_ver" && _is_semver_version "$VERSION" && _version_gt "$sys_ver" "$VERSION"; then
+                return 0
+            fi
+            cur_sha=$(_script_sha256 "$real_path" 2>/dev/null)
+            sys_sha=$(_script_sha256 "$system_script" 2>/dev/null)
+            [[ -n "$cur_sha" && "$cur_sha" != "$sys_sha" ]] && need_update=true
         fi
         
         if [[ "$need_update" == "true" ]]; then
-            cp -f "$real_path" "$system_script" 2>/dev/null
-            chmod +x "$system_script" 2>/dev/null
-            ln -sf "$system_script" /usr/local/bin/vless 2>/dev/null
-            ln -sf "$system_script" /usr/bin/vless 2>/dev/null
-            hash -r 2>/dev/null
-            _ok "系统脚本已同步到当前 ${RELEASE_CHANNEL} 制品"
+            local sys_tmp
+            sys_tmp=$(mktemp "${system_script}.tmp.XXXXXX" 2>/dev/null) || return 0
+            if cp -f "$real_path" "$sys_tmp" 2>/dev/null && chmod 0755 "$sys_tmp" 2>/dev/null && mv -f "$sys_tmp" "$system_script" 2>/dev/null; then
+                ln -sf "$system_script" /usr/local/bin/vless 2>/dev/null
+                ln -sf "$system_script" /usr/bin/vless 2>/dev/null
+                hash -r 2>/dev/null
+                _ok "系统脚本已同步到当前 ${RELEASE_CHANNEL} 制品"
+            else
+                rm -f "$sys_tmp" 2>/dev/null
+            fi
         fi
     fi
 }
@@ -11210,16 +11514,18 @@ register_warp() {
         return 1
     fi
     
-    cd /tmp
-    rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf 2>/dev/null
+    local wgcf_tmp
+    wgcf_tmp=$(mktemp -d) || { _err "创建临时目录失败"; return 1; }
+    chmod 700 "$wgcf_tmp" 2>/dev/null || true
     
-    # 注册 WARP 账户
+    # 注册 WARP 账户（在 0700 私有临时目录内执行，避免私钥暴露于 /tmp）
     echo -ne "  ${C}▸${NC} 注册 WARP 账户..."
     local register_output
-    register_output=$(/usr/local/bin/wgcf register --accept-tos 2>&1)
+    register_output=$( ( cd "$wgcf_tmp" && /usr/local/bin/wgcf register --accept-tos ) 2>&1 )
     local register_ret=$?
     
-    if [[ $register_ret -ne 0 ]] || [[ ! -f /tmp/wgcf-account.toml ]]; then
+    if [[ $register_ret -ne 0 ]] || [[ ! -f "$wgcf_tmp/wgcf-account.toml" ]]; then
+        rm -rf "$wgcf_tmp"
         echo -e " ${R}✗${NC}"
         _err "WARP 账户注册失败"
         [[ -n "$register_output" ]] && echo -e "  ${D}$register_output${NC}"
@@ -11230,10 +11536,11 @@ register_warp() {
     # 生成 WireGuard 配置
     echo -ne "  ${C}▸${NC} 生成 WireGuard 配置..."
     local generate_output
-    generate_output=$(/usr/local/bin/wgcf generate 2>&1)
+    generate_output=$( ( cd "$wgcf_tmp" && /usr/local/bin/wgcf generate ) 2>&1 )
     local generate_ret=$?
     
-    if [[ $generate_ret -ne 0 ]] || [[ ! -f /tmp/wgcf-profile.conf ]]; then
+    if [[ $generate_ret -ne 0 ]] || [[ ! -f "$wgcf_tmp/wgcf-profile.conf" ]]; then
+        rm -rf "$wgcf_tmp"
         echo -e " ${R}✗${NC}"
         _err "配置生成失败"
         [[ -n "$generate_output" ]] && echo -e "  ${D}$generate_output${NC}"
@@ -11243,8 +11550,8 @@ register_warp() {
     
     # 解析配置并保存到 JSON
     echo -ne "  ${C}▸${NC} 保存配置..."
-    parse_and_save_warp_config /tmp/wgcf-profile.conf
-    rm -f /tmp/wgcf-account.toml /tmp/wgcf-profile.conf
+    parse_and_save_warp_config "$wgcf_tmp/wgcf-profile.conf"
+    rm -rf "$wgcf_tmp"
     echo -e " ${G}✓${NC}"
     
     # 显示配置信息
@@ -11353,6 +11660,9 @@ parse_and_save_warp_config() {
     done
     
     mkdir -p "$CFG"
+    local warp_tmp
+    warp_tmp=$(mktemp "${WARP_CONF_FILE}.tmp.XXXXXX") || return 1
+    chmod 600 "$warp_tmp" 2>/dev/null || true
     jq -n \
         --arg pk "$private_key" \
         --arg pub "$public_key" \
@@ -11366,7 +11676,7 @@ parse_and_save_warp_config() {
         address_v6: $v6,
         endpoint: $ep,
         reserved: [0, 0, 0]
-    }' > "$WARP_CONF_FILE"
+    }' > "$warp_tmp" && mv -f "$warp_tmp" "$WARP_CONF_FILE" && chmod 600 "$WARP_CONF_FILE" 2>/dev/null || { rm -f "$warp_tmp"; return 1; }
 }
 
 # 生成 Xray WARP outbound 配置 (支持 WireGuard 和 SOCKS5 双模式)
@@ -12399,9 +12709,10 @@ _display_sorted_latencies() {
         local display_addr=$(_format_server_port "$server" "$port")
         local mark_suffix=""
 
-        # 如果提供了标记数组名，尝试获取对应的标记
-        if [[ -n "$marks_array_name" ]]; then
-            eval "local mark_value=\"\${${marks_array_name}[${name}]}\""
+        # 如果提供了标记数组名，使用 nameref 安全读取（禁止 eval 防止节点名命令注入）
+        if [[ -n "$marks_array_name" && "$marks_array_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+            local -n _marks_ref="$marks_array_name"
+            local mark_value="${_marks_ref[$name]:-}"
             [[ -n "$mark_value" ]] && mark_suffix=" ${Y}← ${mark_value}${NC}"
         fi
         
@@ -14082,7 +14393,7 @@ _wait_local_port() {
             if nc -z 127.0.0.1 "$port" &>/dev/null; then
                 return 0
             fi
-        elif timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/${port}" &>/dev/null; then
+        elif [[ "$port" =~ ^[0-9]+$ ]] && timeout 1 bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$port" &>/dev/null; then
             return 0
         fi
         sleep 0.1
@@ -15469,6 +15780,22 @@ _import_akile_nodes() {
     echo -e "  ${D}包括: HK/JP/KR/TW/SG/US/UK/DE 等地区${NC}"
     echo ""
 
+    # 此预设需管理员自行提供账号与节点列表；未配置占位符时在任何数据库修改前退出。
+    local username="<SET-ME-akile-username>"
+    local password="<SET-ME-akile-password>"
+    local imported=0
+
+    # 定义所有 Akile 节点: 名称|服务器|端口（需自行填写）
+    local nodes_data=(
+        "Akile-HK-01|<SET-ME-host>|58888"
+    )
+
+    if [[ "$username" == '<SET-ME-'* || "$password" == '<SET-ME-'* || "${nodes_data[0]}" == *'<SET-ME-'* ]]; then
+        _warn "Akile 节点预设未配置；未修改任何现有节点或分流规则"
+        _pause
+        return 1
+    fi
+
     # 先删除所有旧的 Akile 节点
     local old_nodes=$(db_get_chain_nodes 2>/dev/null)
     local deleted=0
@@ -15484,29 +15811,8 @@ _import_akile_nodes() {
     if [[ $deleted -gt 0 ]]; then
         echo -e "  ${C}▸${NC} 清理了 $deleted 个旧节点"
         # 同时清理相关的分流规则
-        local tmp=$(mktemp)
-        jq '.routing_rules = [.routing_rules[]? | select(.outbound | (startswith("chain:Akile-") | not))]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+        _db_safe_write 1 "" '.routing_rules = [.routing_rules[]? | select(.outbound | (startswith("chain:Akile-") | not))]'
     fi
-
-    local username="akilecloud"
-    local password="akilecloud"
-    local imported=0
-
-    # 定义所有 Akile 节点: 名称|服务器|端口
-    local nodes_data=(
-        "Akile-HK-RANDOMIPV6|45.8.186.151|58888"
-        "Akile-JP-RANDOMIPV6|203.10.99.23|58888"
-        "Akile-KR-RANDOMIPV6|141.11.131.253|58888"
-        "Akile-TW-RANDOMIPV6|45.207.158.22|58888"
-        "Akile-SG-RANDOMIPV6|104.192.92.63|58888"
-        "Akile-US-RANDOMIPV6|154.83.90.2|58888"
-        "Akile-UK-RANDOMIPV6|212.135.39.2|58888"
-        "Akile-DE-RANDOMIPV6|45.196.222.2|58888"
-        "Akile-JP-SOFTBANK|141.11.131.205|58888"
-        "Akile-JP-KDDI|141.11.131.205|59999"
-        "Akile-TW-HINET|45.207.158.220|58888"
-        "Akile-HK-HKBN|45.207.156.2|58888"
-    )
 
     echo -e "  ${C}▸${NC} 开始导入 ${#nodes_data[@]} 个节点..."
     echo ""
@@ -17421,7 +17727,7 @@ show_single_protocol_info() {
     # 订阅对所有协议都默认关闭，仅以 sub.info 作为显式启用标记。
     if [[ -f "$CFG/sub.info" ]]; then
         local sub_uuid="" sub_port="" sub_domain="" sub_https=""
-        source "$CFG/sub.info"
+        _load_sub_info "$CFG/sub.info"
         local sub_protocol="http"
         [[ "$sub_https" == "true" ]] && sub_protocol="https"
         if [[ -n "$sub_port" ]] && ss -tlnp 2>/dev/null | grep -q ":${sub_port} "; then
@@ -17870,9 +18176,10 @@ uninstall_specific_protocol() {
         case "$selected_protocol" in
             snell) rm -f "$CFG/snell.conf" ;;
             snell-v5) rm -f "$CFG/snell-v5.conf" ;;
-            snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
-            snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
-            ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
+            naive) rm -f "$CFG/Caddyfile" ;;
+            snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" "$CFG/shadowtls-snell-shadowtls.env" ;;
+            snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" "$CFG/shadowtls-snell-v5-shadowtls.env" ;;
+            ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" "$CFG/shadowtls-ss2022-shadowtls.env" ;;
         esac
         
         # 删除服务文件
@@ -18053,21 +18360,14 @@ do_uninstall() {
     
     _info "删除配置目录..."
     
-    # 保留证书目录和域名记录，避免重复申请
-    local cert_backup_dir="/tmp/vless-certs-backup"
-    if [[ -d "$CFG/certs" ]]; then
-        _info "备份证书文件..."
-        mkdir -p "$cert_backup_dir"
-        cp -r "$CFG/certs" "$cert_backup_dir/" 2>/dev/null
-        [[ -f "$CFG/cert_domain" ]] && cp "$CFG/cert_domain" "$cert_backup_dir/" 2>/dev/null
-    fi
-    
+    # 证书目录与域名记录留在 $CFG/certs 内（禁止复制到全局可写的 /tmp 目录）
     # 删除配置目录（但保留证书）
     find "$CFG" -name "*.json" -delete 2>/dev/null
     find "$CFG" -name "*.join" -delete 2>/dev/null
     find "$CFG" -name "*.yaml" -delete 2>/dev/null
     find "$CFG" -name "*.conf" -delete 2>/dev/null
-    rm -f "$CFG/installed_protocols" 2>/dev/null
+    find "$CFG" -name "shadowtls-*.env" -delete 2>/dev/null
+    rm -f "$CFG/installed_protocols" "$CFG/Caddyfile" 2>/dev/null
     
     # 如果没有证书，删除整个目录
     if [[ ! -d "$CFG/certs" ]]; then
@@ -20257,16 +20557,25 @@ get_all_external_links() {
     echo -n "$links"
 }
 
-# 将外部节点转换为 Clash 格式
+# 将外部节点转换为 Clash 格式（剥离控制/换行字符防 YAML 注入）
+_sanitize_sub_scalar() {
+    local v="${1//$'\r'/}"
+    v="${v//$'\n'/}"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '%s' "$v"
+}
+
 external_link_to_clash() {
     local link="$1"
     local json=$(parse_share_link "$link")
     [[ -z "$json" ]] && return
     
-    local type=$(echo "$json" | jq -r '.type')
-    local name=$(echo "$json" | jq -r '.name')
-    local server=$(echo "$json" | jq -r '.server')
+    local type=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.type')")
+    local name=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.name')")
+    local server=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.server')")
     local port=$(echo "$json" | jq -r '.port')
+    [[ "$port" =~ ^[0-9]+$ ]] || return
     
     # 给外部节点名称加上服务器标识，避免与本地节点重复
     local server_suffix=$(get_ip_suffix "$server")
@@ -20424,10 +20733,15 @@ external_link_to_surge() {
     local json=$(parse_share_link "$link")
     [[ -z "$json" ]] && return
     
-    local type=$(echo "$json" | jq -r '.type')
-    local name=$(echo "$json" | jq -r '.name')
-    local server=$(echo "$json" | jq -r '.server')
-    local port=$(echo "$json" | jq -r '.port')
+    local type=$(echo "$json" | jq -r '.type // empty')
+    local name=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.name // empty')")
+    local server=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.server // empty')")
+    local port=$(echo "$json" | jq -r '.port // empty')
+    [[ -z "$name" || -z "$server" || ! "$port" =~ ^[0-9]+$ ]] && return
+    # Surge 语法逗号/等号敏感，替换节点名中的逗号/等号避免配置注入
+    name="${name//,/-}"
+    name="${name//=/_}"
+    server="${server//,/}"
     
     # 给外部节点名称加上服务器标识，避免与本地节点重复
     local server_suffix=$(get_ip_suffix "$server")
@@ -20435,11 +20749,12 @@ external_link_to_surge() {
     
     case "$type" in
         vmess)
-            local uuid=$(echo "$json" | jq -r '.uuid')
-            local network=$(echo "$json" | jq -r '.network')
-            local tls=$(echo "$json" | jq -r '.tls')
-            local sni=$(echo "$json" | jq -r '.sni')
-            local path=$(echo "$json" | jq -r '.path')
+            local uuid=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.uuid // empty')")
+            local network=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.network // empty')")
+            local tls=$(echo "$json" | jq -r '.tls // empty')
+            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
+            local path=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.path // empty')")
+            uuid="${uuid//,/}"; sni="${sni//,/}"; path="${path//,/}"
             if [[ "$network" == "ws" ]]; then
                 echo "$name = vmess, $server, $port, $uuid, tls=$([[ "$tls" == "tls" ]] && echo "true" || echo "false"), ws=true, ws-path=${path:-/}, sni=$sni, skip-cert-verify=true"
             else
@@ -20447,23 +20762,27 @@ external_link_to_surge() {
             fi
             ;;
         trojan)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
+            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
+            password="${password//,/}"; sni="${sni//,/}"
             echo "$name = trojan, $server, $port, password=$password, sni=$sni, skip-cert-verify=true"
             ;;
         ss)
-            local method=$(echo "$json" | jq -r '.method')
-            local password=$(echo "$json" | jq -r '.password')
+            local method=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.method // empty')")
+            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
+            method="${method//,/}"; password="${password//,/}"
             echo "$name = ss, $server, $port, encrypt-method=$method, password=$password"
             ;;
         hysteria2)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
+            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
+            password="${password//,/}"; sni="${sni//,/}"
             echo "$name = hysteria2, $server, $port, password=$password, sni=$sni, skip-cert-verify=true"
             ;;
         anytls)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
+            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
+            password="${password//,/}"; sni="${sni//,/}"
             local anytls_scv=true
             _anytls_secure "$sni" && anytls_scv=false
             echo "$name = anytls, $server, $port, password=$password, sni=$sni, skip-cert-verify=$anytls_scv"
@@ -20726,6 +21045,23 @@ reset_sub_uuid() {
     echo "$new_uuid"
 }
 
+# 判断单个协议实例是否还有有效用户（用于订阅生成 fail-closed：显式 users 数组且全禁用/过期则不暴露）
+_cfg_has_active_user() {
+    local cfg="$1"
+    local today
+    today=$(date '+%Y-%m-%d')
+    jq -e --arg today "$today" '
+        if (.users | type) == "array" then
+            any(.users[];
+                ((.enabled // true) == true) and
+                ((.expire // "") == "" or (.expire > $today))
+            )
+        else
+            true
+        end
+    ' <<< "$cfg" >/dev/null 2>&1
+}
+
 # 生成 V2Ray/通用 Base64 订阅内容
 gen_v2ray_sub() {
     local installed=$(get_installed_protocols)
@@ -20769,6 +21105,7 @@ gen_v2ray_sub() {
         
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
+            _cfg_has_active_user "$cfg" || continue
             
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -20892,6 +21229,7 @@ gen_clash_sub() {
         
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
+            _cfg_has_active_user "$cfg" || continue
             
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -20912,6 +21250,8 @@ gen_clash_sub() {
             fi
             
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
+            local tls_scv="true"
+            _anytls_secure "$sni" && tls_scv="false"
             local proxy=""
             
             case "$protocol" in
@@ -20958,7 +21298,7 @@ gen_clash_sub() {
     network: ws
     tls: true
     udp: true
-    skip-cert-verify: true
+    skip-cert-verify: $tls_scv
     servername: $sni
     ws-opts:
       path: $path
@@ -20975,7 +21315,7 @@ gen_clash_sub() {
     tls: true
     udp: true
     flow: xtls-rprx-vision
-    skip-cert-verify: true
+    skip-cert-verify: $tls_scv
     servername: $sni
     client-fingerprint: chrome"
                 ;;
@@ -20989,7 +21329,7 @@ gen_clash_sub() {
     cipher: auto
     network: ws
     tls: true
-    skip-cert-verify: true
+    skip-cert-verify: $tls_scv
     servername: $sni
     ws-opts:
       path: $path
@@ -21003,7 +21343,7 @@ gen_clash_sub() {
     port: $actual_port
     password: $password
     udp: true
-    skip-cert-verify: true
+    skip-cert-verify: $tls_scv
     sni: $sni"
                 ;;
             ss2022)
@@ -21031,7 +21371,7 @@ gen_clash_sub() {
     port: $port
     password: $password
     sni: $sni
-    skip-cert-verify: true"
+    skip-cert-verify: $tls_scv"
                 ;;
             tuic)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
@@ -21044,7 +21384,7 @@ gen_clash_sub() {
     udp-relay-mode: native
     congestion-controller: bbr
     sni: $sni
-    skip-cert-verify: true"
+    skip-cert-verify: $tls_scv"
                 ;;
             anytls)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
@@ -21053,7 +21393,7 @@ gen_clash_sub() {
     port: $port
     password: $password
     sni: $sni
-    skip-cert-verify: true"
+    skip-cert-verify: $tls_scv"
                 ;;
             esac
             
@@ -21139,6 +21479,7 @@ gen_surge_sub() {
         
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
+            _cfg_has_active_user "$cfg" || continue
             
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -21150,11 +21491,13 @@ gen_surge_sub() {
             local version=$(echo "$cfg" | jq -r '.version // empty')
             
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
+            local tls_scv=true
+            _anytls_secure "$sni" && tls_scv=false
             local proxy=""
             
             case "$protocol" in
                 trojan)
-                    [[ -n "$server_ip" ]] && proxy="$name = trojan, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    [[ -n "$server_ip" ]] && proxy="$name = trojan, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=$tls_scv"
                     ;;
                 ss2022)
                     [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
@@ -21163,15 +21506,13 @@ gen_surge_sub() {
                     [[ -n "$server_ip" ]] && proxy="$name = ss, $server_ip, $port, encrypt-method=$method, password=$password"
                     ;;
                 hy2)
-                    [[ -n "$server_ip" ]] && proxy="$name = hysteria2, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
+                    [[ -n "$server_ip" ]] && proxy="$name = hysteria2, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=$tls_scv"
                     ;;
                 tuic)
-                    [[ -n "$server_ip" ]] && proxy="$name = tuic, $server_ip, $port, uuid=$uuid, password=$password, sni=$sni, skip-cert-verify=true, alpn=h3"
+                    [[ -n "$server_ip" ]] && proxy="$name = tuic, $server_ip, $port, uuid=$uuid, password=$password, sni=$sni, skip-cert-verify=$tls_scv, alpn=h3"
                     ;;
                 anytls)
-                    local anytls_scv=true
-                    _anytls_secure "$sni" && anytls_scv=false
-                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=$anytls_scv"
+                    [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=$tls_scv"
                     ;;
                 snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
                     # Snell 和 Snell+ShadowTLS 都使用相同的 Surge 配置格式
@@ -21363,9 +21704,9 @@ EOF
 show_sub_links() {
     [[ ! -f "$CFG/sub.info" ]] && { _warn "订阅服务未配置"; return; }
     
-    # 清除变量避免污染
+    # 清除变量避免污染（安全读取键值，禁止 source）
     local sub_uuid="" sub_port="" sub_domain="" sub_https=""
-    source "$CFG/sub.info"
+    _load_sub_info "$CFG/sub.info"
     local ipv4=$(get_ipv4)
     local protocol="http"
     [[ "$sub_https" == "true" ]] && protocol="https"
@@ -21403,7 +21744,7 @@ manage_subscription() {
         if [[ -f "$CFG/sub.info" ]]; then
             # 清除变量避免污染
             local sub_uuid="" sub_port="" sub_domain="" sub_https=""
-            source "$CFG/sub.info"
+            _load_sub_info "$CFG/sub.info"
             echo -e "  状态: ${G}已配置${NC}"
             echo -e "  端口: ${G}$sub_port${NC}"
             [[ -n "$sub_domain" ]] && echo -e "  域名: ${G}$sub_domain${NC}"
@@ -21435,7 +21776,7 @@ manage_subscription() {
                     # 获取订阅端口和域名信息
                     local sub_port="" sub_domain=""
                     if [[ -f "$CFG/sub.info" ]]; then
-                        source "$CFG/sub.info"
+                        _load_sub_info "$CFG/sub.info"
                     fi
                     
                     # 删除本项目订阅配置；兼容旧版可能生成的 vless-fake 文件。
@@ -21582,6 +21923,7 @@ setup_subscription_interactive() {
             openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
                 -keyout "$key_file" -out "$cert_file" \
                 -subj "/CN=$server_name" 2>/dev/null
+            chmod 600 "$key_file" 2>/dev/null || true
         fi
         
         cat > "$nginx_conf" << EOF
@@ -21666,13 +22008,8 @@ EOF
         return 1
     }
     
-    # 保存订阅配置
-    cat > "$CFG/sub.info" << EOF
-sub_uuid=$sub_uuid
-sub_port=$sub_port
-sub_domain=$sub_domain
-sub_https=$use_https
-EOF
+    # 保存订阅配置（安全写入，权限 0600，禁止 source 执行）
+    _write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$use_https"
     
     # 添加域名到 hosts（解决部分 VPS 环境下的本地回环问题）
     if [[ -n "$sub_domain" ]]; then
@@ -21844,13 +22181,9 @@ _sync_tunnel_config() {
         fi
     fi
     
-    # 3. 如果需要，重启 xray
+    # 3. 如果需要，通过本项目服务边界重启 Xray（禁止使用裸 pkill 误伤共享实例）
     if [[ "$need_restart" == "true" ]]; then
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-service xray restart 2>/dev/null || pkill -HUP xray 2>/dev/null
-        else
-            systemctl restart xray 2>/dev/null || pkill -HUP xray 2>/dev/null
-        fi
+        svc restart vless-reality 2>/dev/null || true
     fi
     
     return 0
@@ -22463,12 +22796,8 @@ EOF
                 sed -i 's/"Host": *"[^"]*"/"Host": ""/g' "$CFG/config.json"
             fi
             
-            # 重启 xray 使配置生效
-            if [[ "$DISTRO" == "alpine" ]]; then
-                rc-service xray restart 2>/dev/null || pkill -HUP xray 2>/dev/null
-            else
-                systemctl restart xray 2>/dev/null || pkill -HUP xray 2>/dev/null
-            fi
+            # 通过本项目服务边界重启 xray 使配置生效（禁止裸 pkill 误伤共享实例）
+            svc restart vless-reality 2>/dev/null || true
             _ok "xray 配置已更新"
         fi
     fi
@@ -23285,23 +23614,32 @@ _select_protocol_for_users() {
     local protocols=$(db_get_all_protocols)
     [[ -z "$protocols" ]] && { _err "没有已安装的协议"; return 1; }
     
+    local i=1
+    local proto_array=()
+    local proto
+    while IFS= read -r proto; do
+        [[ -z "$proto" ]] && continue
+        supports_per_user_management "$proto" || continue
+        local core="xray"
+        db_exists "singbox" "$proto" && core="singbox"
+        proto_array+=("$core:$proto")
+    done <<< "$protocols"
+    [[ ${#proto_array[@]} -gt 0 ]] || { _err "没有支持逐用户管理的已安装协议"; return 1; }
+
     echo ""
     _line
     echo -e "  ${W}选择协议${NC}"
     _line
     
-    local i=1
-    local proto_array=()
-    while IFS= read -r proto; do
-        [[ -z "$proto" ]] && continue
-        local core="xray"
-        db_exists "singbox" "$proto" && core="singbox"
-        local user_count=$(db_count_users "$core" "$proto")
-        local proto_name=$(get_protocol_name "$proto")
+    local entry core user_count proto_name
+    for entry in "${proto_array[@]}"; do
+        core="${entry%%:*}"
+        proto="${entry#*:}"
+        user_count=$(db_count_users "$core" "$proto")
+        proto_name=$(get_protocol_name "$proto")
         _item "$i" "$proto_name ${D}($user_count 用户)${NC}"
-        proto_array+=("$core:$proto")
         ((i++))
-    done <<< "$protocols"
+    done
     
     _item "0" "返回"
     _line
@@ -23396,18 +23734,22 @@ _show_users_list() {
 
 # 生成用户的分享链接（根据协议类型）
 _gen_user_share_link() {
-    local core="$1" proto="$2" uuid="$3" user_name="$4"
+    local core="$1" proto="$2" uuid="$3" user_name="$4" target_port="${5:-}"
     
     # 获取协议配置
     local cfg=$(db_get "$core" "$proto")
     [[ -z "$cfg" || "$cfg" == "null" ]] && return
     
-    # 检查是否为多端口数组格式
+    # 多端口优先使用用户统计携带的端口，旧调用方未传端口时保持取首实例。
     local is_array=false
     if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
         is_array=true
-        # 多端口：从第一个端口实例获取配置
-        cfg=$(echo "$cfg" | jq '.[0]')
+        if [[ -n "$target_port" ]]; then
+            cfg=$(echo "$cfg" | jq --arg port "$target_port" '[.[] | select((.port | tostring) == $port)][0] // empty')
+        else
+            cfg=$(echo "$cfg" | jq '.[0]')
+        fi
+        [[ -z "$cfg" ]] && return
     fi
     
     # 提取配置字段
@@ -23425,54 +23767,48 @@ _gen_user_share_link() {
     local country_code=$(get_ip_country "$ipv4")
     [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
     
-    # 检测回落协议端口
+    # 检测回落协议端口（仅当主协议 vless-vision/trojan 处于 8443 回落模式时复用主端口）
     local display_port="$port"
     if [[ "$proto" == "vless-ws" || "$proto" == "vmess-ws" ]]; then
-        if db_exists "xray" "vless-vision"; then
-            local vision_cfg=$(db_get "xray" "vless-vision")
-            if echo "$vision_cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                display_port=$(echo "$vision_cfg" | jq -r '.[0].port // empty')
-            else
-                display_port=$(echo "$vision_cfg" | jq -r '.port // empty')
-            fi
-        elif db_exists "xray" "trojan"; then
-            local trojan_cfg=$(db_get "xray" "trojan")
-            if echo "$trojan_cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                display_port=$(echo "$trojan_cfg" | jq -r '.[0].port // empty')
-            else
-                display_port=$(echo "$trojan_cfg" | jq -r '.port // empty')
-            fi
-        elif db_exists "xray" "vless"; then
-            local vless_cfg=$(db_get "xray" "vless")
-            if echo "$vless_cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                display_port=$(echo "$vless_cfg" | jq -r '.[0].port // empty')
-            else
-                display_port=$(echo "$vless_cfg" | jq -r '.port // empty')
-            fi
+        if _has_master_protocol; then
+            display_port=$(_get_master_port "$port")
         fi
         [[ -z "$display_port" ]] && display_port="$port"
     fi
     
     local remark="${country_code}-${user_name}"
+    local server_host="$ipv4"
+    if [[ -z "$server_host" && -n "$ipv6" ]]; then
+        server_host="[$ipv6]"
+    fi
     
-    # 生成 IPv4 链接
-    if [[ -n "$ipv4" ]]; then
+    # 生成链接（优先 IPv4，纯 IPv6 环境回退 [IPv6]）
+    if [[ -n "$server_host" ]]; then
         local link=""
         case "$proto" in
-            vless) link=$(gen_vless_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$remark") ;;
-            vless-xhttp) link=$(gen_vless_xhttp_link "$ipv4" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$remark") ;;
-            vless-vision) link=$(gen_vless_vision_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
-            vless-ws) link=$(gen_vless_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
-            vmess-ws) link=$(gen_vmess_ws_link "$ipv4" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
-            ss2022) link=$(gen_ss2022_link "$ipv4" "$display_port" "$method" "$uuid" "$remark") ;;
-            hy2) link=$(gen_hy2_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
-            trojan) link=$(gen_trojan_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
+            vless) link=$(gen_vless_link "$server_host" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$remark") ;;
+            vless-xhttp) link=$(gen_vless_xhttp_link "$server_host" "$display_port" "$uuid" "$public_key" "$short_id" "$sni" "$path" "$remark") ;;
+            vless-vision) link=$(gen_vless_vision_link "$server_host" "$display_port" "$uuid" "$sni" "$remark") ;;
+            vless-ws) link=$(gen_vless_ws_link "$server_host" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
+            vmess-ws) link=$(gen_vmess_ws_link "$server_host" "$display_port" "$uuid" "$sni" "$path" "$remark") ;;
+            ss2022) link=$(gen_ss2022_link "$server_host" "$display_port" "$method" "$uuid" "$remark") ;;
+            ss-legacy) link=$(gen_ss_legacy_link "$server_host" "$display_port" "$method" "$uuid" "$remark") ;;
+            hy2) link=$(gen_hy2_link "$server_host" "$display_port" "$uuid" "$sni" "$remark") ;;
+            trojan) link=$(gen_trojan_link "$server_host" "$display_port" "$uuid" "$sni" "$remark") ;;
             tuic) 
-                local password=$(echo "$cfg" | jq -r '.password // empty')
-                link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$remark") 
+                local password
+                password=$(echo "$cfg" | jq -r --arg name "$user_name" --arg uuid "$uuid" '
+                    if (.users | type) == "array" then
+                        ([.users[] | select((.name // "") == $name or (.uuid // "") == $uuid)][0] |
+                            (.password // .uuid // empty))
+                    else
+                        .password // empty
+                    end
+                ')
+                link=$(gen_tuic_link "$server_host" "$display_port" "$uuid" "$password" "$sni" "$remark") 
                 ;;
-            anytls) link=$(gen_anytls_link "$ipv4" "$display_port" "$uuid" "$sni" "$remark") ;;
-            socks) link=$(gen_socks_link "$ipv4" "$display_port" "$user_name" "$uuid" "$remark") ;;
+            anytls) link=$(gen_anytls_link "$server_host" "$display_port" "$uuid" "$sni" "$remark") ;;
+            socks) link=$(gen_socks_link "$server_host" "$display_port" "$user_name" "$uuid" "$remark") ;;
         esac
         [[ -n "$link" ]] && echo "$link"
     fi
@@ -23499,12 +23835,18 @@ _show_user_share_links() {
         # 显示用户列表
         local users=()
         local uuids=()
+        local ports=()
         local idx=1
         
-        while IFS='|' read -r name uuid used quota enabled port routing; do
-            [[ -z "$name" ]] && continue
+        local today
+        today=$(date '+%Y-%m-%d')
+        while IFS='|' read -r name uuid used quota enabled port routing expire_date; do
+            [[ -z "$name" || -z "$uuid" ]] && continue
+            [[ "$enabled" == "false" ]] && continue
+            [[ -n "$expire_date" && "$expire_date" < "$today" ]] && continue
             users+=("$name")
             uuids+=("$uuid")
+            ports+=("$port")
             echo -e "  ${G}$idx${NC}) $name"
             ((idx++))
         done <<< "$stats"
@@ -23529,8 +23871,9 @@ _show_user_share_links() {
             for i in "${!users[@]}"; do
                 local user="${users[$i]}"
                 local uuid="${uuids[$i]}"
+                local port="${ports[$i]}"
                 echo -e "  ${Y}$user:${NC}"
-                local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user")
+                local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user" "$port")
                 [[ -n "$link" ]] && echo -e "  ${C}$link${NC}"
                 echo ""
             done
@@ -23541,13 +23884,14 @@ _show_user_share_links() {
             # 显示单个用户链接
             local user="${users[$((choice-1))]}"
             local uuid="${uuids[$((choice-1))]}"
+            local port="${ports[$((choice-1))]}"
             
             echo ""
             _dline
             echo -e "  ${W}$user 分享链接${NC}"
             _dline
             
-            local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user")
+            local link=$(_gen_user_share_link "$core" "$proto" "$uuid" "$user" "$port")
             if [[ -n "$link" ]]; then
                 echo -e "  ${C}$link${NC}"
                 echo ""
@@ -23647,7 +23991,7 @@ _select_user_routing() {
                     _warn "WARP 未安装"
                     read -rp "  是否现在安装 WARP? [Y/n]: " install_warp
                     if [[ ! "$install_warp" =~ ^[nN]$ ]]; then
-                        install_warp_go
+                        register_warp && db_set_warp_mode "wgcf"
                         if ! warp_status &>/dev/null; then
                             _err "WARP 安装失败，请稍后重试"
                             return 1
@@ -23766,7 +24110,7 @@ _add_user() {
     # 生成 UUID/密码
     local uuid
     case "$proto" in
-        vless|vless-xhttp|vless-ws|vless-vision|tuic)
+        vless|vless-xhttp|vless-ws|vless-vision|vmess-ws|tuic)
             uuid=$(gen_uuid)
             ;;
         ss2022)
@@ -24872,21 +25216,33 @@ do_update() {
     # 备份当前脚本
     cp "$script_path" "${script_path}.bak" 2>/dev/null
 
-    # 替换当前运行的脚本
+    # 替换当前运行的脚本（生产模式启动新进程执行 --apply-configs，避免旧内存函数重渲染）
     if mv "$tmp_file" "$script_path" && chmod +x "$script_path"; then
         if [[ "$script_path" != "$system_script" && -f "$system_script" ]]; then
-            cp -f "$script_path" "$system_script" 2>/dev/null
-            chmod +x "$system_script" 2>/dev/null
-            _info "已同步更新系统目录脚本"
+            local sys_tmp
+            sys_tmp=$(mktemp "${system_script}.tmp.XXXXXX" 2>/dev/null) || sys_tmp=""
+            if [[ -n "$sys_tmp" ]] && cp -f "$script_path" "$sys_tmp" 2>/dev/null && chmod +x "$sys_tmp" 2>/dev/null && mv -f "$sys_tmp" "$system_script" 2>/dev/null; then
+                _info "已同步更新系统目录脚本"
+            else
+                [[ -n "$sys_tmp" ]] && rm -f "$sys_tmp" 2>/dev/null
+            fi
         fi
 
         _ok "已更新到最新 master 制品"
         _info "正在自动重新生成配置并重启服务以使新制品生效..."
 
         local apply_failed=0
-        init_db 2>/dev/null || apply_failed=1
-        rebuild_and_reload_xray "silent" 2>/dev/null || apply_failed=1
-        rebuild_and_reload_singbox "silent" 2>/dev/null || apply_failed=1
+        if [[ "${VLESS_SOURCE_ONLY:-0}" == "1" ]]; then
+            # 隔离测试模式沿用原有同进程 helper 合同
+            init_db 2>/dev/null || apply_failed=1
+            rebuild_and_reload_xray "silent" 2>/dev/null || apply_failed=1
+            rebuild_and_reload_singbox "silent" 2>/dev/null || apply_failed=1
+        else
+            # 生产模式：在新进程中加载刚替换的新脚本执行配置重建与服务重载
+            if ! "$script_path" --apply-configs 2>/dev/null; then
+                apply_failed=1
+            fi
+        fi
 
         echo ""
         if [[ "$apply_failed" -ne 0 ]]; then
@@ -24927,9 +25283,9 @@ main_menu() {
 
     # 进入菜单本身必须是只读导航；Tunnel 配置同步只在用户明确的协议变更路径执行。
 
-    # 已安装环境若检测到滚动 master 制品变化，则主动引导更新（默认 Yes）。
-    # 全新安装不打扰；用户输 n 可跳过进入菜单。
-    if get_installed_protocols >/dev/null 2>&1; then
+    # 已安装环境若检测到滚动 master 制品变化，则主动引导更新。
+    # 全新安装（已安装协议列表为空）不打扰；用户输 n 可跳过进入菜单。
+    if [[ -n "$(get_installed_protocols 2>/dev/null)" ]]; then
         _get_latest_script_hash "false" "true" >/dev/null 2>&1 || true
         if _has_script_update; then
             echo ""
@@ -24937,7 +25293,7 @@ main_menu() {
             read -rp "  是否立即更新并尝试自动生效? [y/N]: " _upg_confirm
             if [[ "$_upg_confirm" =~ ^[yY]$ ]]; then
                 do_update
-                exit 0
+                exit $?
             fi
             echo -e "  ${D}跳过本次更新，进入菜单${NC}"
         fi
@@ -25068,6 +25424,18 @@ fi
 
 # 命令行参数处理
 case "${1:-}" in
+    --apply-configs)
+        # 非交互重建并重载所有已安装引擎配置（供 do_update 新进程调用）
+        init_db || exit 1
+        _apply_rc=0
+        if [[ -n "$(get_xray_protocols 2>/dev/null)" ]]; then
+            rebuild_and_reload_xray "silent" || _apply_rc=1
+        fi
+        if [[ -n "$(get_singbox_protocols 2>/dev/null)" ]]; then
+            rebuild_and_reload_singbox "silent" || _apply_rc=1
+        fi
+        exit "$_apply_rc"
+        ;;
     --sync-traffic)
         # 静默模式：用于定时任务
         init_db

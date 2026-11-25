@@ -1,6 +1,8 @@
 # vless-aio-hardened 使用手册
 
-> 适用安装器：本仓 `master` 分支中的 `vless-server.sh`
+> 当前 H15 产品：`3.4.10-h15`，SHA-256 `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`（基于 H14-rc.1 `6ea18a9e5af7ca2802ee6982d478d042ffcbcd4108b3a978c26e50aaf77eaa34` 安全加固）。
+>
+> 请使用已核验本地包或本仓 tag 制品；无参启动会初始化/迁移 DB 并同步系统脚本，旧版必须先备份；仅 `--help` 与 `--apply-configs` 按其明确契约执行。新版变更及部署/升级见 [RELEASE-H15.md](./RELEASE-H15.md)、[CHANGELOG.md](./CHANGELOG.md)。
 
 ## 目录
 
@@ -14,11 +16,11 @@
 8. [命令行与常见操作](#8-命令行与常见操作)
 9. [验证与排障](#9-验证与排障)
 10. [更新与卸载边界](#10-更新与卸载边界)
-11. [H13 验收基线](#11-h13-验收基线)
+11. [H15 验收基线](#11-h15-验收基线)
 
 ## 1. 项目与支持范围
 
-`vless-aio-hardened` 是上游 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。`3.4.10` 仅说明上游基线；本仓交付以 `master` 当前制品为准。
+`vless-aio-hardened` 是上游 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。`3.4.10` 仅说明上游基线；本次交付以本手册顶部 H15 SHA 和随包校验清单为准，不将未更新的在线滚动分支当作相同字节。
 
 脚本按实际运行核心管理协议：
 
@@ -35,7 +37,7 @@
 - AnyTLS 的实际入站由 sing-box 生成，支持多用户、多端口、到期/禁用过滤、用户分享链接及真实证书。
 - 菜单更新替换脚本后会尝试重新生成 Xray / sing-box 配置并重载服务；任一自动应用步骤失败时，新脚本与备份会保留、更新流程返回非零并要求人工核对/重建。无论返回值如何，操作后仍须人工验证。
 - 生成 Xray 配置前会先建立日志目录，创建失败立即停止；测试日志根路径必须是绝对路径。
-- Xray 用户增删只走数据库驱动的完整重建；NAT 清理只删除数据库精确归属且已启用的 v4/v6 端口跳跃规则；卸载不按裸进程名终止共享实例；HY2/TUIC 证书只在协议最后一个端口删除后清理；主菜单不隐式同步 Tunnel。
+- Xray 用户增删只走数据库驱动的完整重建；NAT 清理只删除数据库精确归属且已启用的 v4/v6 端口跳跃规则；卸载不按裸进程名终止共享实例；Hysteria2/TUIC 证书只在协议最后一个端口删除后清理；主菜单不隐式同步 Tunnel。
 - 通过通用 `_install_binary` 路径下载核心时，先检查 URL 是否仍含未替换的变量占位符，避免把模板错误伪装成网络 404；其它自定义下载路径不受此守卫覆盖。
 
 “单文件脚本”不表示离线安装：安装过程会先安装通用系统依赖，再按所选协议下载相应核心或组件。
@@ -49,33 +51,24 @@
 5. **纯 IPv6 判定**：依赖检查前若脚本无法 ping 通 `8.8.8.8`，会按纯 IPv6 环境处理：首次备份 `/etc/resolv.conf` 为 `/etc/resolv.conf.bak`，然后写入 DNS64 解析器。若环境只是禁用了 ICMP，应先审查这一行为。
 6. **证书**：脚本内置的 ACME 申请流程需要相应公网连通条件，常见 HTTP-01 场景要求 80 端口可达。不能满足时，不要把域名存在等同于证书已签发。
 7. **可选节点导入**：`_import_alice_nodes()` 中的 `<SET-ME-*>` 是环境占位符，普通安装不依赖它。占位符未配置时函数会在任何数据库修改前退出；如要启用该预设，仍须先审查并配置节点地址与凭据。
-8. **迁移边界**：本仓没有独立的旧版 AnyTLS 迁移脚本。迁移旧部署时以 `db.json` 备份和当前菜单功能为准，不要照抄不存在文件的命令。
+8. **旧版 AnyTLS 迁移**：本仓提供独立迁移脚本 `migrate-anytls-singbox.sh`（支持 `--dry-run`、多端口数组无损合并、端口冲突 fail-closed、`0600` 备份与 `--apply-configs` 自动应用）。执行前仍须先备份 `db.json` 与 `/etc/vless-reality/`。
 
 ## 3. 安装与升级
 
 ### 3.1 全新安装
 
-简易安装：
+将本次完整校验包传入目标主机，在包目录执行：
 
 ```bash
-wget -O vless-server.sh https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh
-chmod +x vless-server.sh
-sudo ./vless-server.sh
-```
-
-需要完整性校验时，同时下载完整发行包：
-
-```bash
-base=https://raw.githubusercontent.com/offzen/vless-aio-hardened/master
-for file in vless-server.sh README.md USAGE.md FIXES.md SHA256SUMS PROVENANCE.json; do
-  wget -O "$file" "$base/$file"
-done
 sha256sum -c SHA256SUMS
+printf '%s  %s\n' \
+  f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a \
+  vless-server.sh | sha256sum -c -
 chmod +x vless-server.sh
 sudo ./vless-server.sh
 ```
 
-`master` 是滚动分支；可复现留档应同时保存下载时的仓库 commit ID、全部六个文件和校验结果。
+制品必须来自已核验的 H15 代码 commit、`v3.4.10-h15` tag 或本地交付包；使用滚动 `master` 下载时务必按上面命令核对 SHA-256。包文件清单见 [RELEASE-H15.md](./RELEASE-H15.md)。
 
 无参数运行当前文件进入主菜单时，脚本会尝试把它复制到 `/usr/local/bin/vless-server.sh`，并创建 `/usr/local/bin/vless` 与 `/usr/bin/vless` 软链接；首次协议安装成功后也会再次确保快捷命令存在。只运行 `--help` 等 CLI 分支不会触发这一步。进入菜单后选择 `1 安装协议`；成功后可运行：
 
@@ -84,9 +77,11 @@ sudo vless
 sudo /usr/local/bin/vless-server.sh --help
 ```
 
-### 3.2 已有部署：菜单更新
+### 3.2 已有部署：菜单更新的历史行为
 
-旧的编号版本必须先按 3.3 节手动替换；它仍使用 release/tag 版本号判断，无法自动发现不带版本号的滚动 `master` 制品。完成首次迁移后，后续才可使用本节菜单更新。
+**此节说明现有更新器。** 菜单 12 固定公开滚动 `master`；H15 晋升到该源后，更新器取得的即为本修订，但仍须按上文核对 SHA-256。需要最可控的路径时按 3.3 节手工替换。
+
+旧编号版本仍可能按 release/tag 版本号判断，首次迁移需要手工替换；已经采用滚动模式的安装，其更新器行为如下：
 
 1. 在启动新脚本前备份 `/etc/vless-reality/`；已有 CF Tunnel 时同时备份 `/etc/cloudflared/`。无参数启动会在任何菜单选择和更新询问前初始化/迁移数据库并同步系统脚本；仅进入菜单不会自动同步 Tunnel、改写 Xray/cloudflared 配置或重启/HUP相关服务。不能先启动再补备份。
 2. 运行 `sudo vless`，选择 `12 检查脚本更新`。
@@ -96,7 +91,7 @@ sudo /usr/local/bin/vless-server.sh --help
 
 ### 3.3 已有部署：手动替换
 
-这是旧编号版本迁移到滚动 `master` 的必经路径。重新执行 3.1 的完整发行包下载、校验和无参数启动命令。进入主菜单时脚本会尝试创建或同步 `/usr/local/bin/vless-server.sh` 及快捷方式，但不会因此重建既有派生配置。随后选择 `14 重建全部配置`，并执行第 9 节验证：菜单 14 会依次尝试生成配置和重启服务，但内部失败不会形成可靠的最终失败状态。
+H15 可使用手工替换路径：启动前备份现役脚本和配置目录，再按 3.1 校验本地交付包；替换方法见 [RELEASE-H15.md](./RELEASE-H15.md) 第 4 节。进入主菜单时脚本会尝试创建或同步 `/usr/local/bin/vless-server.sh` 及快捷方式，但不会因此重建既有派生配置。随后选择 `14 重建全部配置`，并执行第 9 节验证：菜单 14 会依次尝试生成配置和重启服务，但内部失败不会形成可靠的最终失败状态。
 
 ## 4. 配置文件架构
 
@@ -172,16 +167,18 @@ sudo /usr/local/bin/vless-server.sh --help
 主菜单 `4 用户管理` 提供查看、添加、删除、配额、流量重置、启用/禁用、到期、用户路由、分享链接、流量同步与通知等操作，但当前存在以下硬边界：
 
 - Xray 用户添加/删除只更新 `db.json` 后执行一次完整配置重建，不再运行会覆盖全部 VLESS inbound 并强制 Vision flow 的二次补丁。操作后仍须检查重建返回值、目标用户与其它协议的 inbound。
-- SOCKS5、Shadowsocks（SS2022 与传统版）和独立服务协议不支持这套有效的多用户添加：前两者当前生成器仍读取顶层凭据，独立服务协议不使用该用户模型。
+- 当前 manifest 的 11 个逐用户 supported identifier 是：`vless`、`vless-xhttp`、`vless-ws`、`vmess-ws`、`vless-vision`、`trojan`、`socks`、`ss-legacy`、`Hysteria2`、`tuic`、`anytls`。每项均完成 DB→菜单/URI→配置凭据及多端口隔离的动态合同。逐用户管理支持不代表具备自动流量计量。
+- 传统 Shadowsocks 的显式 DB `users` 表映射到 Xray `settings.clients`，只纳入启用且未过期用户。显式空表或零有效用户不生成该 inbound，不回退顶层密码；完全没有 `users` 字段的旧安装才保持单密码。字段必须是 `clients`，`settings.users` 会被静默忽略。
+- `vless-xhttp-cdn`、`vless-ws-notls`、`trojan-ws`、`ss2022` 拒绝逐用户管理：selector 隐藏，`db_add_user` 写前拒绝且 DB 不变；不影响既有单用户安装/运行。独立服务 identifier 也不纳入此多用户模型。
 - sing-box 用户管理走全量重建，但其用户级路由只支持 `direct`、`warp` 和 `chain`；菜单即使显示 `balancer`，也不会生成相应规则。
-- TUIC 新增用户的菜单分享链接会使用错误的顶层密码；修复前不要直接使用该子用户链接，当前服务端为新增用户使用其自身 UUID 作为 password。
+- TUIC 用户级 URI 已读取匹配用户的 `password` 或 `uuid`，不再错用顶层密码；当前新增用户默认使用自身 UUID 作为 password，显式用户密码按实际用户配置核对。
 
 重要边界：
 
 - 具有 email 标识客户端的 VLESS / VMess / Trojan 可使用 Xray Stats API 做按用户流量统计；SOCKS5 与 Shadowsocks 不在这套按用户计量/配额执行范围内。**只有流量同步实际执行成功时**才会累计数据库用量并在达到配额后禁用用户。添加用户时设置非零配额会尝试安装同步 cron；之后修改已有用户配额不会自动安装，因此仍须在 `4 → 9` 核对或启用 cron 与同步。
 - 当前脚本安装的官方 sing-box 二进制没有 per-user V2Ray API 统计能力，因此 Hysteria2、AnyTLS、TUIC **不能按用户自动计量流量，也不能因流量配额自动封禁**。数据库可以保存配额值，但它不是已生效的计量收据。
 - sing-box 用户的到期日期和启用/禁用状态只在配置生成时过滤；在菜单中修改到期日期后，需用菜单 14 重建（到期检查任务在真正过期后也会禁用并重建）。到期日当天仍有效，脚本从次日才判定过期，并在下一次检查（默认 03:00）禁用。这与流量配额是两套不同机制。
-- 多端口协议会为各端口生成独立 inbound；添加用户只写入首个端口实例。VLESS 按端口读取用户；VMess / Trojan 会合并所有端口的用户并把全集写入每个 inbound，因此首端口中的用户会在该协议所有端口有效。异常时先检查 `db.json` 的数组结构，再使用菜单 14 重建。
+- 多端口协议会为各端口生成独立 inbound；添加用户的旧入口仍写入首个端口实例，不代表已提供任意端口选择 UI。当前 VMess/Trojan 等生成器按目标端口过滤，supported 动态合同证明第二端口只保留本端口有效凭据，用户 URI 按明确端口匹配。异常时先检查 `db.json` 数组结构，再使用菜单 14 重建并逐端口验收。
 
 ## 7. AnyTLS 与证书
 
@@ -300,18 +297,16 @@ sing-box check -c /etc/vless-reality/singbox.json
 
 “完全卸载”并不等于删除所有证书、核心二进制或主机级副作用。执行前备份配置、root crontab、iptables/ip6tables、相关 sysctl 与共享服务状态；如需连证书和整个配置目录一并删除，必须按脚本最后显示的命令另行操作。
 
-## 11. H13 验收基线
+## 11. H15 验收基线
 
-H13 交付制品 `vless-server.sh` 的冻结 SHA-256 为 `33c953bde77f587cb6601751ea404f92b134be0cc663c2e765685393225dfa88`，大小 982,535 bytes。该精确制品已通过：
+H15 产品 SHA-256 为 `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`（握手 `3.4.10-h15`），相对 H14-rc.1（`6ea18a9e…eaa34`）完成审计 P0/P1/关键 P2 全部修复，审计与整改见 [docs/AUDIT-H14-RC1.md](./docs/AUDIT-H14-RC1.md)、[docs/REMEDIATION-AND-ARCHITECTURE.md](./docs/REMEDIATION-AND-ARCHITECTURE.md)。
 
-- `bash -n`、ShellCheck error 级、diff/JSON/checksum 和 h12→h13 VERSION 单调抬升门禁；
-- 16 个命名离线回归脚本、Xray 日志路径 mutation 4/4、候选身份 fail-closed 4/4；
-- updater 集成 97/97，覆盖 init/Xray/sing-box 单项或组合应用失败时的非零返回与备份保留；
-- Docker bookworm 隔离生命周期 E2E 9/9，使用真实 Xray 26.3.27 客户端—服务端—HTTP 数据面，并确认测试容器/镜像零遗留；
-- 固定 sing-box 1.13.0 的原生配置 `check`（rc=0）及私有网络命名空间 AnyTLS→SOCKS→HTTP 数据面。
+CI 入口为 `bash tests/run-ci.sh <mode>`，模式：`syntax`、`static`（ShellCheck error 级）、`unit`（`--awk-bin mawk|gawk` 各一遍，含 mutation 与 identity）、`xray-e2e`、`auth-e2e`、`singbox-e2e`（固定 Xray 26.3.27 / sing-box 1.14.4）、`stateful-upgrade`（H14 → H15 真实制品升级）、`webroot-e2e`、`installer-e2e`（Docker 9 组生命周期，无网络、TEST-NET 靶机，同时断言回环仍被阻断）。工作流使用完整历史检出（`fetch-depth: 0`），否则 `stateful-upgrade` 会因找不到 H14 基线而失败。
 
-这些是发布前验收证据，不替代目标主机的备份、配置检查、服务状态与真实客户端连接验证。任何 `vless-server.sh` 或绑定测试脚本字节变化都会使对应收据失效，必须重跑相关门禁。
+边界：CI Web 只覆盖函数/HTTP/service spy；Docker 为私有 leaf pin，不证明公网 CA、强沙箱或自动回滚；干净 Debian/systemd 与 Alpine/OpenRC 的真实 init 全生命周期未自动化；sing-box 协议、`ss-legacy`、SOCKS5 无逐用户流量计量。
 
-私有 manifest、分层测试计划与测试收据不随包分发；六文件发布包包含 `vless-server.sh`、三份脱敏文档、`SHA256SUMS` 与 `PROVENANCE.json`，不携带内部测试环境与证据路径。实际复跑需另行取得与候选 SHA 匹配的测试源码和计划。
+发布元数据（`SHA256SUMS`、`PROVENANCE.json`、`ci.yml` 中的产品 SHA）在任何文件变更后用 `bash scripts/refresh-manifest.sh` 一键重算；仅文档变更不要求重复已绿的产品门禁。
+
+安装只需要 `vless-server.sh` 与校验文件；`tests/` 与 `.github/` 属于仓库自身的测试与 CI 基础设施，不参与安装，也不随发行制品提供。
 
 本仓为第三方补丁副本，版权与主要设计归原项目作者；请遵守适用许可与当地法律法规，仅用于合法用途。
