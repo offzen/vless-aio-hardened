@@ -1,3 +1,11 @@
+# FIXES — H17
+
+产品 SHA-256：`f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`（兼容握手：`3.4.10-h17`）。针对第二轮外部审计 16 项缺陷、`034c2853` 复审全部 13 项功能边界（R01–R13）与双核心更新测试缺口（T01），以及 `718c53f`/`ffdc318` 复核新增并发与边角缺陷（N0–N9、D1–D4）的整改摘要见 [CHANGELOG.md](./CHANGELOG.md) 与 [RELEASE-H17.md](./RELEASE-H17.md)：同核心配置生成与重载改为 `.reload-apply.<core>.lock` 整段串行并经 `db.lock` 围栏取快照，闭合旧批次覆盖新配置与 `pre-arm` 误清竞态并清理死代码；旧单用户迁移与统计按协议对齐生效凭据优先级（密码型协议优先顶层 `password` 且 `anytls` 同步落盘 `password`）；AnyTLS 迁移器持久化阶段状态并在冲突/重启失败时恢复旧服务与保留状态继承运行态，续接以 DB 当前端口为准、`--dry-run` 允许预览、`port_listening` 消除 `pipefail` SIGPIPE；区分 WARP 官方客户端归属、以 `dpkg-query` 精准校验卸载结果（避免 `rc` 态误判）并由 `do_uninstall` 统一复用 `uninstall_warp_official`；流量入账完整保留当前未清批次全部 ID 并传播失败退出码；按端口卸载、独立协议安装与沿用 UUID 的订阅重配置均事务化；统一 HY2 双字段凭据、TUIC/HY2/AnyTLS 证书对校验与 `db_validate` 严格对象类型检查。
+
+# FIXES — H16
+
+产品 SHA-256：`7645d99e0b935c31c2462ae3328d0d806c77efe7ee35909f347b9aed97decc16`（兼容握手：`3.4.10-h16`）。针对外部审计 13 项发现的整改摘要见 [CHANGELOG.md](./CHANGELOG.md) 与 [RELEASE-H16.md](./RELEASE-H16.md)。
+
 # FIXES — H15-rc.1
 
 产品 SHA-256：`f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`（兼容握手：`3.4.10-h15`）。

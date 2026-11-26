@@ -163,9 +163,8 @@ get_sub_uuid() { cat "$CFG/sub_uuid"; }
 is_internal_port_occupied() { return 1; }
 get_ipv4() { printf '%s\n' '127.0.0.1'; }
 generate_sub_files() {
-    local sub_uuid sub_dir
-    sub_uuid=$(get_sub_uuid)
-    sub_dir="$CFG/subscription/$sub_uuid"
+    local sub_uuid="${1:-$(get_sub_uuid)}"
+    local sub_dir="${2:-$CFG/subscription/$sub_uuid}"
     mkdir -p "$sub_dir"
     printf '%s\n' 'isolated-v2ray' > "$sub_dir/base64"
     printf '%s\n' 'proxies: []' > "$sub_dir/clash.yaml"

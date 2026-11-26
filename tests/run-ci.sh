@@ -231,9 +231,9 @@ run_installer_e2e() {
         rm -f -- "$receipt"
         fail "installer lifecycle E2E failed"
     fi
-    if ! grep -Fq 'PASS: 9 lifecycle groups;' "$receipt" || grep -Fq 'SKIP' "$receipt"; then
+    if ! grep -Fq 'PASS: 10 lifecycle groups;' "$receipt" || grep -Fq 'SKIP' "$receipt"; then
         rm -f -- "$receipt"
-        fail "installer lifecycle 9/9 completion marker missing or skipped"
+        fail "installer lifecycle 10/10 completion marker missing or skipped"
     fi
     rm -f -- "$receipt"
     echo "PASS: required installer lifecycle gate completed without skip"

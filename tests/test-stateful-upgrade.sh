@@ -39,7 +39,7 @@ H13="$BASE_SCRIPT"
 CANDIDATE_SHA=$(sha256sum "$CANDIDATE" | awk '{print $1}')
 [[ "$CANDIDATE_SHA" != "$BASE_EXPECTED_SHA" ]] || { echo "FAIL: candidate unexpectedly equals $BASE_LABEL" >&2; exit 1; }
 CANDIDATE_VERSION=$(sed -n 's/^readonly VERSION="\([^"]*\)"/\1/p' "$CANDIDATE" | head -n1)
-[[ "$CANDIDATE_VERSION" =~ -h1[45]$ ]] || { echo "FAIL: expected H14/H15 candidate, got $CANDIDATE_VERSION" >&2; exit 1; }
+[[ "$CANDIDATE_VERSION" =~ -h1[4567]$ ]] || { echo "FAIL: expected H14/H15/H16/H17 candidate, got $CANDIDATE_VERSION" >&2; exit 1; }
 
 pass=0
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }

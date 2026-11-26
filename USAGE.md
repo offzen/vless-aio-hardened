@@ -1,8 +1,8 @@
 # vless-aio-hardened 使用手册
 
-> 当前 H15 产品：`3.4.10-h15`，SHA-256 `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`（基于 H14-rc.1 `6ea18a9e5af7ca2802ee6982d478d042ffcbcd4108b3a978c26e50aaf77eaa34` 安全加固）。
+> 当前 H17 产品：`3.4.10-h17`，SHA-256 `f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`（公开仓上一正式版 H15：`f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`；内部审计基线 H16：`7645d99e0b935c31c2462ae3328d0d806c77efe7ee35909f347b9aed97decc16`；源自 H14-rc.1 `6ea18a9e5af7ca2802ee6982d478d042ffcbcd4108b3a978c26e50aaf77eaa34` 安全加固）。
 >
-> 请使用已核验本地包或本仓 tag 制品；无参启动会初始化/迁移 DB 并同步系统脚本，旧版必须先备份；仅 `--help` 与 `--apply-configs` 按其明确契约执行。新版变更及部署/升级见 [RELEASE-H15.md](./RELEASE-H15.md)、[CHANGELOG.md](./CHANGELOG.md)。
+> 请使用已核验本地包或本仓 tag 制品；无参启动会初始化/迁移 DB 并同步系统脚本，旧版必须先备份；仅 `--help` 与 `--apply-configs` 按其明确契约执行。新版变更及部署/升级见 [RELEASE-H17.md](./RELEASE-H17.md)、[RELEASE-H16.md](./RELEASE-H16.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 目录
 
@@ -16,11 +16,11 @@
 8. [命令行与常见操作](#8-命令行与常见操作)
 9. [验证与排障](#9-验证与排障)
 10. [更新与卸载边界](#10-更新与卸载边界)
-11. [H15 验收基线](#11-h15-验收基线)
+11. [H17 验收基线](#11-h17-验收基线)
 
 ## 1. 项目与支持范围
 
-`vless-aio-hardened` 是上游 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。`3.4.10` 仅说明上游基线；本次交付以本手册顶部 H15 SHA 和随包校验清单为准，不将未更新的在线滚动分支当作相同字节。
+`vless-aio-hardened` 是上游 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。`3.4.10` 仅说明上游基线；本次交付以本手册顶部 H17 SHA 和随包校验清单为准，不将未更新的在线滚动分支当作相同字节。
 
 脚本按实际运行核心管理协议：
 
@@ -62,13 +62,13 @@
 ```bash
 sha256sum -c SHA256SUMS
 printf '%s  %s\n' \
-  f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a \
+  f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548 \
   vless-server.sh | sha256sum -c -
 chmod +x vless-server.sh
 sudo ./vless-server.sh
 ```
 
-制品必须来自已核验的 H15 代码 commit、`v3.4.10-h15` tag 或本地交付包；使用滚动 `master` 下载时务必按上面命令核对 SHA-256。包文件清单见 [RELEASE-H15.md](./RELEASE-H15.md)。
+制品必须来自已核验的 H17 代码 commit、`v3.4.10-h17` tag 或本地交付包；使用滚动 `master` 下载时务必按上面命令核对 SHA-256。包文件清单见 `SHA256SUMS` 与 [RELEASE-H17.md](./RELEASE-H17.md)。
 
 无参数运行当前文件进入主菜单时，脚本会尝试把它复制到 `/usr/local/bin/vless-server.sh`，并创建 `/usr/local/bin/vless` 与 `/usr/bin/vless` 软链接；首次协议安装成功后也会再次确保快捷命令存在。只运行 `--help` 等 CLI 分支不会触发这一步。进入菜单后选择 `1 安装协议`；成功后可运行：
 
@@ -79,19 +79,19 @@ sudo /usr/local/bin/vless-server.sh --help
 
 ### 3.2 已有部署：菜单更新的历史行为
 
-**此节说明现有更新器。** 菜单 12 固定公开滚动 `master`；H15 晋升到该源后，更新器取得的即为本修订，但仍须按上文核对 SHA-256。需要最可控的路径时按 3.3 节手工替换。
+**此节说明现有更新器。** 菜单 12 固定公开滚动 `master`；H17 晋升到该源后，更新器取得的即为本修订，并自动与远端 `SHA256SUMS` 交叉核对，但仍须按上文备份并核对。需要最可控的路径时按 3.3 节手工替换。
 
 旧编号版本仍可能按 release/tag 版本号判断，首次迁移需要手工替换；已经采用滚动模式的安装，其更新器行为如下：
 
 1. 在启动新脚本前备份 `/etc/vless-reality/`；已有 CF Tunnel 时同时备份 `/etc/cloudflared/`。无参数启动会在任何菜单选择和更新询问前初始化/迁移数据库并同步系统脚本；仅进入菜单不会自动同步 Tunnel、改写 Xray/cloudflared 配置或重启/HUP相关服务。不能先启动再补备份。
 2. 运行 `sudo vless`，选择 `12 检查脚本更新`。
-3. 脚本下载远程 `master` 制品并比较 SHA-256；字节不同时才询问更新。release 和 tag 不参与判断。
-4. 替换前检查下载内容的 Bash shebang 与语法，并尝试写入同路径 `.bak` 备份；替换成功后会尝试重建、重载 Xray 与 sing-box。
-5. 三个自动应用步骤会全部尝试；任一步骤失败时流程返回非零，但已验证的新脚本不会回滚，`.bak` 备份仍保留。即使界面显示更新完成，也必须执行第 9 节的配置、服务与连接验证。
+3. 脚本下载远程 `master` 制品并与 `SHA256SUMS` 核对；版本不低于本地且字节不同时才询问更新。
+4. 替换前检查下载内容的 Bash shebang 与语法，先在同目录生成并逐字节核对 `.bak` 备份（备份失败即中止，不替换现役脚本）；替换成功后通过新进程执行 `--apply-configs` 重建并重载 Xray 与 sing-box。
+5. 自动应用失败时流程返回非零并明确提示，已验证的新脚本与 `.bak` 备份均保留。无论是否报错，更新后仍建议执行第 9 节的配置、服务与连接验证。
 
 ### 3.3 已有部署：手动替换
 
-H15 可使用手工替换路径：启动前备份现役脚本和配置目录，再按 3.1 校验本地交付包；替换方法见 [RELEASE-H15.md](./RELEASE-H15.md) 第 4 节。进入主菜单时脚本会尝试创建或同步 `/usr/local/bin/vless-server.sh` 及快捷方式，但不会因此重建既有派生配置。随后选择 `14 重建全部配置`，并执行第 9 节验证：菜单 14 会依次尝试生成配置和重启服务，但内部失败不会形成可靠的最终失败状态。
+H17 可使用手工替换路径：启动前备份现役脚本和配置目录，再按 3.1 校验本地交付包；替换 `/usr/local/bin/vless-server.sh` 后执行 `sudo /usr/local/bin/vless-server.sh --apply-configs` 或进入菜单选择 `14 重建全部配置`，并执行第 9 节验证。菜单 14 会在重载前对各核心配置执行预检（`xray run -test` / `sing-box check`）；任一核心预检失败时保留原配置、不重启该核心并返回非零提示。
 
 ## 4. 配置文件架构
 
@@ -208,12 +208,12 @@ sudo /usr/local/bin/vless-server.sh --check-expire --notify
 sudo /usr/local/bin/vless-server.sh --setup-expire-cron
 ```
 
-- `--sync-traffic` 会查询并重置 Xray API 计数器、把增量写回数据库；达到配额时可能禁用用户、发送通知并重建/重启 Xray。
-- `--check-expire` 会检查并禁用过期用户，且总会尝试发送三日内临期提醒；附加 `--notify` 时还会发送过期禁用通知。
-- `--setup-expire-cron` 必须使用绝对脚本路径调用；不要从相对路径调用，因为任务会原样记录调用时的 `$0`。该分支即使内部失败也最终返回 0，且可能被其它含 `check-expire` 的任务误判为已安装，因此执行后必须核对 root crontab 中的精确命令。
+- `--sync-traffic` 会读出并清零 Xray API 计数器，先把增量追加到 `$CFG/cache/traffic.pending` 日志，再写回数据库；写库失败的增量留在日志里下一轮重试，不会丢失。重启 Xray 前也会先把内存计数落盘（重启会清零计数器）。达到配额时会先持久化待重载标记、禁用用户、发送通知并重建/重启 Xray；重置流量、修改配额或重新启用用户会重新武装配额告警与封禁。Xray 未运行时会主动跳过采集并返回 0；若运行中采集失败、任一用户写库失败或挂起重载仍未成功，均返回非 0。
+- `--check-expire` 会检查并禁用过期用户，且总会尝试发送三日内临期提醒；附加 `--notify` 时还会发送过期禁用通知。写库前先持久化代次待重载标记；若所有 sing-box 协议均无启用用户且已清配置并成功停服，标记会清除并返回 0；若重建、重载或停服失败则保留标记并返回非 0，由下一轮自动重试。
+- `--setup-expire-cron` 与 cron 条目统一指向 `/usr/local/bin/vless-server.sh`（不存在时用当前脚本的绝对真实路径），不会再写入相对路径；已存在但路径或间隔不同的旧条目会被替换。`--setup-expire-cron` 安装失败时返回非 0，执行后仍建议核对 root crontab 中的精确命令。
 - 流量统计 cron 通过菜单 `4 用户管理 → 9 流量统计设置` 管理；脚本**没有**可调用的 `--setup-traffic-cron` 命令行分支。设置配额时的自动安装也可能失败，不能只凭数据库里已有配额值判断限额已生效。
-- 这些 CLI 分支不传播内部失败，最终均返回 0；自动化或 cron 不能以退出码作为成功证据，必须核对日志、数据库、crontab 与服务状态。
-- 流量/到期 cron 的检测、替换和删除只按整行是否包含 `sync-traffic` / `check-expire` 子串匹配，不验证脚本路径或所有权。操作前备份 root crontab，避免无关任务使用这些字符串，并在操作后核对精确命令。
+- 生产 CLI 退出码约定：`--apply-configs`（含 `--ensure-singbox`）、`--sync-traffic`、`--check-expire`、`--setup-expire-cron` 均会在数据库损坏、写库/采集失败或挂起重载未收敛时返回非 0；自动化或 cron 仍建议结合日志、数据库、crontab 与服务状态联合核对。
+- 流量/到期 cron 的检测、替换和删除按完整参数词（`--sync-traffic` / `--check-expire`）匹配，不验证脚本路径或所有权；读取 crontab 失败（非「没有 crontab」）时脚本拒绝改写。操作前仍建议备份 root crontab。
 
 | 操作 | 菜单路径 |
 |---|---|
@@ -285,23 +285,23 @@ sing-box check -c /etc/vless-reality/singbox.json
 菜单 `13 完全卸载` 需要再次确认，主要行为包括：
 
 - 按 `vless-*` 通配符停止/禁用并删除服务文件，不验证文件所有权；管理员自建的同名前缀 unit 必须提前备份或改名。脚本不按裸进程名全局终止 `xray`、`sing-box`、Snell、AnyTLS 或 ShadowTLS，只通过本项目 `vless-*` 服务边界停止；
-- 若项目状态显示 WARP 已 configured/connected，或系统 `PATH` 中存在 `warp-cli`，会断开并卸载 `cloudflare-warp`；脚本不验证它是否由本项目安装，系统共享或既有 WARP 必须先评估；
+- 对 WARP 官方客户端区分「本项目使用（`warp_mode=official`）」与「由本项目安装（`warp_official_owned=true`）」：仅当数据库明确记录软件包由本项目安装时，才会断开、停用 `warp-svc` 并卸载 `cloudflare-warp` 软件包；主机原有复用或历史归属未知的官方客户端均会保留软件包与共享服务，仅清理本项目分流集成与 WGCF 配置；
 - 会按 `vless-*` / `xhttp-cdn*` 文件名模式删除 Nginx 配置，不验证文件所有权；共享 Nginx 不会自动 stop/disable，管理员自建的同名前缀文件必须提前备份或改名；
 - 会按通用服务名停止、禁用并删除活动的 `fake-web.service`，不验证是否由本项目创建；仅 Web placeholder 文件的删除会核对身份和内容，管理员修改过的页面会保留；
 - 存在 `certs/` 时会保留证书目录，并一并保留 `cert_domain` 以便下次复用；没有 `certs/` 时会删除整个配置目录；有证书时，卸载只按扩展名清理部分生成文件，`role`、`traffic_interval`、日志、辅助脚本、订阅状态等其它文件也可能留在目录中；
 - Xray、sing-box、Snell 等核心二进制通常保留，脚本会显示进一步删除命令。若卸载开始前能由数据库、join 文件或项目 `Caddyfile` 证明本项目用过 NaïveProxy，脚本只通过 `vless-naive` 服务边界停止；`/usr/local/bin/caddy` 始终保留，确认无其它 unit/站点引用后才能手动删除；
-- 当前卸载流程没有调用流量同步 cron / 到期检查 cron 的卸载函数；卸载后应从 `crontab` 移除所有包含 `--sync-traffic` 或 `--check-expire` 的本项目任务，无论其脚本路径是否仍存在；
+- 完全卸载会移除本项目的流量同步与到期检查 cron 条目；仍请在卸载后用 `crontab -l` 核对没有残留 `--sync-traffic` / `--check-expire` 任务；
 - 不会自动停止或卸载菜单 9 配置的 cloudflared / CF Tunnel，也不会删除 BBR 的 sysctl 配置；这些功能应先在各自菜单中单独停用、删除或恢复；
 - 不会恢复 DNS64 对 `/etc/resolv.conf` 的修改，也不会删除或回退 `/etc/sysctl.d/99-vless-dualstack.conf` 与实时 `net.ipv6.bindv6only=0`；须另行核对和恢复；
 - 完全卸载会按卸载前数据库中的精确 `hop_enable=1` 记录成对清理本项目 IPv4/IPv6 端口跳跃规则，不再枚举或删除第三方 REDIRECT 规则；数据库缺失或记录无效时不会猜测清理。
 
 “完全卸载”并不等于删除所有证书、核心二进制或主机级副作用。执行前备份配置、root crontab、iptables/ip6tables、相关 sysctl 与共享服务状态；如需连证书和整个配置目录一并删除，必须按脚本最后显示的命令另行操作。
 
-## 11. H15 验收基线
+## 11. H17 验收基线
 
-H15 产品 SHA-256 为 `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`（握手 `3.4.10-h15`），相对 H14-rc.1（`6ea18a9e…eaa34`）完成审计 P0/P1/关键 P2 全部修复，审计与整改见 [docs/AUDIT-H14-RC1.md](./docs/AUDIT-H14-RC1.md)、[docs/REMEDIATION-AND-ARCHITECTURE.md](./docs/REMEDIATION-AND-ARCHITECTURE.md)。
+H17 产品 SHA-256 为 `f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`（握手 `3.4.10-h17`；内部审计基线 H16 为 `7645d99e0b935c31c2462ae3328d0d806c77efe7ee35909f347b9aed97decc16`；公开仓上一正式版 H15 为 `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`），相对 H14-rc.1（`6ea18a9e…eaa34`）累计完成初始审计 P0/P1/关键 P2 及 H16/H17 外部审计与复审全部修复，审计与整改见 [docs/AUDIT-H14-RC1.md](./docs/AUDIT-H14-RC1.md)、[docs/REMEDIATION-AND-ARCHITECTURE.md](./docs/REMEDIATION-AND-ARCHITECTURE.md)、[RELEASE-H16.md](./RELEASE-H16.md) 与 [RELEASE-H17.md](./RELEASE-H17.md)。
 
-CI 入口为 `bash tests/run-ci.sh <mode>`，模式：`syntax`、`static`（ShellCheck error 级）、`unit`（`--awk-bin mawk|gawk` 各一遍，含 mutation 与 identity）、`xray-e2e`、`auth-e2e`、`singbox-e2e`（固定 Xray 26.3.27 / sing-box 1.14.4）、`stateful-upgrade`（H14 → H15 真实制品升级）、`webroot-e2e`、`installer-e2e`（Docker 9 组生命周期，无网络、TEST-NET 靶机，同时断言回环仍被阻断）。工作流使用完整历史检出（`fetch-depth: 0`），否则 `stateful-upgrade` 会因找不到 H14 基线而失败。
+CI 入口为 `bash tests/run-ci.sh <mode>`，模式：`syntax`、`static`（ShellCheck error 级）、`unit`（`--awk-bin mawk|gawk` 各一遍，含 mutation 与 identity）、`xray-e2e`、`auth-e2e`、`singbox-e2e`（固定 Xray 26.3.27 / sing-box 1.14.4）、`stateful-upgrade`（H13/H14 → H17 真实制品升级）、`webroot-e2e`、`installer-e2e`（Docker 10 组生命周期，无网络、TEST-NET 靶机，同时断言回环仍被阻断与真实 `--apply-configs` 入口）。工作流使用完整历史检出（`fetch-depth: 0`），否则 `stateful-upgrade` 会因找不到历史基线而失败。
 
 边界：CI Web 只覆盖函数/HTTP/service spy；Docker 为私有 leaf pin，不证明公网 CA、强沙箱或自动回滚；干净 Debian/systemd 与 Alpine/OpenRC 的真实 init 全生命周期未自动化；sing-box 协议、`ss-legacy`、SOCKS5 无逐用户流量计量。
 

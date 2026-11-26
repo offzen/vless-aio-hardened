@@ -349,7 +349,11 @@ http.server.ThreadingHTTPServer(("0.0.0.0",int(os.environ["HTTP_PORT"])),H).serv
   assert_eq "$after" "$((before + 1))" "add alice did not trigger exactly one restart"
   assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-18443") | .settings.clients[] | select(.id=="22222222-2222-4222-8222-222222222222")] | length == 1' "alice missing from config"
   data_plane "$uuid1" nonce-alice
-  ok "db_add_user rebuilt/restarted once and alice data plane passed"
+  # 审计回归：安装后立即添加首个用户，不得让刚发给原用户的链接失效
+  assert_jq "$CFG/config.json" '[.inbounds[] | select(.tag=="vless-ws-18443") | .settings.clients[] | select(.id=="11111111-1111-4111-8111-111111111111")] | length == 1' "original installer user was dropped from config after adding the first user"
+  assert_jq "$DB_FILE" '[.xray["vless-ws"].users[] | select(.name=="default" and .uuid=="11111111-1111-4111-8111-111111111111")] | length == 1' "original installer user was not preserved as default"
+  data_plane "$uuid0" nonce-original-after-add
+  ok "db_add_user rebuilt/restarted once; alice AND the original installer user both pass the real data plane"
 
   before=$(count_svc restart vless-reality)
   db_add_user xray vless-ws bob "$uuid2" 0
@@ -410,6 +414,102 @@ y"
   assert_eq "$(grep -c -- '|-t nat -D ' "$FW_LOG")" "8" "unexpected NAT delete spy count"
   grep -Fq 'iptables|OUTPUT|39990:39999|39999' "$FW_STATE" || fail "third-party NAT sentinel lost after last port"
   ok "last-port uninstall removed protocol cert and only its remaining NAT rules"
+
+  # 审计回归（测试缺口）：贯穿真实的生产 CLI 入口。升级流程最终执行的是替换后脚本的
+  # `--apply-configs`；这里以独立进程（非 SOURCE_ONLY、真实 /etc/vless-reality、真实 CLI 分派与退出码）
+  # 覆盖「有效库 / 有效空库 / 损坏库」三种输入，损坏库不得零操作返回成功。
+  local prod=/etc/vless-reality rc cfg_hash
+  rm -rf "$prod"; cp -a "$CFG" "$prod"
+  rm -f "$prod/config.json"
+  rc=0; env -u VLESS_SOURCE_ONLY -u VLESS_TEST_CFG -u VLESS_TEST_LOG_ROOT /usr/local/bin/vless-server.sh --apply-configs >"$sandbox/apply-valid.log" 2>&1 || rc=$?
+  assert_eq "$rc" "0" "production --apply-configs failed on a valid DB: $(tail -n 3 "$sandbox/apply-valid.log" | tr '\n' ' ')"
+  assert_file "$prod/config.json"
+  /usr/local/bin/xray run -test -c "$prod/config.json" >/dev/null 2>&1 || fail "production --apply-configs produced an invalid config"
+  cfg_hash=$(sha256sum "$prod/config.json")
+  cp -a "$prod/db.json" "$sandbox/db.good.json"
+  head -c 40 "$sandbox/db.good.json" >"$prod/db.json"
+  rc=0; env -u VLESS_SOURCE_ONLY -u VLESS_TEST_CFG -u VLESS_TEST_LOG_ROOT /usr/local/bin/vless-server.sh --apply-configs >"$sandbox/apply-corrupt.log" 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "production --apply-configs returned success on a truncated DB"
+  [[ $(sha256sum "$prod/config.json") == "$cfg_hash" ]] || fail "corrupt-DB apply changed the previous config"
+  echo '{"version":"4.0.0","xray":false,"singbox":{},"meta":{}}' >"$prod/db.json"
+  rc=0; env -u VLESS_SOURCE_ONLY -u VLESS_TEST_CFG -u VLESS_TEST_LOG_ROOT /usr/local/bin/vless-server.sh --apply-configs >"$sandbox/apply-bool.log" 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "production --apply-configs accepted boolean xray=false DB as empty"
+  [[ $(sha256sum "$prod/config.json") == "$cfg_hash" ]] || fail "boolean-core DB apply changed the previous config"
+  echo '{"version":"4.0.0","xray":{},"singbox":{},"meta":{}}' >"$prod/db.json"
+  rc=0; env -u VLESS_SOURCE_ONLY -u VLESS_TEST_CFG -u VLESS_TEST_LOG_ROOT /usr/local/bin/vless-server.sh --apply-configs >"$sandbox/apply-empty.log" 2>&1 || rc=$?
+  assert_eq "$rc" "0" "production --apply-configs must succeed as a no-op on a valid empty DB"
+  [[ $(sha256sum "$prod/config.json") == "$cfg_hash" ]] || fail "empty-DB apply touched the existing config"
+
+  # 复审回归 T01：双核心（Xray + Sing-box 共存）经菜单 12 替换脚本并起真实新进程 --apply-configs，
+  # 验证双核心同时成功与单核心重载失败传递（仅替换下载源与 systemctl 边界）。
+  mkdir -p "$prod/certs/hy2" "$sandbox/t01-bin" "$sandbox/t01-cache"
+  cp -a "$prod/certs/server.crt" "$prod/certs/hy2/server.crt"
+  cp -a "$prod/certs/server.key" "$prod/certs/hy2/server.key"
+  jq '.singbox.hy2 = {"port":31443,"password":"t01-hy2-pass","sni":"localhost"}' "$sandbox/db.good.json" >"$prod/db.json"
+  cat >"$sandbox/t01-bin/systemctl" <<'EOF'
+#!/bin/bash
+echo "systemctl|$*" >>"$T01_SVC_LOG"
+case "$1" in
+  is-active) echo active; exit 0 ;;
+  restart)
+    u="${*: -1}"
+    [[ "$u" == "${T01_FAIL_UNIT:-}" ]] && exit 1
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$sandbox/t01-bin/systemctl"
+  local t01_old="$sandbox/t01-installed.sh" t01_svclog="$sandbox/t01-svc.log"
+  sed -e 's@^readonly VERSION=.*@readonly VERSION="3.4.10-h15"@' \
+      -e 's@^readonly VERSION_CACHE_DIR=.*@readonly VERSION_CACHE_DIR="'"$sandbox"'/t01-cache"@' \
+      "$product" >"$t01_old"
+  chmod +x "$t01_old"
+  cp "$t01_old" "$sandbox/t01-before.sh"
+  : >"$t01_svclog"
+  rm -f "$prod/config.json" "$prod/singbox.json" "$prod/.reload-pending.xray" "$prod/.reload-pending.singbox"
+  rc=0
+  T01_SVC_LOG="$t01_svclog" T01_FAIL_UNIT="" PATH="$sandbox/t01-bin:$PATH" \
+    env -u VLESS_SOURCE_ONLY -u VLESS_TEST_CFG -u VLESS_TEST_LOG_ROOT \
+    bash -c '
+      export VLESS_SOURCE_ONLY=1; source "$0"; export VLESS_SOURCE_ONLY=0
+      _header() { :; }; _line() { :; }; _info() { :; }; _ok() { :; }; _warn() { :; }
+      _init_version_cache() { mkdir -p "$VERSION_CACHE_DIR"; }
+      _fetch_script_tmp() { local f; f=$(mktemp "'"$sandbox"'/t01-dl.XXXXXX") || return 1; cp "'"$product"'" "$f" || return 1; printf "%s\n" "$f"; }
+      _fetch_manifest_sha() { sha256sum "'"$product"'" | awk "{print \$1}"; }
+      do_update
+    ' "$t01_old" <<<"y" >"$sandbox/t01-ok.log" 2>&1 || rc=$?
+  assert_eq "$rc" "0" "T01 dual-core menu-12 update failed: $(tail -n 3 "$sandbox/t01-ok.log" | tr '\n' ' ')"
+  cmp -s "$t01_old" "$product" || fail "T01 menu-12 did not install exact candidate bytes"
+  cmp -s "$t01_old.bak" "$sandbox/t01-before.sh" || fail "T01 menu-12 backup mismatch"
+  assert_file "$prod/config.json"
+  assert_file "$prod/singbox.json"
+  /usr/local/bin/xray run -test -c "$prod/config.json" >/dev/null 2>&1 || fail "T01 dual-core Xray config invalid"
+  grep -Fq 'systemctl|restart vless-reality' "$t01_svclog" || fail "T01 dual-core did not restart Xray"
+  grep -Fq 'systemctl|restart vless-singbox' "$t01_svclog" || fail "T01 dual-core did not restart Sing-box"
+
+  # 单核重载失败传递（vless-singbox 重启失败 → 菜单返回非 0 且保留备份）
+  cp "$sandbox/t01-before.sh" "$t01_old"
+  rm -f "$t01_old.bak" "$prod/.reload-pending.xray" "$prod/.reload-pending.singbox"
+  : >"$t01_svclog"
+  rc=0
+  T01_SVC_LOG="$t01_svclog" T01_FAIL_UNIT="vless-singbox" PATH="$sandbox/t01-bin:$PATH" \
+    env -u VLESS_SOURCE_ONLY -u VLESS_TEST_CFG -u VLESS_TEST_LOG_ROOT \
+    bash -c '
+      export VLESS_SOURCE_ONLY=1; source "$0"; export VLESS_SOURCE_ONLY=0
+      _header() { :; }; _line() { :; }; _info() { :; }; _ok() { :; }; _warn() { :; }
+      _init_version_cache() { mkdir -p "$VERSION_CACHE_DIR"; }
+      _fetch_script_tmp() { local f; f=$(mktemp "'"$sandbox"'/t01-dl.XXXXXX") || return 1; cp "'"$product"'" "$f" || return 1; printf "%s\n" "$f"; }
+      _fetch_manifest_sha() { sha256sum "'"$product"'" | awk "{print \$1}"; }
+      do_update
+    ' "$t01_old" <<<"y" >"$sandbox/t01-fail.log" 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "T01 single-core reload failure returned 0"
+  cmp -s "$t01_old.bak" "$sandbox/t01-before.sh" || fail "T01 failure path lost usable backup"
+  assert_file "$prod/.reload-pending.singbox"
+  assert_absent "$prod/.reload-pending.xray"
+
+  rm -rf "$prod"
+  ok "production --apply-configs CLI & dual-core menu-12 upgrade: valid/corrupt/bool/empty DB and partial failure propagation verified"
 
   mkdir -p /etc/systemd/system
   echo shared-caddy > /etc/systemd/system/shared-caddy.service

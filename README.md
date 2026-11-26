@@ -4,7 +4,7 @@
 
 ## 功能概览
 
-- 单文件安装与管理脚本：`vless-server.sh`（当前版本 `3.4.10-h15`）
+- 单文件安装与管理脚本：`vless-server.sh`（当前版本 `3.4.10-h17`）
 - 支持 Xray、sing-box 与独立服务协议；多协议可共存，Xray / sing-box 托管协议支持多端口与逐用户管理
 - 凭据与状态文件统一最小权限（`0600`）与原子写入：唯一临时文件、带过期回收的目录锁、异常清空护栏，敏感凭据不暴露在进程命令行或 `/tmp`
 - Xray / sing-box 默认优先拦截私网目标（含 IPv4/IPv6 回环与 CGNAT）与 BitTorrent 出站流量
@@ -13,7 +13,7 @@
 - 真实证书校验使用系统 CA 链验证并拒绝自签伪造；真证书场景默认关闭订阅中的 `allowInsecure` / `skip-cert-verify`，并对外部订阅字段做注入清洗
 - 内置更新器支持新进程配置重载（`--apply-configs`）、防降级检查及 Xray 下载摘要校验；通用二进制下载拒绝含未替换占位符的 URL
 
-详细的支持范围、安装/升级步骤、菜单说明、用户管理、证书与排障见 [USAGE.md](USAGE.md)；H15 完整变更与升级细节见 [RELEASE-H15.md](RELEASE-H15.md) 与 [CHANGELOG.md](CHANGELOG.md)。
+详细的支持范围、安装/升级步骤、菜单说明、用户管理、证书与排障见 [USAGE.md](USAGE.md)；H17 完整变更与升级细节见 [RELEASE-H17.md](RELEASE-H17.md)、[RELEASE-H16.md](RELEASE-H16.md) 与 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 支持环境
 
@@ -76,16 +76,17 @@ sudo /usr/local/bin/vless-server.sh --help
 - `migrate-anytls-singbox.sh`：独立 AnyTLS 到 sing-box 托管模式的迁移脚本
 - `README.md`：项目入口与安装说明
 - `USAGE.md`：完整使用手册
-- `RELEASE-H15.md`：H15 正式版发布与升级手册
+- `RELEASE-H15.md` / `RELEASE-H16.md` / `RELEASE-H17.md`：各版本发布与升级手册
 - `CHANGELOG.md` / `FIXES.md`：版本更新清单与修复摘要
 - `SHA256SUMS` / `PROVENANCE.json`：文件哈希清单与版本来源记录
 
 ## 发行身份与验证
 
-H15 正式版交付身份：
+H17 审计整改版交付身份：
 
-- 发布版本 / Tag：`v3.4.10-h15`（脚本 `readonly VERSION="3.4.10-h15"`）
-- `vless-server.sh` SHA-256：`f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`
+- 发布版本 / Tag：`v3.4.10-h17`（脚本 `readonly VERSION="3.4.10-h17"`）
+- `vless-server.sh` SHA-256：`f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`
+- 上一公开正式版 H15：`v3.4.10-h15`（`f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`）；H16（`3.4.10-h16`，`7645d99e...`）为内部审计基线未公开发行，从 `v3.4.10-h15` 直升 `v3.4.10-h17` 将一并包含 H16 与 H17 全部整改
 
 本仓通过自动化 CI 覆盖 Bash 语法、ShellCheck 静态检查、版本抬升闸门、`mawk`/`gawk` 双引擎单元测试、状态升级回归、Xray/sing-box 原生配置与数据面 E2E 以及隔离安装器测试。
 

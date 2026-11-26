@@ -57,7 +57,7 @@ make_source_copy() {
 }
 
 make_runner() {
-  local dir="$1" runner="$2" source_copy="$3" remote="$4" apply_mode="$5" chmod_mode="$6"
+  local dir="$1" runner="$2" source_copy="$3" remote="$4" apply_mode="$5" chmod_mode="$6" manifest_mode="${7:-ok}"
   cat >"$runner" <<EOF
 #!/usr/bin/env bash
 set -uo pipefail
@@ -83,6 +83,13 @@ _fetch_script_tmp() {
   cp "$remote" "\$f" || return 1
   printf '%s\n' "\$f"
 }
+_fetch_manifest_sha() {
+  case "$manifest_mode" in
+    ok) sha256sum "$remote" | awk '{print \$1}' ;;
+    mismatch) printf '%064d\n' 7 ;;
+    missing) return 1 ;;
+  esac
+}
 init_db() { printf 'init_db\n' >>"\$REBUILD_LOG"; [[ "$apply_mode" != fail && "$apply_mode" != fail-init ]]; }
 rebuild_and_reload_xray() { printf 'xray\n' >>"\$REBUILD_LOG"; [[ "$apply_mode" != fail && "$apply_mode" != fail-xray ]]; }
 rebuild_and_reload_singbox() { printf 'singbox\n' >>"\$REBUILD_LOG"; [[ "$apply_mode" != fail && "$apply_mode" != fail-singbox ]]; }
@@ -99,7 +106,7 @@ EOF
 
 run_case() {
   local name="$1" kind="$2" remote_version="$3" answer="$4" expected_rc="$5"
-  local expected_state="$6" apply_mode="$7" chmod_mode="$8" expected_apply="$9"
+  local expected_state="$6" apply_mode="$7" chmod_mode="$8" expected_apply="$9" manifest_mode="${10:-ok}"
   local dir runner source_copy remote before rc
   dir="$TMP/$name"
   runner="$TMP/$name.runner.sh"
@@ -118,7 +125,7 @@ run_case() {
     *) echo "FAIL: unknown fixture kind: $kind" >&2; return 2 ;;
   esac
   chmod +x "$remote"
-  make_runner "$dir" "$runner" "$source_copy" "$remote" "$apply_mode" "$chmod_mode"
+  make_runner "$dir" "$runner" "$source_copy" "$remote" "$apply_mode" "$chmod_mode" "$manifest_mode"
   if [[ "$kind" == same-bytes ]]; then
     cp "$runner" "$remote"
   fi
@@ -159,6 +166,9 @@ run_case html html '' '' 1 preserved normal normal ''
 run_case syntax-broken truncated "$LOCAL_VERSION" '' 1 preserved normal normal ''
 run_case explicit-no valid "$LOCAL_VERSION" n 0 preserved normal normal ''
 run_case replacement-failure valid "$LOCAL_VERSION" '' 1 preserved normal fail ''
+# 审计 F6：与 SHA256SUMS 清单交叉核对；不一致或取不到清单都必须中止且不改动调用者
+run_case manifest-mismatch valid 3.4.10-h99 '' 1 preserved normal normal '' mismatch
+run_case manifest-missing valid 3.4.10-h99 '' 1 preserved normal normal '' missing
 
 printf '\n########## 3. auto-apply failure returns nonzero after replacement ##########\n'
 run_case apply-failure valid "$LOCAL_VERSION" '' 1 replaced fail normal 'init_db,xray,singbox,'

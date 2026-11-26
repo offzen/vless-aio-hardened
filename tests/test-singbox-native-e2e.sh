@@ -132,6 +132,13 @@ jq -e '
   ([.inbounds[].users[] | .uuid? // .password?] | any(. == "11111111-1111-4111-8111-000000000002")) and
   ([.inbounds[].users[] | .uuid? // .password?] | all(. != "11111111-1111-4111-8111-000000000003" and . != "11111111-1111-4111-8111-000000000004"))
 ' "$RAW_CONFIG" >/dev/null || { echo "FAIL: product renderer did not preserve exactly the active sing-box users" >&2; exit 1; }
+# 复审回归 R09：当 HY2 用户同时拥有不同的 uuid 和 password 时，入站与订阅导出必须选出完全相同的凭据
+HY2_INBOUND_PW=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password' "$RAW_CONFIG")
+HY2_EXPORT_PW=$(_cfg_effective hy2 "$(db_get singbox hy2)" | jq -r '.password')
+[[ -n "$HY2_INBOUND_PW" && "$HY2_INBOUND_PW" == "$HY2_EXPORT_PW" ]] || {
+    echo "FAIL: HY2 inbound password ($HY2_INBOUND_PW) differs from subscription export ($HY2_EXPORT_PW)" >&2
+    exit 1
+}
 mkdir -p "$TMP/check-work"
 if ! "$SINGBOX_BIN" check -D "$TMP/check-work" -c "$RAW_CONFIG" >"$TMP/raw-check.log" 2>&1; then
     sed -n '1,40p' "$TMP/raw-check.log" >&2

@@ -51,7 +51,7 @@ SINGBOX_BIN="$singbox_dir/sing-box" bash tests/run-ci.sh singbox-e2e
 - `auth-e2e` runs Xray's native parser for UUID/password/account schema representatives
   and reuses the real `ss-legacy` 3/3 accept/accept/reject data plane.
 - `installer-e2e` computes the current `vless-server.sh` SHA-256, injects it into the
-  fail-closed candidate identity check, and must end with the full `9 lifecycle groups`
+  fail-closed candidate identity check, and must end with the full `10 lifecycle groups`
   marker. Running only `--identity-selftest` cannot satisfy this gate.
 - `singbox-e2e` installs sing-box 1.14.4 from SHA-256-pinned amd64/arm64 assets,
   checks the product-generated Hysteria2/TUIC/AnyTLS configuration with the native parser,
@@ -70,4 +70,4 @@ read-only repository mount.
 
 ## Rolling release CI
 
-The master push workflow verifies the complete file manifest, exact H14 product checksum, and Bash syntax. It does not deploy, create tags or publish assets. The historical H14 full matrix belongs to the canonical source tree; it is not rerun by this export. The history-dependent stateful-upgrade fixture needs the exact H13 baseline and is not part of clean-history CI. The private runner adapter and foreign publishing tools are not distributed.
+The master/`ci/**` push and pull-request workflow (`.github/workflows/ci.yml`) verifies, in order: the product SHA-256 pinned in the workflow, `SHA256SUMS`, `scripts/refresh-manifest.sh --check`, the version-bump gate, Bash syntax, the ShellCheck error gate, the `mawk` and `gawk` unit suites, `stateful-upgrade` (it needs the full Git history, hence `fetch-depth: 0`), and then the pinned-core jobs `xray-e2e`, `auth-e2e`, `singbox-e2e`, `webroot-e2e` and `installer-e2e`. It does not deploy, create tags or publish assets. `tests/test-h16-audit-fixes.sh` is picked up by the unit-suite auto-discovery and also runs under both AWK engines.

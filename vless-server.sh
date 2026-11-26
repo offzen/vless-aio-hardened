@@ -18,6 +18,11 @@
 #  本仓(升级源): https://github.com/offzen/vless-aio-hardened
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 确保 cron / Alpine / sudo 精简 PATH 下也能找到 /usr/local/bin 中的核心二进制（追加至尾部，不覆盖前置 PATH）
+case ":${PATH:-}:" in *:/usr/local/sbin:*) ;; *) PATH="${PATH:+$PATH:}/usr/local/sbin" ;; esac
+case ":${PATH:-}:" in *:/usr/local/bin:*) ;; *) PATH="${PATH:+$PATH:}/usr/local/bin" ;; esac
+export PATH
+
 # 本仓采用滚动 master 发布；用户界面不显示独立发布版本号。
 # 脚本更新直接比较 master 制品的 SHA-256；release/tag 不参与版本判断。
 readonly RELEASE_CHANNEL="master"
@@ -25,7 +30,7 @@ readonly RELEASE_CHANNEL="master"
 #   1) 3.4.10-h5 及更早的存量客户端只认语义化版本号，靠它识别本制品并放行下载；
 #   2) 本版更新器用它做"防降级"方向判断（远端更旧一律拒绝）。
 # 格式受老客户端硬约束：^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$，且必须单调递增。
-readonly VERSION="3.4.10-h15"
+readonly VERSION="3.4.10-h17"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/offzen/vless-aio-hardened"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
@@ -50,12 +55,13 @@ readonly LATENCY_MAX_ATTEMPTS="${LATENCY_MAX_ATTEMPTS:-0}"
 _CACHED_IPV4=""
 _CACHED_IPV6=""
 
-# Alpine busybox pgrep 不支持 -x，使用兼容方式检测进程
+# Alpine busybox pgrep 不支持 -x，使用兼容方式检测进程（绝不用裸 pgrep -f，避免误命中 timeout/bash 等含子串的辅助进程）
 _pgrep() {
     local proc="$1"
     if [[ "$DISTRO" == "alpine" ]]; then
-        # Alpine busybox pgrep: 先尝试精确匹配，再尝试命令行匹配
-        pgrep "$proc" >/dev/null 2>&1 || pgrep -f "$proc" >/dev/null 2>&1
+        pgrep "$proc" >/dev/null 2>&1 && return 0
+        # 仅按 argv[0] 精确匹配（排除 `timeout 30 sing-box check` 等非主进程）
+        pgrep -f "^(/usr/local/s?bin/|/usr/s?bin/)?${proc}([[:space:]]|$)" >/dev/null 2>&1
     else
         pgrep -x "$proc" >/dev/null 2>&1
     fi
@@ -171,6 +177,16 @@ cleanup_webroot_placeholder() {
 }
 
 # 初始化数据库
+# 校验 DB 可读且结构完整：区分「损坏 / 不可读」与「有效空库」。
+# 损坏的 db.json 过去会被枚举函数吞掉 jq 错误、当成“没有已安装协议”，使 --apply-configs 零操作返回成功。
+db_validate() {
+    [[ -f "$DB_FILE" ]] || return 1
+    jq -e '(type == "object")
+        and ((has("xray") | not) or (.xray | type == "object"))
+        and ((has("singbox") | not) or (.singbox | type == "object"))' \
+        "$DB_FILE" > /dev/null 2>&1
+}
+
 init_db() {
     mkdir -p "$CFG" || return 1
     [[ -f "$DB_FILE" ]] && return 0
@@ -192,8 +208,162 @@ init_db() {
     return 0
 }
 
-# 更新数据库时间戳
-_db_touch() {
+# ── 分层互斥锁（内核 flock + 兼容 mkdir/pid 目录锁）──────────────────────────
+# 1) 外层内核 flock（${lock_dir}.flock）：在所有 H16 进程间提供内核级零竞态互斥，
+#    进程异常终止时由内核自动释放，兼顾 Debian/Ubuntu/RHEL（util-linux）与 Alpine（BusyBox -n 轮询）。
+# 2) 内层目录锁（${DB_FILE}.lock + pid）：与 migrate-anytls-singbox.sh 及存量 H15 进程保持完全互通；
+#    无 flock 时也能独立降级工作，并通过原子改名 + inode 校验回收陈旧锁。
+# 同一进程内按路径可重入，最外层 release 先原子移除目录锁再关闭 flock 文件描述符。
+declare -gA _LOCK_DEPTH=()
+declare -gA _LOCK_OWNER=()
+declare -gA _LOCK_FD=()
+
+_lock_pid_alive() { [[ "$1" =~ ^[0-9]+$ ]] && kill -0 "$1" 2>/dev/null; }
+
+# 跨平台取目录 mtime/inode：Linux 绝不回退到 `stat -f`（GNU stat 的 -f 是文件系统信息，会输出多行文本）
+_lock_mtime() {
+    local v=""
+    v=$(stat -c %Y "$1" 2>/dev/null) || v=""
+    if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+        case "$(uname -s 2>/dev/null || true)" in
+            Darwin|*BSD*) v=$(stat -f %m "$1" 2>/dev/null) || v="" ;;
+        esac
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v"
+}
+
+_lock_inode() {
+    local v=""
+    v=$(stat -c %i "$1" 2>/dev/null) || v=""
+    if [[ ! "$v" =~ ^[0-9]+$ ]]; then
+        case "$(uname -s 2>/dev/null || true)" in
+            Darwin|*BSD*) v=$(stat -f %i "$1" 2>/dev/null) || v="" ;;
+        esac
+    fi
+    [[ "$v" =~ ^[0-9]+$ ]] && printf '%s\n' "$v"
+}
+
+# 获取外层内核 flock（成功时在 _LOCK_FD[$lock_dir] 记录 fd；无 flock 命令时返回 0 直接降级到目录锁）
+_lock_flock_acquire() {
+    local lock_dir="$1" tries="$2" fd="" wait_sec old_umask i
+    command -v flock >/dev/null 2>&1 || return 0
+    local flock_file="${lock_dir}.flock"
+    old_umask=$(umask)
+    umask 077
+    if ! { exec {fd}>"$flock_file"; } 2>/dev/null; then
+        umask "$old_umask"
+        return 0
+    fi
+    umask "$old_umask"
+    if flock -x -n "$fd" 2>/dev/null; then
+        _LOCK_FD[$lock_dir]="$fd"
+        return 0
+    fi
+    wait_sec=$(( (tries + 9) / 10 ))
+    (( wait_sec < 1 )) && wait_sec=1
+    if flock --version >/dev/null 2>&1; then
+        if flock -x -w "$wait_sec" "$fd" 2>/dev/null; then
+            _LOCK_FD[$lock_dir]="$fd"
+            return 0
+        fi
+    else
+        # Alpine BusyBox flock 无 -w 参数，使用非阻塞 -n 轮询
+        for ((i = 0; i < tries; i++)); do
+            if flock -x -n "$fd" 2>/dev/null; then
+                _LOCK_FD[$lock_dir]="$fd"
+                return 0
+            fi
+            sleep 0.1 2>/dev/null || sleep 1
+        done
+    fi
+    { exec {fd}>&-; } 2>/dev/null || true
+    return 1
+}
+
+_lock_flock_release() {
+    local lock_dir="$1" fd="${_LOCK_FD[$1]:-}"
+    [[ -n "$fd" ]] || return 0
+    unset "_LOCK_FD[$lock_dir]"
+    command -v flock >/dev/null 2>&1 && flock -u "$fd" 2>/dev/null || true
+    { exec {fd}>&-; } 2>/dev/null || true
+}
+
+# 用法: _lockdir_acquire <lock_dir> [重试次数(每次0.1s，默认100≈10s)]
+# 约束: 必须在获取锁的同一进程内调用 _lockdir_release 释放；子进程/subshell 内调用 release 为 no-op（因 _LOCK_OWNER 按 BASHPID 隔离）。
+_lockdir_acquire() {
+    local lock_dir="$1" tries="${2:-100}" i pid now mt ino stale grave pid_tmp
+    local self_pid="${BASHPID:-$$}"
+    if (( ${_LOCK_DEPTH[$lock_dir]:-0} > 0 )) && [[ "${_LOCK_OWNER[$lock_dir]:-}" == "$self_pid" ]]; then
+        _LOCK_DEPTH[$lock_dir]=$(( _LOCK_DEPTH[$lock_dir] + 1 ))
+        return 0
+    fi
+    _lock_flock_acquire "$lock_dir" "$tries" || return 1
+    for ((i = 0; i < tries; i++)); do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            pid_tmp="$lock_dir/.pid.${self_pid}"
+            if printf '%s\n' "$self_pid" > "$pid_tmp" 2>/dev/null; then
+                mv -f "$pid_tmp" "$lock_dir/pid" 2>/dev/null || true
+            fi
+            _LOCK_DEPTH[$lock_dir]=1
+            _LOCK_OWNER[$lock_dir]="$self_pid"
+            return 0
+        fi
+        # 回收陈旧锁：持锁进程已死；或目录存在却长期没有 pid 文件（mkdir 与写 pid 之间崩溃）
+        stale=0
+        pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+        if [[ -n "$pid" ]]; then
+            _lock_pid_alive "$pid" || stale=1
+        elif [[ -d "$lock_dir" ]]; then
+            now=$(date +%s)
+            mt=$(_lock_mtime "$lock_dir")
+            [[ "$mt" =~ ^[0-9]+$ && "$now" =~ ^[0-9]+$ ]] && (( now - mt >= 10 )) && stale=1
+        fi
+        if (( stale )); then
+            # 先记录 inode，再原子改名；改名后核对 inode，若被换成别人刚拿到的新锁则放回，避免误删活锁
+            ino=$(_lock_inode "$lock_dir")
+            grave="${lock_dir}.stale.${self_pid}.${RANDOM}"
+            if mv "$lock_dir" "$grave" 2>/dev/null; then
+                if [[ -n "$ino" && "$(_lock_inode "$grave")" != "$ino" ]]; then
+                    [[ -e "$lock_dir" ]] || mv "$grave" "$lock_dir" 2>/dev/null || true
+                else
+                    rm -rf "$grave" 2>/dev/null || true
+                fi
+            fi
+            continue
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    _lock_flock_release "$lock_dir"
+    return 1
+}
+
+_lockdir_release() {
+    local lock_dir="$1" d="${_LOCK_DEPTH[$1]:-0}" pid grave
+    local self_pid="${BASHPID:-$$}"
+    [[ "${_LOCK_OWNER[$lock_dir]:-}" == "$self_pid" ]] || return 0
+    (( d > 0 )) || return 0
+    d=$((d - 1))
+    _LOCK_DEPTH[$lock_dir]=$d
+    (( d > 0 )) && return 0
+    unset "_LOCK_OWNER[$lock_dir]"
+    # 只释放自己持有的目录锁：先原子改名再 rm -rf，最后释放外层 flock
+    pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
+    if [[ "$pid" == "$self_pid" || ( -z "$pid" && -n "${_LOCK_FD[$lock_dir]:-}" ) ]]; then
+        grave="${lock_dir}.rel.${self_pid}.${RANDOM}"
+        if mv "$lock_dir" "$grave" 2>/dev/null; then
+            rm -rf "$grave" 2>/dev/null || true
+        else
+            rm -rf "$lock_dir" 2>/dev/null || true
+        fi
+    fi
+    _lock_flock_release "$lock_dir"
+}
+
+_db_lock_acquire() { _lockdir_acquire "${DB_FILE}.lock"; }
+_db_lock_release() { _lockdir_release "${DB_FILE}.lock"; }
+
+# 更新数据库时间戳（调用方必须已持锁）
+_db_touch_unlocked() {
     [[ -f "$DB_FILE" ]] || init_db || return 1
     local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
@@ -209,18 +379,18 @@ _db_touch() {
     fi
 }
 
+# 更新数据库时间戳
+_db_touch() {
+    _db_lock_acquire || return 1
+    _db_touch_unlocked
+    local rc=$?
+    _db_lock_release
+    return "$rc"
+}
+
+# 通用 jq 改写：与 _db_safe_write 共用同一把锁（allow_wipe=1、无清空护栏）
 _db_apply() { # _db_apply [jq args...] 'filter'
-    [[ -f "$DB_FILE" ]] || init_db || return 1
-    local tmp; tmp=$(mktemp "${DB_FILE}.apply.XXXXXX") || return 1
-    chmod 600 "$tmp" 2>/dev/null || true
-    if jq "$@" "$DB_FILE" >"$tmp" 2>/dev/null; then
-        mv "$tmp" "$DB_FILE"
-        chmod 600 "$DB_FILE" 2>/dev/null || true
-        _db_touch
-        return 0
-    fi
-    rm -f "$tmp"
-    return 1
+    _db_safe_write 1 "" "$@"
 }
 
 # 原子安全写数据库（防止并发/失败写坏 db.json 导致用户列表被清空）
@@ -240,31 +410,12 @@ _db_safe_write() {
     shift 2
     [[ -f "$DB_FILE" ]] || init_db || return 1
 
-    # 便携互斥锁：mkdir 是原子的；记录持锁 PID 并支持自动清理死锁（防崩溃永久锁死）
-    local lock_dir="${DB_FILE}.lock"
-    local locked=0
-    for _ in $(seq 1 50); do
-        if mkdir "$lock_dir" 2>/dev/null; then
-            printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || true
-            locked=1
-            break
-        fi
-        # 若持锁进程已不存在，回收遗留陈旧锁
-        if [[ -f "$lock_dir/pid" ]]; then
-            local _lock_pid
-            _lock_pid=$(cat "$lock_dir/pid" 2>/dev/null || true)
-            if [[ "$_lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$_lock_pid" 2>/dev/null; then
-                rm -rf "$lock_dir" 2>/dev/null || true
-                continue
-            fi
-        fi
-        sleep 0.1 2>/dev/null || sleep 1
-    done
-    if [[ "$locked" != "1" ]]; then
+    # 便携互斥锁（mkdir + pid；见 _db_lock_acquire）
+    if ! _db_lock_acquire; then
         _err "数据库写入锁等待超时，已跳过本次写入"
         return 1
     fi
-    _release_db_lock() { rm -rf "$lock_dir" 2>/dev/null || true; }
+    _release_db_lock() { _db_lock_release; }
 
     # 计算守卫 key 下写入前的用户总数
     local before_users=0
@@ -333,7 +484,7 @@ _db_safe_write() {
     chmod 600 "$tmp" 2>/dev/null || true
     if mv "$tmp" "$DB_FILE"; then
         chmod 600 "$DB_FILE" 2>/dev/null || true
-        _db_touch 2>/dev/null
+        _db_touch_unlocked 2>/dev/null
     else
         rm -f "$tmp"
         rc=1
@@ -354,11 +505,13 @@ db_add() { # db_add core proto json
         return 1
     fi
     
-    _db_apply --arg p "$proto" --argjson c "$json" ".${core}[\$p]=\$c"
+    # 写库失败（锁超时 / jq 失败）必须向上传递，调用方据此中止安装，不得继续生成链接
+    _db_apply --arg p "$proto" --argjson c "$json" ".${core}[\$p]=\$c" || return 1
     
     # 协议配置更新后，自动同步隧道配置（如果有隧道）
     # 确保隧道配置与新协议兼容
     _sync_tunnel_config 2>/dev/null || true
+    return 0
 }
 
 
@@ -579,13 +732,12 @@ db_add_ip_routing_rule() {
     [[ -z "$inbound_ip" || -z "$outbound_ip" ]] && return 1
     [[ ! -f "$DB_FILE" ]] && init_db
     
-    local tmp=$(mktemp)
-    jq --arg in_ip "$inbound_ip" --arg out_ip "$outbound_ip" '
+    _db_apply --arg in_ip "$inbound_ip" --arg out_ip "$outbound_ip" '
         .ip_routing.enabled = true |
         .ip_routing.rules = ((.ip_routing.rules // []) | 
             [.[] | select(.inbound_ip != $in_ip)] + 
             [{"inbound_ip": $in_ip, "outbound_ip": $out_ip}])
-    ' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    '
 }
 
 # 删除IP路由规则
@@ -595,25 +747,22 @@ db_del_ip_routing_rule() {
     [[ -z "$inbound_ip" ]] && return 1
     [[ ! -f "$DB_FILE" ]] && return 1
     
-    local tmp=$(mktemp)
-    jq --arg in_ip "$inbound_ip" '
+    _db_apply --arg in_ip "$inbound_ip" '
         .ip_routing.rules = [(.ip_routing.rules // [])[] | select(.inbound_ip != $in_ip)]
-    ' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    '
 }
 
 # 清空所有IP路由规则
 db_clear_ip_routing_rules() {
     [[ ! -f "$DB_FILE" ]] && return 1
-    local tmp=$(mktemp)
-    jq '.ip_routing.rules = []' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply '.ip_routing.rules = []'
 }
 
 # 设置IP路由启用/禁用
 db_set_ip_routing_enabled() {
     local enabled="$1"
     [[ ! -f "$DB_FILE" ]] && init_db
-    local tmp=$(mktemp)
-    jq --argjson e "$enabled" '.ip_routing.enabled = $e' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --argjson e "$enabled" '.ip_routing.enabled = $e'
 }
 
 # 获取指定入站IP的出站IP
@@ -1073,6 +1222,40 @@ gen_xray_socks_accounts() {
 # used: 已用流量(字节)
 # enabled: 是否启用
 
+# 旧单用户配置（顶层 uuid/password，无 users 数组）→ 显式 users 表的共享 jq 定义。
+# 渲染器/导出器对「显式 users 表」不再回退顶层凭据，因此任何会创建 users 数组的写入
+# （添加用户、禁用 default、启动迁移）都必须先把原用户落成真实记录，否则已发出的链接会失效。
+# 凭据优先级按协议与渲染器/导出器（_cfg_effective）同源：
+# - 密码型协议（anytls/hy2/trojan/ss-legacy/socks）优先顶层 password，再回退 uuid/psk；
+# - UUID 型协议（vless*/vmess-ws/tuic）优先顶层 uuid，再回退 password/psk；
+# - TUIC 保留独立 password；AnyTLS 同时落 password，避免渲染器与迁移记录分叉；SOCKS 保留 username。
+# 用法: 在 jq 过滤器前拼接 "$_DB_MIG_JQ"，再 `.[$c][$p] |= _mig_all($p; $created)`。
+_DB_MIG_JQ='
+def _mig_default($proto; $created):
+    if (.users | type) == "array" then .
+    else
+        ((.uuid // "") | tostring) as $u
+        | ((.password // "") | tostring) as $pw
+        | ((.psk // "") | tostring) as $psk
+        | ((.username // "") | tostring) as $un
+        | (if ($proto | IN("anytls","hy2","trojan","ss-legacy","socks")) then
+               (if $pw != "" then $pw elif $u != "" then $u elif $psk != "" then $psk else "" end)
+           else
+               (if $u != "" then $u elif $pw != "" then $pw elif $psk != "" then $psk else "" end)
+           end) as $cred
+        | if $cred == "" then .
+          else .users = [
+              ({name:(if $proto == "socks" and $un != "" then $un else "default" end),
+                uuid:$cred, quota:0, used:0, enabled:true, created:$created}
+               + (if $proto == "tuic" and $u != "" and $pw != "" then {password:$pw}
+                  elif $proto == "anytls" and $pw != "" then {password:$pw}
+                  else {} end))
+          ] end
+    end;
+def _mig_all($proto; $created):
+    if type == "array" then map(_mig_default($proto; $created)) else _mig_default($proto; $created) end;
+'
+
 # 添加用户到协议 (支持多端口数组格式)
 # 用法: db_add_user "xray" "vless" "用户名" "uuid" [配额GB] [到期日期YYYY-MM-DD]
 # 多端口时：用户会添加到第一个端口实例的 users 数组（共享凭证）
@@ -1118,7 +1301,10 @@ db_add_user() {
     # 添加用户 (支持多端口数组，包含 expire_date)
     _db_safe_write 0 "${core}.${proto}" \
         --arg c "$core" --arg p "$proto" --arg n "$name" --arg u "$uuid" \
-        --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" '
+        --argjson q "$quota" --arg cr "$created" --arg exp "$expire_date" \
+        "$_DB_MIG_JQ"'
+        # 先把旧单用户的原凭据落成 default 用户（同一次原子写），再追加新用户
+        .[$c][$p] |= _mig_all($p; $cr) |
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             # 多端口: 添加到第一个端口实例
@@ -1133,12 +1319,19 @@ db_add_user() {
     [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
     [[ "$quota_gb" -gt 0 ]] && ensure_traffic_cron 2>/dev/null
     
-    # 自动重建配置
+    # 自动重建配置。数据库已提交：重载失败时返回 3（非 0），与「写库失败」(1) 区分，
+    # 调用方据此提示「已写入但未生效」，避免用户误以为没添加成功而重复添加。
+    local _rr=0
     if [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent"
+        rebuild_and_reload_xray "silent" || _rr=1
     elif [[ "$core" == "singbox" ]]; then
-        rebuild_and_reload_singbox "silent"
+        rebuild_and_reload_singbox "silent" || _rr=1
     fi
+    if [[ $_rr -ne 0 ]]; then
+        _err "用户 $name 已写入数据库，但配置重建或服务重载失败（修复后可用菜单 14 重建）"
+        return 3
+    fi
+    return 0
 }
 
 
@@ -1167,12 +1360,18 @@ db_del_user() {
         end
     ' || { _err "删除用户失败（数据库写入未完成或被清空护栏拦截）"; return 1; }
     
-    # 自动重建配置
+    # 自动重建配置（数据库已提交；重载失败返回 3，语义同 db_add_user）
+    local _rr=0
     if [[ "$core" == "xray" ]]; then
-        rebuild_and_reload_xray "silent"
+        rebuild_and_reload_xray "silent" || _rr=1
     elif [[ "$core" == "singbox" ]]; then
-        rebuild_and_reload_singbox "silent"
+        rebuild_and_reload_singbox "silent" || _rr=1
     fi
+    if [[ $_rr -ne 0 ]]; then
+        _err "用户 $name 已从数据库删除，但配置重建或服务重载失败（修复后可用菜单 14 重建）"
+        return 3
+    fi
+    return 0
 }
 
 # 获取用户信息 (支持多端口数组格式)
@@ -1291,8 +1490,40 @@ db_count_users() {
 # 更新用户流量 (支持多端口数组格式)
 # 用法: db_update_user_traffic "xray" "vless" "用户名" 增量字节数
 db_update_user_traffic() {
-    local core="$1" proto="$2" name="$3" bytes="$4"
+    local core="$1" proto="$2" name="$3" bytes="$4" entries="${5:-}"
     [[ ! -f "$DB_FILE" ]] && return 1
+    
+    # entries（可选）: [{"id":"<日志条目唯一标识>","v":<字节>}...]。
+    # 入账与「已入账标识」在同一次加锁原子写里提交：
+    # - 用哈希映射去重并在批次内按 id 去重，确保任意批次大小（>200 条积压）都不会挤出当前未清日志的 ID；
+    # - 当前批次全部 ID 完整保留（覆盖整份可能被重放的日志），已退休的历史 ID 保留最近 200 条以控制体积。
+    if [[ -n "$entries" ]]; then
+        _db_safe_write 0 "${core}.${proto}" \
+            --arg c "$core" --arg p "$proto" --arg n "$name" --argjson ents "$entries" '
+            def apply_user:
+                if .name == $n then
+                    (.traffic_applied // []) as $done |
+                    ($done | map({(.): true}) | add // {}) as $done_map |
+                    ([$ents[] | select($done_map[.id] | not)] | unique_by(.id)) as $new |
+                    .used = ((.used // 0) + ([$new[].v] | add // 0)) |
+                    ([$ents[].id] | unique) as $active_ids |
+                    ($active_ids | map({(.): true}) | add // {}) as $active_map |
+                    ([$done[] | select($active_map[.] | not)] | .[-200:]) as $hist |
+                    .traffic_applied = ($hist + $active_ids)
+                else . end;
+            .[$c][$p] as $cfg |
+            if ($cfg | type) == "array" then
+                .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
+                    .users = ([.users[] | apply_user])
+                else
+                    .
+                end]
+            else
+                .[$c][$p].users = [.[$c][$p].users // [] | .[] | apply_user]
+            end
+        ' || return 1
+        return 0
+    fi
     
     _db_safe_write 0 "${core}.${proto}" \
         --arg c "$core" --arg p "$proto" --arg n "$name" --argjson b "$bytes" '
@@ -1320,12 +1551,12 @@ db_set_user_traffic() {
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
-                .users = ([.users[] | if .name == $n then .used = $b else . end])
+                .users = ([.users[] | if .name == $n then (.used = $b | (if $b == 0 then (.quota_exceeded_notified = false | .last_alert_percent = 0) else . end)) else . end])
             else
                 .
             end]
         else
-            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .used = $b else . end]
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then (.used = $b | (if $b == 0 then (.quota_exceeded_notified = false | .last_alert_percent = 0) else . end)) else . end]
         end
     ' || return 1
 }
@@ -1352,39 +1583,38 @@ db_set_user_quota() {
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
-                .users = ([.users[] | if .name == $n then .quota = $q else . end])
+                .users = ([.users[] | if .name == $n then (.quota = $q | .quota_exceeded_notified = false | .last_alert_percent = 0) else . end])
             else
                 .
             end]
         else
-            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .quota = $q else . end]
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then (.quota = $q | .quota_exceeded_notified = false | .last_alert_percent = 0) else . end]
         end
     ' || return 1
 }
 
 # 启用/禁用用户 (支持多端口数组格式)
 # 用法: db_set_user_enabled "xray" "vless" "用户名" true/false
-db_set_user_enabled() {
+_db_set_user_enabled_nowrite() {
     local core="$1" proto="$2" name="$3" enabled="$4"
     [[ ! -f "$DB_FILE" ]] && return 1
     [[ "$enabled" == "true" || "$enabled" == "false" ]] || return 1
+    _db_lock_acquire || { _err "获取数据库写锁超时"; return 1; }
+    local rc=0
+    _db_set_user_enabled_nowrite_locked "$core" "$proto" "$name" "$enabled" || rc=$?
+    _db_lock_release
+    return "$rc"
+}
+
+_db_set_user_enabled_nowrite_locked() {
+    local core="$1" proto="$2" name="$3" enabled="$4"
     # 旧单用户配置没有 users 数组，菜单显示的 default 是合成用户。
     # 禁用前先为每个相关端口落下真实用户记录，否则写入会静默成功而凭据仍可用。
     if [[ "$name" == "default" ]]; then
         _db_safe_write 0 "${core}.${proto}" \
-            --arg c "$core" --arg p "$proto" '
-            def migrate:
-                if ((.users // []) | length) == 0 then
-                    (.uuid // .password // .username // empty) as $cred |
-                    if $cred != null and $cred != "" then
-                        .users = [{name:"default", uuid:$cred, enabled:true, quota:0, used:0}]
-                    else . end
-                else . end;
-            if (.[$c][$p] | type) == "array" then
-                .[$c][$p] |= map(migrate)
-            else
-                .[$c][$p] |= migrate
-            end
+            --arg c "$core" --arg p "$proto" --arg cr "$(date '+%Y-%m-%d')" \
+            "$_DB_MIG_JQ"'
+            .[$c][$p] |= _mig_all($p; $cr)
         ' || return 1
     fi
     
@@ -1399,20 +1629,38 @@ db_set_user_enabled() {
     ' "$DB_FILE" 2>/dev/null) || return 1
     [[ "$matched" -gt 0 ]] || { _err "用户 $name 不存在"; return 1; }
 
-    _db_safe_write 0 "${core}.${proto}" \
+    # 在 DB 锁围栏内完成「写库前 pre-arm → 写库 → 写库后 post-arm」：
+    # 1) 即使写库后立即崩溃，持久化的待重载标记仍能被下一轮扫描拾取；
+    # 2) rebuild_and_reload_* 取快照前同样穿过 DB 锁围栏，绝不会在写库完成前误把 pre-arm 当已生效快照清掉。
+    local _rp_had=0 _rp_pre=""
+    _reload_pending "$core" && _rp_had=1
+    _rp_pre=$(_reload_pending_arm "$core")
+
+    if ! _db_safe_write 0 "${core}.${proto}" \
         --arg c "$core" --arg p "$proto" --arg n "$name" --argjson e "$enabled" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
-                .users = ([.users[] | if .name == $n then .enabled = $e else . end])
+                .users = ([.users[] | if .name == $n then (.enabled = $e | (if $e then (.quota_exceeded_notified = false | .last_alert_percent = 0) else . end)) else . end])
             else
                 .
             end]
         else
-            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .enabled = $e else . end]
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then (.enabled = $e | (if $e then (.quota_exceeded_notified = false | .last_alert_percent = 0) else . end)) else . end]
         end
-    ' || return 1
-    
+    '; then
+        [[ $_rp_had -eq 0 && -n "$_rp_pre" ]] && _reload_pending_ack "$core" 1 "$_rp_pre"
+        return 1
+    fi
+    _reload_pending_arm "$core" >/dev/null
+    return 0
+}
+
+# 启用/禁用用户并立即重建配置、重载服务
+db_set_user_enabled() {
+    local core="$1"
+    _db_set_user_enabled_nowrite "$@" || return 1
+
     # 自动重建配置（按核心分别重建；否则 singbox 协议的用户启用/禁用不会生效）
     if [[ "$core" == "xray" ]]; then
         rebuild_and_reload_xray "silent" 2>/dev/null || { _err "数据库已更新，但 Xray 配置或服务重载失败"; return 1; }
@@ -1559,6 +1807,14 @@ _format_user_routing() {
 #  用户到期日期管理函数
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 校验并规范化 YYYY-MM-DD：必须是真实存在的日历日期（拒绝 2026-02-30、2026-13-45）
+_valid_ymd() {
+    local d="$1" norm
+    [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    norm=$(date -d "$d" '+%Y-%m-%d' 2>/dev/null) || return 1
+    [[ "$norm" == "$d" ]]
+}
+
 # 设置用户到期日期 (支持多端口数组格式)
 # 用法: db_set_user_expire_date "xray" "vless" "用户名" "2026-02-28"
 # 空字符串或 "never" 表示永不过期
@@ -1568,18 +1824,22 @@ db_set_user_expire_date() {
     
     # 处理特殊值
     [[ "$expire_date" == "never" ]] && expire_date=""
+    if [[ -n "$expire_date" ]] && ! _valid_ymd "$expire_date"; then
+        _err "无效的到期日期: $expire_date（需为真实存在的 YYYY-MM-DD）"
+        return 1
+    fi
     
     _db_safe_write 0 "${core}.${proto}" \
         --arg c "$core" --arg p "$proto" --arg n "$name" --arg e "$expire_date" '
         .[$c][$p] as $cfg |
         if ($cfg | type) == "array" then
             .[$c][$p] = [$cfg[] | if (.users // [] | length) > 0 then
-                .users = ([.users[] | if .name == $n then .expire_date = $e else . end])
+                .users = ([.users[] | if .name == $n then (.expire_date = $e | del(.last_expire_warn_day)) else . end])
             else
                 .
             end]
         else
-            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then .expire_date = $e else . end]
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] | if .name == $n then (.expire_date = $e | del(.last_expire_warn_day)) else . end]
         end
     ' || return 1
     
@@ -1634,6 +1894,10 @@ db_get_user_days_left() {
     
     if [[ -n "$today_sec" && -n "$expire_sec" ]]; then
         echo $(( (expire_sec - today_sec) / 86400 ))
+    elif [[ "$expire_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        # 旧版本允许写入的非法日历日期（如 2026-02-30）：与配置渲染的字典序过滤保持一致，
+        # 已越过则按已过期处理，保证 --check-expire 与渲染结论相同；未到期不告警。
+        if [[ "$expire_date" < "$(date '+%Y-%m-%d')" ]]; then echo -1; else echo ""; fi
     else
         echo ""
     fi
@@ -1722,8 +1986,7 @@ db_get_tg_config() {
 db_set_tg_config() {
     local field="$1" value="$2"
     [[ ! -f "$DB_FILE" ]] && init_db
-    local tmp_file="${DB_FILE}.tmp"
-    jq --arg f "$field" --arg v "$value" '.telegram[$f] = $v' "$DB_FILE" > "$tmp_file" && mv "$tmp_file" "$DB_FILE"
+    _db_apply --arg f "$field" --arg v "$value" '.telegram[$f] = $v'
 }
 
 # 发送 Telegram 消息（优先读取统一的 $CFG/telegram.json，兼容旧 db.json .telegram）
@@ -1788,24 +2051,52 @@ send_tg_expired_notice() {
 #═══════════════════════════════════════════════════════════════════════════════
 
 # 执行过期用户检查和禁用
+# 先在数据库中批量禁用，再对受影响的核心各重建/重启一次（避免每个用户重启一次造成连续断线）；
+# 只统计并通知真正写入成功的用户；标准输出只输出最终计数。
 check_and_disable_expired_users() {
     local notify="${1:-}"
-    local count=0
-    
-    local expired_users=$(db_get_expired_users)
-    [[ -z "$expired_users" ]] && echo "$count" && return 0
-    
+    local count=0 need_xray=0 need_singbox=0 reload_failed=0
+    local -a notices=()
+
+    # 上一轮已禁用但重建/重载失败的核心：用户在 DB 中已是 disabled，不会再出现在
+    # 「过期且启用」列表里，必须靠标记重试，否则旧进程会一直接受已撤销的凭据。
+    _reload_pending xray && need_xray=1
+    _reload_pending singbox && need_singbox=1
+
+    local expired_users
+    expired_users=$(db_get_expired_users)
+    if [[ -z "$expired_users" && $need_xray -eq 0 && $need_singbox -eq 0 ]]; then echo "$count"; return 0; fi
+
+    local core proto name expire_date days_left
     while IFS='|' read -r core proto name expire_date days_left; do
         [[ -z "$name" ]] && continue
-        db_set_user_enabled "$core" "$proto" "$name" false
-        ((count++))
-        [[ "$notify" == "--notify" ]] && send_tg_expired_notice "$name" "$proto" "$expire_date"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
+        if _db_set_user_enabled_nowrite "$core" "$proto" "$name" false >/dev/null 2>&1; then
+            count=$((count + 1))
+            [[ "$core" == "xray" ]] && need_xray=1
+            [[ "$core" == "singbox" ]] && need_singbox=1
+            notices+=("$name|$proto|$expire_date")
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用失败: $name ($proto)" >> "$CFG/expire.log"
+        fi
     done <<< "$expired_users"
-    
-    if [[ $count -gt 0 ]]; then
-        rebuild_and_reload_xray "silent" 2>/dev/null
-        rebuild_and_reload_singbox "silent" 2>/dev/null
+
+    if [[ $need_xray -eq 1 ]]; then
+        rebuild_and_reload_xray "silent" >/dev/null 2>&1 || reload_failed=1
+    fi
+    if [[ $need_singbox -eq 1 ]]; then
+        rebuild_and_reload_singbox "silent" >/dev/null 2>&1 || reload_failed=1
+    fi
+    if [[ $reload_failed -eq 1 ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 数据库已禁用过期用户，但配置重建或服务重载失败，下轮检查将自动重试" >> "$CFG/expire.log"
+    fi
+
+    if [[ "$notify" == "--notify" ]]; then
+        local n
+        for n in "${notices[@]}"; do
+            IFS='|' read -r name proto expire_date <<< "$n"
+            send_tg_expired_notice "$name" "$proto" "$expire_date"
+        done
     fi
     echo "$count"
 }
@@ -1830,18 +2121,81 @@ send_expire_warnings() {
     echo "$count"
 }
 
+# ── cron 管理（流量同步 / 到期检查）──────────────────────────────────────────
+# 统一指向系统目录里的脚本（若存在），否则用当前脚本的绝对真实路径；
+# 绝不写入相对路径（cron 的工作目录是 $HOME，相对路径会静默失效）。
+_cron_script_path() {
+    local sys="/usr/local/bin/vless-server.sh" p
+    if [[ -x "$sys" ]]; then printf '%s' "$sys"; return 0; fi
+    p=$(readlink -f "$0" 2>/dev/null || true)
+    [[ "$p" == /* ]] || p="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+    printf '%s' "$p"
+}
+
+# 读取当前 crontab 到 stdout；「没有 crontab」视为空，其它读取错误返回 1（调用方据此拒绝覆盖，防止清空用户 cron）
+_cron_read() {
+    local err out rc
+    err=$(mktemp 2>/dev/null) || err=/dev/null
+    out=$(crontab -l 2>"$err"); rc=$?
+    if [[ $rc -ne 0 ]]; then
+        if [[ "$err" != /dev/null && -s "$err" ]] && ! grep -qiE 'no crontab|can.t open|no such file|not found' "$err"; then
+            [[ "$err" != /dev/null ]] && rm -f "$err"
+            return 1
+        fi
+        out=""
+    fi
+    [[ "$err" != /dev/null ]] && rm -f "$err"
+    printf '%s' "$out"
+}
+
+# 是否存在带指定参数的本项目 cron 行（匹配完整参数词，而不是任意子串）
+_cron_has() {
+    local flag="$1" cur
+    cur=$(_cron_read) || return 1
+    printf '%s\n' "$cur" | grep -qE -e "[[:space:]]${flag}([[:space:]]|\$)"
+}
+
+# 把 crontab 内容（stdin）写回；空内容用 crontab -r
+_cron_write() {
+    local content; content=$(cat)
+    if [[ -n "$content" ]]; then
+        printf '%s\n' "$content" | crontab -
+    else
+        crontab -r 2>/dev/null || true
+    fi
+}
+
+# 保证带 <flag> 的 cron 行恰好是 <line>：已一致则不动(返回0)；缺失或路径/间隔不同则替换(返回1)；失败返回2
+_cron_ensure() {
+    local flag="$1" line="$2" cur filtered
+    cur=$(_cron_read) || return 2
+    if printf '%s\n' "$cur" | grep -qxF -e "$line"; then
+        # 精确一致，且没有其它同类重复行
+        [[ "$(printf '%s\n' "$cur" | grep -cE -e "[[:space:]]${flag}([[:space:]]|\$)")" == "1" ]] && return 0
+    fi
+    filtered=$(printf '%s\n' "$cur" | grep -vE -e "[[:space:]]${flag}([[:space:]]|\$)" || true)
+    { [[ -n "$filtered" ]] && printf '%s\n' "$filtered"; printf '%s\n' "$line"; } | crontab - 2>/dev/null || return 2
+    return 1
+}
+
+# 移除带 <flag> 的 cron 行（读取失败时不改动）
+_cron_remove() {
+    local flag="$1" cur filtered
+    cur=$(_cron_read) || { _warn "无法读取 crontab，未修改"; return 1; }
+    printf '%s\n' "$cur" | grep -qE -e "[[:space:]]${flag}([[:space:]]|\$)" || return 0
+    filtered=$(printf '%s\n' "$cur" | grep -vE -e "[[:space:]]${flag}([[:space:]]|\$)" || true)
+    printf '%s' "$filtered" | _cron_write
+}
+
 # 安装过期检查 cron job (每天 3:00)
 install_expire_check_cron() {
-    local script_path="$0"
-    local cron_cmd="0 3 * * * $script_path --check-expire --notify >/dev/null 2>&1"
-    
-    if crontab -l 2>/dev/null | grep -q "check-expire"; then
-        _info "过期检查 cron 已存在"
-        return 0
-    fi
-    
-    (crontab -l 2>/dev/null; echo "$cron_cmd") | crontab -
-    [[ $? -eq 0 ]] && _ok "已安装过期检查 cron (每天 3:00)" || _err "安装失败"
+    local cron_cmd="0 3 * * * $(_cron_script_path) --check-expire --notify >/dev/null 2>&1"
+    _cron_ensure "--check-expire" "$cron_cmd"
+    case $? in
+        0) _info "过期检查 cron 已存在" ;;
+        1) _ok "已安装过期检查 cron (每天 3:00)" ;;
+        *) _err "安装失败"; return 1 ;;
+    esac
 }
 
 # 确保过期检查 cron 已安装（设置到期日期时自动调用）
@@ -1850,55 +2204,33 @@ install_expire_check_cron() {
 # 确保流量统计 cron 已安装（设置流量配额时自动调用）
 ensure_traffic_cron() {
     local interval="${1:-$(get_traffic_interval)}"
-    local script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-    local cron_cmd="*/$interval * * * * $script_path --sync-traffic >/dev/null 2>&1"
+    local cron_cmd="*/$interval * * * * $(_cron_script_path) --sync-traffic >/dev/null 2>&1"
     
-    if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
-        echo -e "  ${D}(流量统计定时任务已启用)${NC}"
-        return 0
-    fi
-    
-    if (crontab -l 2>/dev/null; echo "$cron_cmd") | crontab - 2>/dev/null; then
-        echo -e "  ${G}✓ 已自动安装流量统计定时任务 (每${interval}分钟)${NC}"
-        set_traffic_interval "$interval"
-        return 1
-    else
-        echo -e "  ${Y}提示: 流量统计定时任务未安装，可运行: ./vless-server.sh --setup-traffic-cron${NC}"
-        return 2
-    fi
+    _cron_ensure "--sync-traffic" "$cron_cmd"
+    case $? in
+        0) echo -e "  ${D}(流量统计定时任务已启用)${NC}"; return 0 ;;
+        1) echo -e "  ${G}✓ 已自动安装流量统计定时任务 (每${interval}分钟)${NC}"
+           set_traffic_interval "$interval"
+           return 1 ;;
+        *) echo -e "  ${Y}提示: 流量统计定时任务未安装，可在菜单 4 → 9 流量统计设置中启用${NC}"
+           return 2 ;;
+    esac
 }
 
 ensure_expire_check_cron() {
-    local script_path="$(readlink -f "$0" 2>/dev/null || echo "$0")"
-    local cron_cmd="0 3 * * * $script_path --check-expire --notify >/dev/null 2>&1"
+    local cron_cmd="0 3 * * * $(_cron_script_path) --check-expire --notify >/dev/null 2>&1"
     
-    # 如果已存在则跳过
-    if crontab -l 2>/dev/null | grep -q "check-expire"; then
-        echo -e "  ${D}(过期检查定时任务已启用)${NC}"
-        return 0
-    fi
-    
-    # 尝试安装
-    if (crontab -l 2>/dev/null; echo "$cron_cmd") | crontab - 2>/dev/null; then
-        echo -e "  ${G}✓ 已自动安装过期检查定时任务 (每天 3:00)${NC}"
-        return 1
-    else
-        echo -e "  ${Y}提示: 过期检查定时任务未安装，可运行: ./vless-server.sh --setup-expire-cron${NC}"
-        return 2
-    fi
+    _cron_ensure "--check-expire" "$cron_cmd"
+    case $? in
+        0) echo -e "  ${D}(过期检查定时任务已启用)${NC}"; return 0 ;;
+        1) echo -e "  ${G}✓ 已自动安装过期检查定时任务 (每天 3:00)${NC}"; return 1 ;;
+        *) echo -e "  ${Y}提示: 过期检查定时任务未安装，可运行: $(_cron_script_path) --setup-expire-cron${NC}"; return 2 ;;
+    esac
 }
 
 # 卸载过期检查 cron（保护现有 crontab，读取失败时不覆盖清空）
 uninstall_expire_check_cron() {
-    local current_cron filtered_cron
-    current_cron=$(crontab -l 2>/dev/null) || { _warn "当前无 crontab 或读取失败，未修改"; return 0; }
-    filtered_cron=$(printf '%s\n' "$current_cron" | grep -v "check-expire" || true)
-    if [[ -n "$filtered_cron" ]]; then
-        printf '%s\n' "$filtered_cron" | crontab -
-    else
-        crontab -r 2>/dev/null || true
-    fi
-    _ok "已移除过期检查 cron"
+    _cron_remove "--check-expire" && _ok "已移除过期检查 cron"
 }
 
 # 获取所有用户的流量统计 (用于显示，支持多端口数组格式)
@@ -1919,8 +2251,8 @@ db_get_users_stats() {
             if (.users | type) == "array" then
                 .users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(if .enabled == null then true else .enabled end)|\($port_cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif (.uuid != null or .password != null or .username != null) then
-                # 无 users 数组，生成默认用户（与 Xray email 格式一致使用 "default"）
-                "default|\(.uuid // .password // .username)|0|0|true|\(.port)||"
+                # 无 users 数组，生成默认用户（与 Xray email 格式一致使用 "default"；密码型协议优先顶层 password）
+                "default|\(if ($p | IN("anytls","hy2","trojan","ss-legacy","socks")) then (if (.password // "") != "" then .password elif (.uuid // "") != "" then .uuid else (.username // "") end) else (if (.uuid // "") != "" then .uuid elif (.password // "") != "" then .password else (.username // "") end) end)|0|0|true|\(.port)||"
             else
                 empty
             end
@@ -1929,7 +2261,7 @@ db_get_users_stats() {
             if ($cfg.users | type) == "array" then
                 $cfg.users[] | "\(.name)|\(.uuid)|\(.used // 0)|\(.quota // 0)|\(if .enabled == null then true else .enabled end)|\($cfg.port)|\(.routing // "")|\(.expire_date // "")"
             elif ($cfg.uuid != null or $cfg.password != null or $cfg.username != null) then
-                "default|\($cfg.uuid // $cfg.password // $cfg.username)|0|0|true|\($cfg.port)||"
+                "default|\(if ($p | IN("anytls","hy2","trojan","ss-legacy","socks")) then (if ($cfg.password // "") != "" then $cfg.password elif ($cfg.uuid // "") != "" then $cfg.uuid else ($cfg.username // "") end) else (if ($cfg.uuid // "") != "" then $cfg.uuid elif ($cfg.password // "") != "" then $cfg.password else ($cfg.username // "") end) end)|0|0|true|\($cfg.port)||"
             else
                 empty
             end
@@ -1969,25 +2301,9 @@ db_migrate_to_multiuser() {
             supports_per_user_management "$proto" || continue
             local has_users=$(jq -r --arg p "$proto" ".${core}[\$p].users // \"none\"" "$DB_FILE" 2>/dev/null)
             if [[ "$has_users" == "none" ]]; then
-                # 需要迁移：将现有配置转为默认用户
-                local uuid=$(db_get_field "$core" "$proto" "uuid")
-                local password=$(db_get_field "$core" "$proto" "password")
-                local psk=$(db_get_field "$core" "$proto" "psk")
-                
-                # 根据协议类型确定用户凭证
-                local user_cred=""
-                if [[ -n "$uuid" ]]; then
-                    user_cred="$uuid"
-                elif [[ -n "$password" ]]; then
-                    user_cred="$password"
-                elif [[ -n "$psk" ]]; then
-                    user_cred="$psk"
-                fi
-                
-                if [[ -n "$user_cred" ]]; then
-                    local created=$(date '+%Y-%m-%d')
-                    _db_apply --arg p "$proto" --arg u "$user_cred" --arg c "$created" \
-                        ".${core}[\$p].users = [{name:\"default\",uuid:\$u,quota:0,used:0,enabled:true,created:\$c}]"
+                # 需要迁移：将现有配置转为默认用户（TUIC 同时保存独立 password）
+                if _db_apply --arg p "$proto" --arg cr "$(date '+%Y-%m-%d')" \
+                    "${_DB_MIG_JQ}.${core}[\$p] |= _mig_all(\$p; \$cr)"; then
                     migrated=true
                 fi
             fi
@@ -2001,12 +2317,108 @@ db_migrate_to_multiuser() {
 # 用法: rebuild_and_reload_xray [silent]
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_xray() {
+    mkdir -p "$CFG" 2>/dev/null || { _reload_pending_arm xray >/dev/null; return 1; }
+    local apply_lock snap had=0 pre_tok="" rc=0
+    apply_lock=$(_reload_apply_lock_dir xray)
+    # 整段串行化「代次快照 → 配置生成与原子替换 → 服务重启 → 代次确认」，
+    # 防止并发旧批次在配置生成较慢时晚于新批次覆盖 config.json 导致已吊销凭据复活。
+    if ! _lockdir_acquire "$apply_lock" 300; then
+        _reload_pending_arm xray >/dev/null
+        [[ -z "${1:-}" ]] && _err "获取 Xray 重载锁超时，已保留待重载标记"
+        return 1
+    fi
+    if ! snap=$(_reload_pending_snapshot_fenced xray); then
+        _reload_pending_arm xray >/dev/null
+        _lockdir_release "$apply_lock"
+        [[ -z "${1:-}" ]] && _err "获取数据库快照锁超时，已保留待重载标记"
+        return 1
+    fi
+    had="${snap%%|*}"
+    pre_tok="${snap#*|}"
+    _rebuild_and_reload_xray_impl "$@" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        _reload_pending_ack xray "$had" "$pre_tok"
+    else
+        _reload_pending_arm xray >/dev/null
+    fi
+    _lockdir_release "$apply_lock"
+    return "$rc"
+}
+
+# 记录/确认「DB 已改但运行中进程尚未应用」代次标记 + 同核心配置发布串行锁：
+# - 全局锁序：.reload-apply.<core>.lock → traffic.lock → db.lock → .reload-pending.<core>.lock（严格单向无环）
+# - 禁用写入在 db.lock 围栏内执行 pre-arm → 写库 → post-arm；rebuild 在 .reload-apply.<core>.lock 内
+#   经 db.lock 围栏取快照后执行「配置渲染 + 原子替换 + 服务重启 + 代次匹配确认」，既保证旧批次绝不能
+#   覆盖新批次配置，也保证写库前 pre-arm 绝不会被另一批次在写库完成前提前清掉。
+_RELOAD_PENDING_SEQ=0
+_reload_apply_lock_dir() { printf '%s/.reload-apply.%s.lock' "$CFG" "$1"; }
+_reload_pending_gen() {
+    _RELOAD_PENDING_SEQ=$((_RELOAD_PENDING_SEQ + 1))
+    printf '%s-%s-%s-%s' "$(date +%s%N 2>/dev/null || date +%s)" "$$" "$_RELOAD_PENDING_SEQ" "$RANDOM"
+}
+_reload_pending_arm() { # _reload_pending_arm <xray|singbox> -> stdout: token
+    local core="$1" f="$CFG/.reload-pending.$1" lock="$CFG/.reload-pending.$1.lock" tok tmp locked=0
+    mkdir -p "$CFG" 2>/dev/null || true
+    tok=$(_reload_pending_gen)
+    _lockdir_acquire "$lock" 50 >/dev/null 2>&1 && locked=1
+    tmp=$(mktemp "$CFG/.reload-pending.${core}.tmp.XXXXXX" 2>/dev/null) || tmp=""
+    if [[ -n "$tmp" ]]; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        if printf '%s\n' "$tok" > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null; then
+            :
+        else
+            rm -f "$tmp" 2>/dev/null || true
+            ( umask 077; printf '%s\n' "$tok" > "$f" ) 2>/dev/null || true
+        fi
+    else
+        ( umask 077; printf '%s\n' "$tok" > "$f" ) 2>/dev/null || true
+    fi
+    [[ $locked -eq 1 ]] && _lockdir_release "$lock" >/dev/null 2>&1 || true
+    printf '%s' "$tok"
+}
+_reload_pending_snapshot() { # _reload_pending_snapshot <xray|singbox> -> stdout: "<0|1>|<token>"
+    local core="$1" f="$CFG/.reload-pending.$1" lock="$CFG/.reload-pending.$1.lock" had=0 tok="" locked=0
+    _lockdir_acquire "$lock" 50 >/dev/null 2>&1 && locked=1
+    if [[ -e "$f" ]]; then
+        had=1
+        tok=$(cat "$f" 2>/dev/null || true)
+    fi
+    [[ $locked -eq 1 ]] && _lockdir_release "$lock" >/dev/null 2>&1 || true
+    printf '%s|%s' "$had" "$tok"
+}
+_reload_pending_snapshot_fenced() { # _reload_pending_snapshot_fenced <xray|singbox> -> stdout: "<0|1>|<token>"
+    local core="$1" snap=""
+    mkdir -p "$CFG" 2>/dev/null || return 1
+    _db_lock_acquire || return 1
+    snap=$(_reload_pending_snapshot "$core")
+    _db_lock_release
+    printf '%s' "$snap"
+}
+_reload_pending_ack() { # _reload_pending_ack <xray|singbox> <had> <pre_tok>
+    local core="$1" had="${2:-0}" pre_tok="${3:-}"
+    local f="$CFG/.reload-pending.$1" lock="$CFG/.reload-pending.$1.lock" cur=""
+    [[ "$had" -eq 1 ]] || return 0
+    # 获取不到元数据锁时保守保留标记，绝不在无锁状态下删除
+    _lockdir_acquire "$lock" 50 >/dev/null 2>&1 || return 0
+    if [[ -e "$f" ]]; then
+        cur=$(cat "$f" 2>/dev/null || true)
+        if [[ "$cur" == "$pre_tok" ]]; then
+            rm -f "$f" 2>/dev/null || true
+        fi
+    fi
+    _lockdir_release "$lock" >/dev/null 2>&1 || true
+}
+_reload_pending() { [[ -e "$CFG/.reload-pending.$1" ]]; }
+
+_rebuild_and_reload_xray_impl() {
     local silent="${1:-}"
     
     # 重新生成 Xray 配置
     if generate_xray_config 2>/dev/null; then
         # 检查 Xray 服务是否在运行
         if svc status vless-reality 2>/dev/null; then
+            # 重启会清零 Xray 内存中的流量计数器：先把未同步的增量落盘到 pending 日志（尽力而为）
+            _traffic_collect_to_journal 2>/dev/null || true
             # 重启服务确保配置生效 (reload 可能不可靠)
             if svc restart vless-reality 2>/dev/null; then
                 [[ -z "$silent" ]] && _ok "配置已更新并重载"
@@ -2029,10 +2441,41 @@ rebuild_and_reload_xray() {
 # 用法: rebuild_and_reload_singbox [silent]
 # 参数: silent - 如果设置则不输出成功信息
 rebuild_and_reload_singbox() {
+    mkdir -p "$CFG" 2>/dev/null || { _reload_pending_arm singbox >/dev/null; return 1; }
+    local apply_lock snap had=0 pre_tok="" rc=0
+    apply_lock=$(_reload_apply_lock_dir singbox)
+    # 整段串行化「代次快照 → 配置生成与原子替换 → 服务重启/停服 → 代次确认」，
+    # 防止并发旧批次晚于新批次覆盖 singbox.json 导致已吊销凭据复活。
+    if ! _lockdir_acquire "$apply_lock" 300; then
+        _reload_pending_arm singbox >/dev/null
+        [[ -z "${1:-}" ]] && _err "获取 Sing-box 重载锁超时，已保留待重载标记"
+        return 1
+    fi
+    if ! snap=$(_reload_pending_snapshot_fenced singbox); then
+        _reload_pending_arm singbox >/dev/null
+        _lockdir_release "$apply_lock"
+        [[ -z "${1:-}" ]] && _err "获取数据库快照锁超时，已保留待重载标记"
+        return 1
+    fi
+    had="${snap%%|*}"
+    pre_tok="${snap#*|}"
+    _rebuild_and_reload_singbox_impl "$@" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        _reload_pending_ack singbox "$had" "$pre_tok"
+    else
+        _reload_pending_arm singbox >/dev/null
+    fi
+    _lockdir_release "$apply_lock"
+    return "$rc"
+}
+
+_rebuild_and_reload_singbox_impl() {
     local silent="${1:-}"
+    local gen_rc=0
     
-    # 重新生成 Sing-box 配置
-    if generate_singbox_config; then
+    # 重新生成 Sing-box 配置（rc=0 正常生成；rc=2 全部协议均无启用用户并已清配置；rc=1 真正生成/预检失败）
+    generate_singbox_config || gen_rc=$?
+    if [[ $gen_rc -eq 0 ]]; then
         # 检查 Sing-box 服务是否在运行
         if svc status vless-singbox 2>/dev/null; then
             # 重载服务
@@ -2047,8 +2490,22 @@ rebuild_and_reload_singbox() {
             [[ -z "$silent" ]] && _ok "Sing-box 配置已更新"
             return 0
         fi
+    elif [[ $gen_rc -eq 2 ]]; then
+        # 所有 Sing-box 协议均无启用用户（例如最后一位用户到期/被禁用）：
+        # 清除配置并停止服务即为预期收敛状态；停服成功（或本已停止）返回 0 以确认待办，停服失败才返回 1 继续重试。
+        if svc status vless-singbox 2>/dev/null; then
+            if svc stop vless-singbox 2>/dev/null; then
+                [[ -z "$silent" ]] && _ok "Sing-box 无启用用户，已清除配置并停止服务"
+                return 0
+            else
+                [[ -z "$silent" ]] && _err "Sing-box 无启用用户，但停止运行中服务失败"
+                return 1
+            fi
+        fi
+        [[ -z "$silent" ]] && _ok "Sing-box 无启用用户，配置已清除且服务已停止"
+        return 0
     else
-        # 若因全部用户被禁用/过期导致无有效配置，停止运行中的服务，避免内存中残留旧凭据继续生效
+        # 真正生成或预检失败：若 singbox.json 不存在且服务仍在跑，尝试停服；无论如何返回 1 保留重试标记
         if [[ ! -f "$CFG/singbox.json" ]] && svc status vless-singbox 2>/dev/null; then
             svc stop vless-singbox 2>/dev/null || true
         fi
@@ -2318,128 +2775,208 @@ get_user_traffic() {
     echo $((uplink + downlink))
 }
 
+# ── 流量计数器 → 持久化日志（pending journal）───────────────────────────────
+# Xray 的统计计数器只在进程内存里：`statsquery -reset` 会在返回当前值的同时原子清零，
+# 进程重启也会清零。因此「读出即落盘」：先把读出的增量追加到 $CFG/cache/traffic.pending，
+# 再由 sync 逐用户写入 db.json，只有写库成功的条目才从日志里删除；写库失败（锁超时、
+# jq 失败）的增量留到下一轮重试，不会丢失。
+_traffic_pending_file() { printf '%s/cache/traffic.pending' "$CFG"; }
+_traffic_lock_dir()     { printf '%s/cache/traffic.lock' "$CFG"; }
+_TRAFFIC_SYNC_ACTIVE=0
+
+# 读出并清零 Xray 当前计数器，把非零的 user 计数追加到 pending 日志。
+# 仅做「读+落盘」，不写 db.json、不做配额判断，失败面最小；重启 Xray 之前也调用它。
+_traffic_collect_to_journal() {
+    _pgrep xray >/dev/null 2>&1 || return 0
+    command -v xray >/dev/null 2>&1 || return 0
+    mkdir -p -m 700 "$CFG/cache" 2>/dev/null || return 1
+    _lockdir_acquire "$(_traffic_lock_dir)" 100 || return 1
+
+    local tmp rc=0
+    tmp=$(mktemp "$CFG/cache/traffic.collect.XXXXXX") || { _lockdir_release "$(_traffic_lock_dir)"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    local -a to=()
+    command -v timeout >/dev/null 2>&1 && to=(timeout 10)
+    # statsquery -reset 原子地返回并清零；API 不可达时不会清零，直接放弃本轮
+    if "${to[@]}" xray api statsquery --server="127.0.0.1:${XRAY_API_PORT}" -reset 2>/dev/null \
+        | jq -r '.stat[]? | select((.name // .Name) | startswith("user>>>")) | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp" 2>/dev/null \
+        && [[ ${PIPESTATUS[0]} -eq 0 ]]; then
+        if [[ -s "$tmp" ]]; then
+            # 每条日志带唯一标识（name value id），供入账幂等去重
+            local _batch; _batch="$(date +%s%N 2>/dev/null || date +%s)-$$-$RANDOM"
+            ( umask 077; awk -v b="$_batch" '{print $0, b "-" NR}' "$tmp" >> "$(_traffic_pending_file)" ) || rc=1
+        fi
+    else
+        rc=1
+    fi
+    rm -f "$tmp"
+    _lockdir_release "$(_traffic_lock_dir)"
+    return "$rc"
+}
+
 # 同步所有用户流量到数据库
-# 用法: sync_all_user_traffic [reset]
+# 用法: sync_all_user_traffic [reset]   （reset 参数仅为兼容旧调用保留，计数始终先落盘再清零）
 sync_all_user_traffic() {
-    local reset="${1:-true}"  # 默认重置计数器
-    
     [[ ! -f "$DB_FILE" ]] && return 1
-    
+
     # 检查是否需要发送每日报告 (在流量统计之前调用，确保不会被 early return 跳过)
     check_daily_report
-    
-    # 检查 Xray 是否运行 (使用兼容 Alpine 的 _pgrep)
-    if ! _pgrep xray; then
-        return 0  # 改为 return 0，因为每日报告已处理，不算错误
+
+    # 由 db_set_user_enabled → rebuild_and_reload_xray → flush 间接重入时直接返回
+    [[ "$_TRAFFIC_SYNC_ACTIVE" == "1" ]] && return 0
+
+    mkdir -p -m 700 "$CFG/cache" 2>/dev/null || return 1
+    _TRAFFIC_SYNC_ACTIVE=1
+    local rc=0 _post_reload=0
+    # 配额禁用 / 到期禁用已写入 DB 但上一轮重建或重载失败：用户已是 disabled，
+    # 不会再被本轮识别为「需要禁用」，必须靠标记重试，否则旧进程继续接受已撤销的凭据。
+    # 在获取 traffic.lock 之前执行重载，维持全局锁序 (.reload-apply.xray.lock → traffic.lock)。
+    if _reload_pending xray; then
+        if ! rebuild_and_reload_xray "silent" 2>/dev/null; then
+            _err "上一轮失败的 Xray 重建/重载仍未成功，将在下一轮继续重试"
+            rc=1
+        fi
     fi
-    
-    # 使用临时文件存储 API 结果，避免内存问题
-    local tmp_stats=$(mktemp)
-    trap "rm -f '$tmp_stats'" RETURN
-    
-    # 一次性获取所有流量统计（带重置选项）
-    local reset_flag=""
-    [[ "$reset" == "true" ]] && reset_flag="-reset"
-    
-    if ! xray api statsquery --server=127.0.0.1:${XRAY_API_PORT} $reset_flag 2>/dev/null | \
-         jq -r '.stat[]? | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp_stats" 2>/dev/null; then
-        rm -f "$tmp_stats"
+    # 串行化 cron / 菜单 / 重启前 flush，避免并发消费同一份 pending 日志
+    if ! _lockdir_acquire "$(_traffic_lock_dir)" 100; then
+        _TRAFFIC_SYNC_ACTIVE=0
+        _warn "流量同步锁等待超时，已跳过本轮"
         return 1
     fi
-    
-    [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
-    
-    local updated=0
-    local need_reload=false  # 标记是否需要重载配置
-    local notify_percent=$(tg_get_config "notify_quota_percent")
+    _TRAFFIC_NEED_RELOAD=0
+    _sync_all_user_traffic_locked || rc=1
+    _post_reload=$_TRAFFIC_NEED_RELOAD
+    _lockdir_release "$(_traffic_lock_dir)"
+    # 释放 traffic.lock 后再执行配额禁用后的 Xray 重建与重启，维持全局锁序避免 AB-BA 死锁
+    if [[ $_post_reload -eq 1 ]]; then
+        if ! rebuild_and_reload_xray "silent" 2>/dev/null; then
+            _err "配额禁用后 Xray 配置重建或重启失败，请人工核对"
+            rc=1
+        fi
+    fi
+    _TRAFFIC_SYNC_ACTIVE=0
+    return "$rc"
+}
+
+_sync_all_user_traffic_locked() {
+    local pending; pending=$(_traffic_pending_file)
+    local sync_failed=0
+
+    # 1) 把 Xray 内存里的增量读出并落盘：
+    #    - Xray 未运行或未安装时 _traffic_collect_to_journal 返回 0（主动跳过，不记为失败）
+    #    - Xray 在运行时若 API 查询/解析/追加日志失败，返回非 0 并传播到退出码，同时继续消费已有日志
+    if ! _traffic_collect_to_journal; then
+        sync_failed=1
+    fi
+
+    [[ -s "$pending" ]] || return "$sync_failed"
+
+    local keep_list agg
+    keep_list=$(mktemp "$CFG/cache/traffic.keep.XXXXXX") || return 1
+    agg=$(mktemp "$CFG/cache/traffic.agg.XXXXXX") || { rm -f "$keep_list"; return 1; }
+    chmod 600 "$keep_list" "$agg" 2>/dev/null || true
+    # 同名计数可能在日志里出现多次（多轮未处理），先按名求和
+    awk '{s[$1]+=$2} END{for(k in s) printf "%s %.0f\n", k, s[k]}' "$pending" > "$agg"
+
+    local notify_percent
+    notify_percent=$(tg_get_config "notify_quota_percent")
     notify_percent=${notify_percent:-80}
-    
-    # 定义告警阈值档位（依次检查，每档只发一次）
     local -a alert_thresholds=(80 90 95)
-    
+    local need_reload=false
+    local proto users user email uplink downlink traffic
+
     # 遍历所有 Xray 协议
     for proto in $(db_list_protocols "xray"); do
-        local users=$(db_list_users "xray" "$proto")
+        users=$(db_list_users "xray" "$proto")
         [[ -z "$users" ]] && continue
-        
+
         while IFS= read -r user; do
             [[ -z "$user" ]] && continue
-            local email="${user}@${proto}"
-            
-            # 从临时文件中提取流量值
-            local uplink=$(grep -F "user>>>${email}>>>traffic>>>uplink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-            local downlink=$(grep -F "user>>>${email}>>>traffic>>>downlink " "$tmp_stats" 2>/dev/null | awk '{print $NF}')
-            
+            email="${user}@${proto}"
+
+            uplink=$(awk -v k="user>>>${email}>>>traffic>>>uplink" '$1==k{print $2}' "$agg")
+            downlink=$(awk -v k="user>>>${email}>>>traffic>>>downlink" '$1==k{print $2}' "$agg")
             uplink=${uplink:-0}
             downlink=${downlink:-0}
-            local traffic=$((uplink + downlink))
-            
-            if [[ "$traffic" -gt 0 ]]; then
-                # 更新数据库
-                db_update_user_traffic "xray" "$proto" "$user" "$traffic"
-                ((updated++))
-                
-                # 检查配额
-                local quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
-                local used=$(db_get_user_field "xray" "$proto" "$user" "used")
-                
-                if [[ "$quota" -gt 0 ]]; then
-                    local percent=$((used * 100 / quota))
-                    
-                    # 超限检查 (只处理一次)
-                    if [[ "$used" -ge "$quota" ]]; then
-                        # 检查是否已发送过超限通知
-                        local exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
-                        if [[ "$exceeded_notified" != "true" ]]; then
-                            # 禁用用户
-                            db_set_user_enabled "xray" "$proto" "$user" "false"
-                            # 标记已发送超限通知
-                            db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
-                            # 发送通知
-                            tg_send_over_quota "$user" "$proto" "$used" "$quota"
-                            # 标记需要重载配置
+            traffic=$((uplink + downlink))
+            [[ "$traffic" -gt 0 ]] || continue
+
+            local _entries
+            _entries=$(awk -v e="$email" 'BEGIN{u="user>>>" e ">>>traffic>>>uplink"; d="user>>>" e ">>>traffic>>>downlink"}
+                ($1==u||$1==d){c[$0]++; id=($3!="" ? $3 : "L-" $1 "-" $2 "-" c[$0]); print id, $2}' "$pending" \
+                | jq -Rn '[inputs | split(" ") | {id: .[0], v: (.[1] | tonumber)}]' 2>/dev/null)
+            [[ -n "$_entries" ]] || _entries='[]'
+            if ! db_update_user_traffic "xray" "$proto" "$user" "$traffic" "$_entries"; then
+                # 写库失败：保留这个用户的日志条目待下轮重试，同时置位失败码让 cron 可见（不阻塞其它用户）
+                printf '%s\n%s\n' "user>>>${email}>>>traffic>>>uplink" "user>>>${email}>>>traffic>>>downlink" >> "$keep_list"
+                sync_failed=1
+                continue
+            fi
+
+            # 检查配额
+            local quota used percent
+            quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
+            used=$(db_get_user_field "xray" "$proto" "$user" "used")
+            quota=${quota:-0}; used=${used:-0}
+            if [[ "$quota" -gt 0 ]]; then
+                percent=$((used * 100 / quota))
+
+                if [[ "$used" -ge "$quota" ]]; then
+                    # 超限：仍处于启用状态就禁用（不依赖一次性通知标记，重置/重新启用后可再次触发）
+                    local enabled exceeded_notified
+                    enabled=$(db_get_user_field "xray" "$proto" "$user" "enabled")
+                    if [[ "$enabled" != "false" ]]; then
+                        if _db_set_user_enabled_nowrite "xray" "$proto" "$user" "false" 2>/dev/null; then
                             need_reload=true
-                        fi
-                    elif [[ "$percent" -ge "$notify_percent" ]]; then
-                        # 告警检查：只在跨越新的阈值档位时发送
-                        local last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
-                        last_alert=${last_alert:-0}
-                        
-                        # 找到当前应该告警的最高档位
-                        local should_alert=false
-                        local current_threshold=0
-                        for threshold in "${alert_thresholds[@]}"; do
-                            if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
-                                should_alert=true
-                                current_threshold=$threshold
+                            exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
+                            if [[ "$exceeded_notified" != "true" ]]; then
+                                db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
+                                tg_send_over_quota "$user" "$proto" "$used" "$quota"
                             fi
-                        done
-                        
-                        if [[ "$should_alert" == "true" ]]; then
-                            # 发送告警并更新记录
-                            tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
-                            db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                        else
+                            sync_failed=1
                         fi
+                    fi
+                elif [[ "$percent" -ge "$notify_percent" ]]; then
+                    # 告警检查：只在跨越新的阈值档位时发送
+                    local last_alert should_alert=false current_threshold=0 threshold
+                    last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
+                    last_alert=${last_alert:-0}
+                    for threshold in "${alert_thresholds[@]}"; do
+                        if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
+                            should_alert=true
+                            current_threshold=$threshold
+                        fi
+                    done
+                    if [[ "$should_alert" == "true" ]]; then
+                        tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
+                        db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
                     fi
                 fi
             fi
         done <<< "$users"
     done
-    
-    rm -f "$tmp_stats"
-    
-    # 批量处理完成后统一重载配置（仅当配置生成成功后才重启服务）
-    if [[ "$need_reload" == "true" ]]; then
-        if generate_xray_config 2>/dev/null; then
-            svc restart vless-reality 2>/dev/null || true
-        else
-            _err "配额禁用后 Xray 配置重建失败，未重启服务"
+
+    # 2) 日志只保留写库失败的条目（已成功写入的、以及已不存在用户的条目都丢弃）
+    if [[ -s "$keep_list" ]]; then
+        local newp; newp=$(mktemp "$CFG/cache/traffic.pending.XXXXXX")
+        chmod 600 "$newp" 2>/dev/null || true
+        if ! { awk 'NR==FNR{k[$1]=1; next} ($1 in k)' "$keep_list" "$pending" > "$newp" && mv -f "$newp" "$pending"; }; then
+            rm -f "$newp"
+            sync_failed=1
         fi
+    else
+        : > "$pending" || sync_failed=1
     fi
-    
+    rm -f "$keep_list" "$agg"
+
+    # 批量处理完成后通知外层释放 traffic.lock 再统一重载配置（仅当配置生成成功后才重启服务）
+    if [[ "$need_reload" == "true" ]]; then
+        _TRAFFIC_NEED_RELOAD=1
+    fi
+
     # 注：Sing-box 协议 (hy2/tuic) 暂不支持流量统计（需要完整版编译）
-    
-    return 0
+    return "$sync_failed"
 }
 
 # 获取所有用户流量统计 (用于显示)
@@ -2508,14 +3045,12 @@ set_traffic_interval() {
 # 创建流量统计定时任务
 setup_traffic_cron() {
     local interval="${1:-$(get_traffic_interval)}"
-    local script_path=$(readlink -f "$0")
-    local cron_cmd="*/$interval * * * * $script_path --sync-traffic >/dev/null 2>&1"
+    local cron_cmd="*/$interval * * * * $(_cron_script_path) --sync-traffic >/dev/null 2>&1"
     
-    # 先移除旧的定时任务
-    crontab -l 2>/dev/null | grep -v "sync-traffic" | crontab - 2>/dev/null
-    
-    # 添加新的定时任务
-    (crontab -l 2>/dev/null; echo "$cron_cmd") | crontab -
+    if _cron_ensure "--sync-traffic" "$cron_cmd"; [[ $? -eq 2 ]]; then
+        _err "写入 crontab 失败"
+        return 1
+    fi
     
     # 保存间隔设置
     set_traffic_interval "$interval"
@@ -2525,8 +3060,7 @@ setup_traffic_cron() {
 
 # 移除流量统计定时任务
 remove_traffic_cron() {
-    crontab -l 2>/dev/null | grep -v "sync-traffic" | crontab -
-    _ok "已移除流量统计定时任务"
+    _cron_remove "--sync-traffic" && _ok "已移除流量统计定时任务"
 }
 
 
@@ -2571,10 +3105,16 @@ build_config() {
 
 # 保存 JOIN 信息到文件
 # 用法: _save_join_info "协议名" "数据格式" "链接生成命令" [额外行...]
-# 数据格式中 %s 会被替换为 IP，%b 会被替换为 [IP] (IPv6 带括号)
-# 示例: _save_join_info "vless" "REALITY|%s|$port|$uuid" "gen_vless_link %s $port $uuid"
+# 数据格式与链接命令中「第一个」%s 会被替换为 IP（IPv6 带括号）
+# 示例: _save_join_info "vless" "REALITY|%s|$port|$uuid" "gen_vless_link %s $(_q "$port") $(_q "$uuid")"
+# 注意: 链接命令里的每个用户值必须经 _q 转义（内部用 eval 拆分参数）
+# _q: 将值转义为可安全放进 eval 命令串的单个 Shell 词
+_q() { printf '%q' "$1"; }
+
 _save_join_info() {
     local protocol="$1" data_fmt="$2" link_cmd="$3"; shift 3
+    # 协议注册（写库）失败时不得生成分享文件，避免为不存在的协议发出链接
+    [[ "${_REGISTER_FAILED:-0}" == "1" ]] && return 1
     local join_file="$CFG/${protocol}.join"
     local link_prefix; link_prefix=$(tr '[:lower:]-' '[:upper:]_' <<<"$protocol")
     : >"$join_file"
@@ -2586,9 +3126,12 @@ _save_join_info() {
         [[ -z "$ip" ]] && continue
         ipfmt=$ip; [[ "$label" == V6 ]] && ipfmt="[$ip]"
 
-        data=${data_fmt//%s/$ipfmt}; data=${data//%b/$ipfmt}
+        # 只替换「第一个」占位符：口令/路径等用户输入里即使含 %s 也不会被二次替换。
+        data=${data_fmt/\%s/$ipfmt}
         code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64)
-        cmd=${link_cmd//%s/$ipfmt}; cmd=${cmd//%b/$ipfmt}
+        # link_cmd 里的用户值已由调用方经 _q（printf %q）转义，eval 只做参数拆分，
+        # 不会对自定义口令/路径再做一次 Shell 解释（$()、反引号、空格、引号均按字面）。
+        cmd=${link_cmd/ %s / $(_q "$ipfmt") }
         link=$(eval "$cmd")
 
         printf '# IPv%s\nJOIN_%s=%s\n%s_%s=%s\n' "${label#V}" "$label" "$code" "$link_prefix" "$label" "$link" >>"$join_file"
@@ -2689,6 +3232,29 @@ _is_real_cert() {
     [[ "$issuer" == *"Google Trust Services"* ]]
 }
 
+# 把渲染好的 nginx 配置装入 <dest>（可选 <enabled_link> 软链接）；nginx -t 失败则回滚：
+# 有旧文件就恢复旧文件，没有就删除新文件和链接。返回 0=已生效配置通过测试, 1=已回滚
+_nginx_install_conf() {
+    local src="$1" dest="$2" link="${3:-}" bak="" link_existed=false
+    [[ -e "$dest" ]] && { bak=$(mktemp) && cp -p "$dest" "$bak" 2>/dev/null || bak=""; }
+    [[ -n "$link" && ( -e "$link" || -L "$link" ) ]] && link_existed=true
+    cp -f "$src" "$dest" || { [[ -n "$bak" ]] && rm -f "$bak"; return 1; }
+    chmod 644 "$dest" 2>/dev/null || true
+    [[ -n "$link" ]] && ln -sf "$dest" "$link" 2>/dev/null
+    if nginx -t &>/dev/null; then
+        [[ -n "$bak" ]] && rm -f "$bak"
+        return 0
+    fi
+    nginx -t 2>&1 | tail -n 5 >&2
+    if [[ -n "$bak" ]]; then
+        cp -pf "$bak" "$dest"; rm -f "$bak"
+    else
+        rm -f "$dest"
+        [[ -n "$link" && "$link_existed" == false ]] && rm -f "$link"
+    fi
+    return 1
+}
+
 # 配置 Nginx 反代 XHTTP (h2c 模式，用于 TLS+CDN)
 # 用法: _setup_nginx_xhttp_proxy "domain.com" "18080" "/xhttp_path"
 _setup_nginx_xhttp_proxy() {
@@ -2715,9 +3281,22 @@ _setup_nginx_xhttp_proxy() {
         return 1
     fi
     
-    # 生成 XHTTP 反代配置 (h2c 模式)
+    # 输入校验：这些值会被代入 nginx 配置（sed 替换/配置语法），只接受安全字符集
+    if [[ ! "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+        _err "无效的域名: $domain"; return 1
+    fi
+    if [[ ! "$path" =~ ^/[A-Za-z0-9._~/-]*$ ]]; then
+        _err "无效的 XHTTP 路径（仅允许 字母数字 . _ ~ / -）: $path"; return 1
+    fi
+    if [[ ! "$internal_port" =~ ^[0-9]{1,5}$ ]]; then
+        _err "无效的内部端口: $internal_port"; return 1
+    fi
+
+    # 生成 XHTTP 反代配置 (h2c 模式)；先渲染到临时文件，nginx -t 通过后才落盘
     # 注意: 使用 listen ... http2 语法兼容所有 Nginx 版本
-    cat > "$nginx_conf" << 'NGINX_EOF'
+    local nginx_stage
+    nginx_stage=$(mktemp) || { _err "无法创建临时文件"; return 1; }
+    cat > "$nginx_stage" << 'NGINX_EOF'
 # XHTTP TLS+CDN 反代配置 - 供 Cloudflare CDN 使用
 # 此配置由脚本自动生成，请勿手动修改
 server {
@@ -2752,24 +3331,22 @@ server {
 NGINX_EOF
     
     # 替换占位符
-    sed -i "s|DOMAIN_PLACEHOLDER|${domain}|g" "$nginx_conf"
-    sed -i "s|CFG_PLACEHOLDER|${CFG}|g" "$nginx_conf"
-    sed -i "s|PATH_PLACEHOLDER|${path}|g" "$nginx_conf"
-    sed -i "s|PORT_PLACEHOLDER|${internal_port}|g" "$nginx_conf"
-    
-    # 如果是 sites-available 模式，创建软链接
-    if [[ "$nginx_conf" == *"sites-available"* ]]; then
-        ln -sf "$nginx_conf" "/etc/nginx/sites-enabled/xhttp-cdn" 2>/dev/null
-    fi
-    
-    # 测试并重载 nginx
-    if nginx -t &>/dev/null; then
+    sed -i "s|DOMAIN_PLACEHOLDER|${domain}|g" "$nginx_stage"
+    sed -i "s|CFG_PLACEHOLDER|${CFG}|g" "$nginx_stage"
+    sed -i "s|PATH_PLACEHOLDER|${path}|g" "$nginx_stage"
+    sed -i "s|PORT_PLACEHOLDER|${internal_port}|g" "$nginx_stage"
+
+    # 装入并测试；失败时恢复原配置（或删除新文件），不把坏配置留在共享 Nginx 里
+    local enabled_link=""
+    [[ "$nginx_conf" == *"sites-available"* ]] && enabled_link="/etc/nginx/sites-enabled/xhttp-cdn"
+    if _nginx_install_conf "$nginx_stage" "$nginx_conf" "$enabled_link"; then
+        rm -f "$nginx_stage"
         nginx -s reload &>/dev/null
         _ok "Nginx XHTTP 反代配置成功"
         return 0
     else
-        _err "Nginx 配置错误"
-        nginx -t
+        rm -f "$nginx_stage"
+        _err "Nginx 配置错误，已恢复原配置"
         return 1
     fi
 }
@@ -2798,7 +3375,7 @@ gen_vless_xhttp_tls_cdn_config() {
         '.users = [{"name": $name, "uuid": $uuid, "quota": 0, "used": 0, "enabled": true, "created": (now | strftime("%Y-%m-%d"))}]')
     
     # 使用 register_protocol 支持多端口和覆盖模式
-    register_protocol "$protocol" "$config_json"
+    register_protocol "$protocol" "$config_json" || return 1
     
     # 生成分享链接 (URL 编码 path)
     local encoded_path=$(printf '%s' "$path" | sed 's|/|%2F|g')
@@ -3029,6 +3606,10 @@ register_protocol() {
         core="singbox"
     fi
     
+    # 写库结果：失败时置位 _REGISTER_FAILED，供 _save_join_info / do_install_server 中止后续步骤
+    local _rc=0
+    _REGISTER_FAILED=0
+
     # 获取端口
     local port
     port=$(echo "$config_json" | jq -r '.port')
@@ -3037,30 +3618,41 @@ register_protocol() {
     if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
         # 覆盖模式：更新指定端口的配置
         echo -e "  ${CYAN}覆盖端口 $REPLACE_PORT 的配置...${NC}"
-        db_update_port "$core" "$protocol" "$REPLACE_PORT" "$config_json"
+        db_update_port "$core" "$protocol" "$REPLACE_PORT" "$config_json" || _rc=1
     elif [[ "$INSTALL_MODE" == "add" ]]; then
         # 添加模式：添加新端口实例
         echo -e "  ${CYAN}添加新端口 $port 实例...${NC}"
-        db_add_port "$core" "$protocol" "$config_json"
+        db_add_port "$core" "$protocol" "$config_json" || _rc=1
     elif is_protocol_installed "$protocol"; then
         # 协议已存在但未指定模式：默认添加新端口
         echo -e "  ${CYAN}添加新端口 $port 实例...${NC}"
-        db_add_port "$core" "$protocol" "$config_json"
+        db_add_port "$core" "$protocol" "$config_json" || _rc=1
     else
         # 首次安装：使用单对象格式
-        db_add "$core" "$protocol" "$config_json"
+        db_add "$core" "$protocol" "$config_json" || _rc=1
     fi
     
     # 重置安装模式变量
     unset INSTALL_MODE REPLACE_PORT
+    if [[ $_rc -ne 0 ]]; then
+        _REGISTER_FAILED=1
+        _err "协议 $protocol 写入数据库失败，已中止后续步骤（现有服务与配置未改动）"
+        return 1
+    fi
+    return 0
 }
 
 unregister_protocol() {
-    local protocol=$1
-    
-    # 从数据库删除
-    db_del "xray" "$protocol" 2>/dev/null
-    db_del "singbox" "$protocol" 2>/dev/null
+    local protocol="$1" rc=0
+    [[ -f "$DB_FILE" ]] || return 1
+    # 从数据库删除（传播任一核心的写库失败，避免静默吞错）
+    if db_exists "xray" "$protocol"; then
+        db_del "xray" "$protocol" 2>/dev/null || rc=1
+    fi
+    if db_exists "singbox" "$protocol"; then
+        db_del "singbox" "$protocol" 2>/dev/null || rc=1
+    fi
+    return "$rc"
 }
 
 get_installed_protocols() {
@@ -3188,14 +3780,74 @@ gen_xray_user_routing_outbounds() {
 }
 
 # 生成 Xray 多 inbounds 配置
+# 统计 Xray 协议下仍启用的凭据数（含无 users 数组的旧式单凭据）；用于区分「全部禁用」与「渲染失败」
+_xray_enabled_credential_count() {
+    jq -r '[ (.xray // {}) | to_entries[] | .value
+             | (if type == "array" then .[] else . end)
+             | if ((.users // []) | length) > 0
+               then (.users[] | select(.enabled != false))
+               else select(.uuid != null or .password != null) end
+           ] | length' "$DB_FILE" 2>/dev/null || echo 1
+}
+
+# 生成 Xray 配置：先渲染到同目录临时文件，JSON 校验 + `xray run -test`（若已安装）通过后
+# 才原子 mv 覆盖正式 config.json。任何一步失败都保留原 config.json、不触碰服务，返回非 0。
 generate_xray_config() {
+    mkdir -p "$CFG" || return 1
+    local _xr_apply_lock="" _xr_locked=0 _xr_rc=0
+    if declare -F _lockdir_acquire >/dev/null 2>&1; then
+        _xr_apply_lock="$CFG/.reload-apply.xray.lock"
+        if ! _lockdir_acquire "$_xr_apply_lock" 300; then
+            _err "获取 Xray 配置写锁超时，已保留原配置"
+            return 1
+        fi
+        _xr_locked=1
+    fi
+    _xr_render_body() {
+        local final="$CFG/config.json" stage rc=0
+        stage=$(mktemp "$CFG/config.json.new.XXXXXX") || { _err "无法创建 Xray 配置临时文件"; return 1; }
+        chmod 600 "$stage" 2>/dev/null || true
+        _XRAY_OUT="$stage" _generate_xray_config_render || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            rm -f "$stage"
+            return "$rc"
+        fi
+        if ! jq empty "$stage" 2>/dev/null; then
+            rm -f "$stage"
+            _err "生成的 Xray 配置不是合法 JSON，已保留原配置"
+            return 1
+        fi
+        if command -v xray >/dev/null 2>&1; then
+            local test_out test_rc=0
+            local -a to=()
+            command -v timeout >/dev/null 2>&1 && to=(timeout 30)
+            test_out=$("${to[@]}" xray run -test -format json -c "$stage" 2>&1) || test_rc=$?
+            if [[ $test_rc -ne 0 ]]; then
+                rm -f "$stage"
+                _err "Xray 配置校验失败(xray run -test)，已保留原配置: $(printf '%s' "$test_out" | tail -n 3 | tr '\n' ' ')"
+                return 1
+            fi
+        fi
+        chmod 600 "$stage" 2>/dev/null || true
+        mv -f "$stage" "$final" || { rm -f "$stage"; _err "无法替换 $final"; return 1; }
+        return 0
+    }
+    _xr_render_body || _xr_rc=$?
+    unset -f _xr_render_body 2>/dev/null || true
+    [[ $_xr_locked -eq 1 ]] && _lockdir_release "$_xr_apply_lock"
+    return "$_xr_rc"
+}
+
+_generate_xray_config_render() {
+    # 渲染目标由 generate_xray_config 指定为临时文件；校验通过后才原子替换正式 config.json
+    local _out="${_XRAY_OUT:?_XRAY_OUT is required}"
     local xray_protocols=$(get_xray_protocols)
     [[ -z "$xray_protocols" ]] && return 1
     
     mkdir -p "$CFG"
     # Replace stale generated configuration before rebuilding. If all proxy users are
     # disabled, the final file must not retain clients from the previous generation.
-    rm -f "$CFG/config.json"
+    rm -f "$_out"
     
     # 日志根目录：隔离测试用 VLESS_TEST_LOG_ROOT 重定向到临时目录；未设置或空串时回退 /var/log。
     # 先算一次、再复用同一个变量，避免“目录建在一处、配置指向另一处”这类不一致。
@@ -3505,7 +4157,7 @@ generate_xray_config() {
             inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
             outbounds: $outbounds,
             routing: {domainStrategy: "IPIfNonMatch", rules: [], balancers: $balancers}
-        }' > "$CFG/config.json"
+        }' > "$_out"
 
         # 添加路由规则（API + 默认拦截规则放最前面）
         # 默认拦截：私有 IP 段与 BitTorrent 协议一律走 blackhole（tag=block）
@@ -3517,11 +4169,11 @@ generate_xray_config() {
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             local all_rules=$(echo "$routing_rules" | jq --argjson defaults "$default_rules" '$defaults + .')
             local tmp=$(mktemp)
-            jq --argjson rules "$all_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq --argjson rules "$all_rules" '.routing.rules = $rules' "$_out" > "$tmp" && mv "$tmp" "$_out"
         else
             # 即使没有其他规则，也要添加默认规则
             local tmp=$(mktemp)
-            jq --argjson rules "$default_rules" '.routing.rules = $rules' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            jq --argjson rules "$default_rules" '.routing.rules = $rules' "$_out" > "$tmp" && mv "$tmp" "$_out"
         fi
 
         # 检查是否使用了leastPing或leastLoad策略,添加burstObservatory配置
@@ -3569,7 +4221,7 @@ generate_xray_config() {
                         timeout: "5s"
                     }
                 }
-            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+            ' "$_out" > "$tmp" && mv "$tmp" "$_out"
         fi
     else
         # 无全局分流规则时，仍然需要检查用户级路由规则和负载均衡器
@@ -3649,13 +4301,13 @@ generate_xray_config() {
                 inbounds: [{listen: "127.0.0.1", port: 10085, protocol: "dokodemo-door", settings: {address: "127.0.0.1"}, tag: "api"}],
                 outbounds: $outbounds,
                 routing: {domainStrategy: "IPIfNonMatch", rules: $rules, balancers: $balancers}
-            }' > "$CFG/config.json"
+            }' > "$_out"
             
             # 添加多IP路由 outbound 支持（routing 规则将在 inbound 添加完成后统一添加）
             local ip_routing_outbounds=$(gen_xray_ip_routing_outbounds)
             if [[ -n "$ip_routing_outbounds" && "$ip_routing_outbounds" != "[]" ]]; then
                 local tmp=$(mktemp)
-                jq --argjson ip_outs "$ip_routing_outbounds" '.outbounds += $ip_outs' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
+                jq --argjson ip_outs "$ip_routing_outbounds" '.outbounds += $ip_outs' "$_out" > "$tmp" && mv "$tmp" "$_out"
             fi
         else
             # 无任何用户路由规则时
@@ -3679,7 +4331,7 @@ generate_xray_config() {
                         {"type": "field", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
                         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
                     ]}
-                }' > "$CFG/config.json"
+                }' > "$_out"
             else
                 # 无任何路由规则，使用简单直连配置（仍需要 API 规则 + 默认拦截规则）
                 jq -n --arg logroot "$log_root" --argjson direct "$direct_outbound" '{
@@ -3697,7 +4349,7 @@ generate_xray_config() {
                         {"type": "field", "ip": ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128", "fc00::/7", "fe80::/10"], "outboundTag": "block"},
                         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"}
                     ]}
-                }' > "$CFG/config.json"
+                }' > "$_out"
             fi
         fi
     fi
@@ -3749,7 +4401,10 @@ generate_xray_config() {
     
     # 检查是否至少有一个 inbound 成功添加
     if [[ $success_count -eq 0 ]]; then
-        if [[ -f "$CFG/config.json" ]] && jq -e '[.inbounds[]? | select(.tag != "api")] | length == 0' "$CFG/config.json" >/dev/null 2>&1; then
+        # 只有「确实没有任何可用凭据」才是合法的「全部禁用」状态；
+        # 存在启用用户却全部入站生成失败，是渲染故障，必须报错，不能写出只剩 api 的空配置去重启服务。
+        if [[ "$(_xray_enabled_credential_count)" == "0" ]] \
+           && [[ -f "$_out" ]] && jq -e '[.inbounds[]? | select(.tag != "api")] | length == 0' "$_out" >/dev/null 2>&1; then
             _warn "所有代理用户均已禁用，配置保留为无代理入站状态"
             return 0
         fi
@@ -3758,13 +4413,13 @@ generate_xray_config() {
     fi
     
     # 验证最终配置文件的 JSON 格式
-    if ! jq empty "$CFG/config.json" 2>/dev/null; then
+    if ! jq empty "$_out" 2>/dev/null; then
         _err "生成的 Xray 配置文件 JSON 格式错误"
         return 1
     fi
     
     # 检查 inbounds 数组是否为空；所有用户都被禁用时不写入包含默认凭据的空替代配置。
-    local inbound_count=$(jq '.inbounds | length' "$CFG/config.json" 2>/dev/null)
+    local inbound_count=$(jq '.inbounds | length' "$_out" 2>/dev/null)
     if [[ "$inbound_count" == "0" || -z "$inbound_count" ]]; then
         _err "Xray 配置中没有有效的 inbound"
         return 1
@@ -3773,11 +4428,11 @@ generate_xray_config() {
     # 多IP路由：在所有 inbound 添加完成后，更新 routing 规则
     # 因为 routing 规则需要知道实际生成的 inbound tag
     if db_ip_routing_enabled; then
-        local inbounds_json=$(jq '.inbounds' "$CFG/config.json" 2>/dev/null || echo "[]")
+        local inbounds_json=$(jq '.inbounds' "$_out" 2>/dev/null || echo "[]")
         local ip_routing_rules=$(gen_xray_ip_routing_rules "$inbounds_json")
         
         if [[ -n "$ip_routing_rules" && "$ip_routing_rules" != "[]" ]]; then
-            local tmp=$(mktemp "$CFG/config.json.tmp.XXXXXX")
+            local tmp=$(mktemp "$_out.tmp.XXXXXX")
             chmod 600 "$tmp" 2>/dev/null || true
             # 将多IP路由规则放在默认拦截规则（api + 私网 block + bittorrent block）之后，防止绕过 SSRF/BT 拦截
             jq --argjson ip_rules "$ip_routing_rules" '
@@ -3785,12 +4440,12 @@ generate_xray_config() {
                 ([$r[] | select(.outboundTag == "api" or .outboundTag == "block")]) as $guard |
                 ([$r[] | select(.outboundTag != "api" and .outboundTag != "block")]) as $rest |
                 .routing.rules = ($guard + $ip_rules + $rest)
-            ' "$CFG/config.json" > "$tmp" && mv "$tmp" "$CFG/config.json"
-            chmod 600 "$CFG/config.json" 2>/dev/null || true
+            ' "$_out" > "$tmp" && mv "$tmp" "$_out"
+            chmod 600 "$_out" 2>/dev/null || true
         fi
     fi
 
-    chmod 600 "$CFG/config.json" 2>/dev/null || true
+    chmod 600 "$_out" 2>/dev/null || true
     
     if [[ -n "$failed_protocols" ]]; then
         _warn "以下协议配置失败: $failed_protocols"
@@ -3817,6 +4472,7 @@ _add_single_xray_inbound() {
 
 # 使用 jq 动态构建 inbound (重构版 - 只从数据库或内存覆盖对象只读)
 add_xray_inbound_v2() {
+    local _out="${_XRAY_OUT:-$CFG/config.json}"
     local protocol=$1
     local cfg_override="${2:-}"
     
@@ -4433,8 +5089,8 @@ add_xray_inbound_v2() {
     
     # 合并到主配置
     local tmp_config=$(mktemp)
-    if jq '.inbounds += [input]' "$CFG/config.json" "$tmp_inbound" > "$tmp_config" 2>/dev/null; then
-        mv "$tmp_config" "$CFG/config.json"
+    if jq '.inbounds += [input]' "$_out" "$tmp_inbound" > "$tmp_config" 2>/dev/null; then
+        mv "$tmp_config" "$_out"
     else
         _err "合并 $protocol 配置失败"
         rm -f "$tmp_inbound" "$tmp_config"
@@ -4462,8 +5118,8 @@ add_xray_inbound_v2() {
                 
                 if jq empty "$ip_inbound_file" 2>/dev/null; then
                     local tmp2=$(mktemp)
-                    if jq '.inbounds += [input]' "$CFG/config.json" "$ip_inbound_file" > "$tmp2" 2>/dev/null; then
-                        mv "$tmp2" "$CFG/config.json"
+                    if jq '.inbounds += [input]' "$_out" "$ip_inbound_file" > "$tmp2" 2>/dev/null; then
+                        mv "$tmp2" "$_out"
                     fi
                     rm -f "$tmp2"
                 fi
@@ -4731,13 +5387,12 @@ force_cleanup() {
     cleanup_hy2_nat_rules
 }
 
-# 清理 Hysteria2/TUIC 端口跳跃 NAT 规则。
-# DB 缺失或配置无效时 fail closed；不枚举、不删除其它应用的 REDIRECT 规则。
-cleanup_hy2_nat_rules() {
+# 仅从当前数据库收集待清理的 Hysteria2/TUIC 端口跳跃 NAT 规则（格式: "<hop_start> <hop_end> <port>"），不产生任何防火墙副作用。
+_collect_hy2_nat_rules() {
     [[ -f "$DB_FILE" ]] || return 0
 
     local only_proto="${1:-}" only_port="${2:-}"
-    local proto config row port hs he family chain
+    local proto config row port hs he
     for proto in hy2 tuic; do
         [[ -z "$only_proto" || "$proto" == "$only_proto" ]] || continue
         config=$(jq -c --arg p "$proto" '.singbox[$p] // empty' "$DB_FILE" 2>/dev/null) || continue
@@ -4752,12 +5407,7 @@ cleanup_hy2_nat_rules() {
                 he=$(jq -r '.hop_end // 50000' <<< "$row")
                 [[ "$(jq -r '.hop_enable // 0' <<< "$row")" == "1" ]] || continue
                 [[ "$port" =~ ^[0-9]+$ && "$hs" =~ ^[0-9]+$ && "$he" =~ ^[0-9]+$ && "$hs" -lt "$he" ]] || continue
-                for family in iptables ip6tables; do
-                    command -v "$family" >/dev/null 2>&1 || continue
-                    for chain in PREROUTING OUTPUT; do
-                        "$family" -t nat -D "$chain" -p udp --dport "${hs}:${he}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-                    done
-                done
+                printf '%s %s %s\n' "$hs" "$he" "$port"
             done < <(jq -c '.[]' <<< "$config")
         else
             port=$(jq -r '.port // empty' <<< "$config")
@@ -4766,14 +5416,32 @@ cleanup_hy2_nat_rules() {
             he=$(jq -r '.hop_end // 50000' <<< "$config")
             [[ "$(jq -r '.hop_enable // 0' <<< "$config")" == "1" ]] || continue
             [[ "$port" =~ ^[0-9]+$ && "$hs" =~ ^[0-9]+$ && "$he" =~ ^[0-9]+$ && "$hs" -lt "$he" ]] || continue
-            for family in iptables ip6tables; do
-                command -v "$family" >/dev/null 2>&1 || continue
-                for chain in PREROUTING OUTPUT; do
-                    "$family" -t nat -D "$chain" -p udp --dport "${hs}:${he}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
-                done
-            done
+            printf '%s %s %s\n' "$hs" "$he" "$port"
         fi
     done
+}
+
+# 按已快照的规则列表删除对应 IPv4/IPv6 REDIRECT 规则。
+_delete_hy2_nat_rules_list() {
+    local rules="$1" hs he port family chain
+    [[ -n "$rules" ]] || return 0
+    while read -r hs he port; do
+        [[ -n "$hs" && -n "$he" && -n "$port" ]] || continue
+        for family in iptables ip6tables; do
+            command -v "$family" >/dev/null 2>&1 || continue
+            for chain in PREROUTING OUTPUT; do
+                "$family" -t nat -D "$chain" -p udp --dport "${hs}:${he}" -j REDIRECT --to-ports "$port" 2>/dev/null || true
+            done
+        done
+    done <<< "$rules"
+}
+
+# 清理 Hysteria2/TUIC 端口跳跃 NAT 规则。
+# DB 缺失或配置无效时 fail closed；不枚举、不删除其它应用的 REDIRECT 规则。
+cleanup_hy2_nat_rules() {
+    local rules
+    rules=$(_collect_hy2_nat_rules "${1:-}" "${2:-}")
+    _delete_hy2_nat_rules_list "$rules"
 }
 
 # HY2/TUIC 的证书目录属于整个协议，而不是某一个端口实例。
@@ -5406,6 +6074,11 @@ create_fake_website() {
         mkdir -p "$nginx_conf_dir"
     fi
     
+    # 备份旧配置后再删除（nginx -t 失败时恢复，避免把原本可用的站点配置弄丢）
+    local nginx_bak=""
+    if [[ -f "$nginx_conf_file" ]]; then
+        nginx_bak=$(mktemp) && cp -p "$nginx_conf_file" "$nginx_bak" 2>/dev/null || nginx_bak=""
+    fi
     # 删除旧配置，确保使用最新配置
     rm -f "$nginx_conf_file" /etc/nginx/sites-enabled/vless-fake 2>/dev/null
     # 同时删除可能冲突的 vless-sub.conf (包括 http.d 目录)
@@ -5414,6 +6087,10 @@ create_fake_website() {
     # 共享 Web root 不得覆盖既存首页；仅在路径原先不存在时创建并登记 placeholder。
     create_webroot_placeholder || {
         _err "无法安全创建伪装网页"
+        if [[ -n "$nginx_bak" ]]; then
+            cp -pf "$nginx_bak" "$nginx_conf_file" 2>/dev/null; rm -f "$nginx_bak"
+            [[ "$nginx_conf_dir" == "/etc/nginx/sites-available" ]] && ln -sf "$nginx_conf_file" /etc/nginx/sites-enabled/vless-fake 2>/dev/null
+        fi
         return 1
     }
     
@@ -5718,7 +6395,13 @@ EOF
             echo "配置错误详情："
             nginx -t
             rm -f "$nginx_conf_file" /etc/nginx/sites-enabled/vless-fake 2>/dev/null
+            if [[ -n "$nginx_bak" ]]; then
+                cp -pf "$nginx_bak" "$nginx_conf_file" 2>/dev/null
+                [[ "$nginx_conf_dir" == "/etc/nginx/sites-available" ]] && ln -sf "$nginx_conf_file" /etc/nginx/sites-enabled/vless-fake 2>/dev/null
+                _warn "已恢复原有 Nginx 站点配置"
+            fi
         fi
+        [[ -n "$nginx_bak" ]] && rm -f "$nginx_bak"
         
         # 保存订阅配置信息
         local sub_uuid=$(get_sub_uuid)
@@ -5960,15 +6643,12 @@ gen_tuic_link() {
     printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native${insecure}#${name}"
 }
 
-# 判断给定 SNI 是否正由真实 ACME 证书服务（返回 0=真证书 / 1=自签兜底）。
-# 与 generate_singbox_config 的 anytls 分支证书选择逻辑保持一致：
-# 仅当「已申请过 ACME 域名」且「server.crt 是真实 CA 证书」且「sni 与证书域名一致」时，
-# anytls inbound 才指向 $CFG/certs/server.crt（真实证书）；其余一律用自签。
-# 据此，分享链接在真证书场景应去掉 allowInsecure / skip-cert-verify，客户端才真正校验证书。
+# 判断给定 SNI 是否正由真实 ACME 证书对（server.crt + server.key 均存在）服务（返回 0=真证书 / 1=自签兜底）。
+# 入站渲染器与所有链接/订阅导出共用此单一判据：缺全局私钥时入站不会启用全局证书，导出端亦不得去掉 allow_insecure / skip-cert-verify。
 _anytls_secure() {
     local sni="$1"
     [[ -z "$sni" ]] && return 1
-    [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]] || return 1
+    [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]] || return 1
     _is_real_cert || return 1
     [[ "$sni" == "$(cat "$CFG/cert_domain")" ]]
 }
@@ -7155,23 +7835,39 @@ _is_cache_fresh() {
 }
 
 # 下载脚本到临时文件（回显临时文件路径）
+# -f：HTTP 4xx/5xx 视为失败（不再把错误页当成脚本）；总超时默认 60 秒，避免连接建立后卡死。
 _fetch_script_tmp() {
     local connect_timeout="${1:-10}"
-    local max_time="${2:-}"
+    local max_time="${2:-60}"
     local tmp_file
     tmp_file=$(mktemp 2>/dev/null) || return 1
-    if [[ -n "$max_time" ]]; then
-        if ! curl -sL --connect-timeout "$connect_timeout" --max-time "$max_time" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
-            rm -f "$tmp_file"
-            return 1
-        fi
-    else
-        if ! curl -sL --connect-timeout "$connect_timeout" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
-            rm -f "$tmp_file"
-            return 1
-        fi
+    if ! curl -fsSL --connect-timeout "$connect_timeout" --max-time "$max_time" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
+        rm -f "$tmp_file"
+        return 1
     fi
     echo "$tmp_file"
+}
+
+# 取远端 SHA256SUMS 清单里 vless-server.sh 的哈希（与脚本同目录发布，CI 的 refresh-manifest 保证一致）
+_fetch_manifest_sha() {
+    local url="${SCRIPT_RAW_URL%/*}/SHA256SUMS" tmp sha
+    tmp=$(mktemp 2>/dev/null) || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 -o "$tmp" "$url"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    sha=$(awk '$2 == "vless-server.sh" || $2 == "*vless-server.sh" {print tolower($1); exit}' "$tmp")
+    rm -f "$tmp"
+    _is_sha256 "$sha" || return 1
+    printf '%s\n' "$sha"
+}
+
+# 内容是否像一份完整的 bash 脚本（shebang + 合法版本号）；用于决定能否缓存/采信
+_script_file_plausible() {
+    local f="$1"
+    [[ -s "$f" ]] || return 1
+    head -n 1 "$f" | grep -qE '^#!.*/(env +)?bash([[:space:]]|$)' || return 1
+    _is_semver_version "$(_extract_script_version "$f")"
 }
 
 # 计算脚本内容哈希；滚动 master 以制品字节而不是公开版本号判断更新。
@@ -7275,6 +7971,11 @@ _get_latest_script_hash() {
     tmp_file=$(_fetch_script_tmp 8 25) || return 1
     remote_ver=$(_extract_script_version "$tmp_file")
     remote_hash=$(_script_sha256 "$tmp_file")
+    if ! _script_file_plausible "$tmp_file"; then
+        # 拿到的不是脚本（错误页/截断/镜像异常）：不缓存，避免触发假更新提示
+        rm -f "$tmp_file"
+        return 1
+    fi
     rm -f "$tmp_file"
     _is_sha256 "$remote_hash" || return 1
 
@@ -7881,6 +8582,20 @@ _map_arch() {
 }
 
 # 通用二进制下载安装函数
+# 取 GitHub release 资产的官方 sha256（API 的 assets[].digest），无则输出空
+# 用法: _github_asset_digest owner/repo v1.2.3 asset-name
+_github_asset_digest() {
+    local repo="$1" tag="$2" asset="$3" d
+    [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$tag" =~ ^[0-9A-Za-z._-]+$ && "$asset" =~ ^[0-9A-Za-z._+-]+$ ]] || return 1
+    d=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+        "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null \
+        | jq -r --arg n "$asset" '.assets[]? | select(.name == $n) | .digest // empty' 2>/dev/null | head -n 1)
+    d="${d#sha256:}"
+    d=$(printf '%s' "$d" | tr 'A-F' 'a-f')
+    _is_sha256 "$d" && printf '%s\n' "$d"
+    return 0
+}
+
 _install_binary() {
     local name="$1" repo="$2" url_pattern="$3" extract_cmd="$4"
     local channel="${5:-stable}" force="${6:-false}" version_override="${7:-}"
@@ -7958,25 +8673,44 @@ _install_binary() {
         return 1
     fi
 
-    # 下载并验证
-    if ! curl -fsSL --connect-timeout 60 --retry 2 -o "$tmp/pkg" "$url"; then
+    # 下载（总时限 15 分钟；60 秒内低于 1KB/s 视为卡死）
+    if ! curl -fsSL --connect-timeout 30 --max-time 900 --speed-limit 1024 --speed-time 60 --retry 2 -o "$tmp/pkg" "$url"; then
         rm -rf "$tmp"
         _err "下载 $name 失败: $url"
         return 1
     fi
 
-    # 若官方提供了 .dgst 校验文件（如 Xray-core），强制核对 SHA-256 防止供应链篡改
+    # 完整性校验：
+    #  - Xray：必须核对官方 .dgst；取不到/解析不出时回退到 GitHub API 的 sha256 digest，二者都没有则中止
+    #  - 其他 GitHub release 资产（如 sing-box）：API 提供 digest 时必须匹配，缺失则告警后继续
+    #  - VLESS_ALLOW_UNVERIFIED_DOWNLOAD=1 可显式放行；VLESS_REQUIRE_VERIFIED_DOWNLOAD=1 则对所有资产要求校验
+    local expected_sha="" actual_sha digest_src=""
+    actual_sha=$(_script_sha256 "$tmp/pkg" 2>/dev/null)
     if [[ "$repo" == "XTLS/Xray-core" ]]; then
-        if curl -fsSL --connect-timeout 15 -o "$tmp/pkg.dgst" "${url}.dgst" 2>/dev/null; then
-            local expected_sha actual_sha
-            expected_sha=$(awk '/^SHA2-256=/ {print $2; exit} /^SHA256=/ {print $2; exit}' "$tmp/pkg.dgst" 2>/dev/null)
-            actual_sha=$(_script_sha256 "$tmp/pkg" 2>/dev/null)
-            if [[ -n "$expected_sha" && "$actual_sha" != "$expected_sha" ]]; then
-                rm -rf "$tmp"
-                _err "$name 校验和验证失败（预期 $expected_sha，实际 ${actual_sha:-空}）"
-                return 1
-            fi
+        if curl -fsSL --connect-timeout 15 --max-time 60 -o "$tmp/pkg.dgst" "${url}.dgst" 2>/dev/null; then
+            # 行格式为 `SHA2-256= <hex>`；同时兼容等号后无空格的写法
+            expected_sha=$(awk -F'[=[:space:]]+' '/^SHA2-256[=[:space:]]/ {print tolower($2); exit} /^SHA256[=[:space:]]/ {print tolower($2); exit}' "$tmp/pkg.dgst" 2>/dev/null)
+            _is_sha256 "$expected_sha" && digest_src=".dgst" || expected_sha=""
         fi
+    fi
+    if [[ -z "$expected_sha" && "$url" == "https://github.com/${repo}/releases/download/"* ]]; then
+        expected_sha=$(_github_asset_digest "$repo" "v$version" "${url##*/}")
+        _is_sha256 "$expected_sha" && digest_src="GitHub API digest" || expected_sha=""
+    fi
+    if [[ -n "$expected_sha" ]]; then
+        if [[ "$actual_sha" != "$expected_sha" ]]; then
+            rm -rf "$tmp"
+            _err "$name 校验和验证失败（预期 $expected_sha，实际 ${actual_sha:-空}，来源: $digest_src）"
+            return 1
+        fi
+    elif [[ "${VLESS_ALLOW_UNVERIFIED_DOWNLOAD:-0}" == "1" ]]; then
+        _warn "未能获取 $name 的官方 SHA-256，按 VLESS_ALLOW_UNVERIFIED_DOWNLOAD=1 跳过校验"
+    elif [[ "$repo" == "XTLS/Xray-core" || "${VLESS_REQUIRE_VERIFIED_DOWNLOAD:-0}" == "1" ]]; then
+        rm -rf "$tmp"
+        _err "无法取得 $name 的官方 SHA-256（.dgst 与 GitHub API 均不可用），已中止安装；稍后重试，或显式设置 VLESS_ALLOW_UNVERIFIED_DOWNLOAD=1"
+        return 1
+    else
+        _warn "未能获取 $name 的官方 SHA-256，已跳过完整性校验"
     fi
 
     # 执行解压安装（仍需 eval 但在受控环境）
@@ -9011,10 +9745,19 @@ update_core_menu() {
 generate_singbox_config() {
     local singbox_protocols=$(db_list_protocols "singbox")
     [[ -z "$singbox_protocols" ]] && return 1
-    
-    mkdir -p "$CFG"
-    # 重建前先移除陈旧配置，避免全部用户禁用/过期时保留旧凭据继续生效
-    rm -f "$CFG/singbox.json"
+    mkdir -p "$CFG" || return 1
+    local _sb_apply_lock="" _sb_locked=0 _sb_rc=0
+    if declare -F _lockdir_acquire >/dev/null 2>&1; then
+        _sb_apply_lock="$CFG/.reload-apply.singbox.lock"
+        if ! _lockdir_acquire "$_sb_apply_lock" 300; then
+            _err "获取 Sing-box 配置写锁超时，已保留原配置"
+            return 1
+        fi
+        _sb_locked=1
+    fi
+    _sb_render_body() {
+    # 不再在渲染前删除旧配置：渲染到临时文件、校验通过后才原子替换，失败时保留原配置。
+    # 「全部用户禁用/过期」仍由下方零有效用户分支显式删除 singbox.json（fail-closed，已有回归测试）。
     
     # 读取直连出口 IP 版本设置（默认 AsIs）
     local direct_ip_version="as_is"
@@ -9373,6 +10116,7 @@ generate_singbox_config() {
     
     local inbounds="[]"
     local success_count=0
+    local skipped_no_users=0
     
     for proto in $singbox_protocols; do
         local cfg_raw=$(db_get "singbox" "$proto")
@@ -9404,10 +10148,10 @@ generate_singbox_config() {
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
                 
-                # 智能证书选择：优先使用 ACME 证书，否则使用 hy2 独立自签证书
+                # 智能证书选择：优先使用 ACME 证书对（server.crt + server.key 均存在），否则使用 hy2 独立自签证书
                 local cert_path="$CFG/certs/hy2/server.crt"
                 local key_path="$CFG/certs/hy2/server.key"
-                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
+                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]]; then
                     local cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
                     if [[ "$sni" == "$cert_domain" ]]; then
                         cert_path="$CFG/certs/server.crt"
@@ -9420,11 +10164,12 @@ generate_singbox_config() {
                 # 过滤：禁用用户 + 已过期用户（到期时间对 sing-box 协议真正生效的关键）
                 local _today=$(date '+%Y-%m-%d')
                 # 从当前端口实例取用户；显式 users 表（包括空表）不得回退顶层密码。
+                # HY2 凭据选择规则（与 _cfg_effective 严格一致）：优先非空 .uuid，其次 .password。
                 users_json=$(echo "$cfg" | jq -c --arg today "$_today" '
                     if (.users | type) == "array" then
                         [.users[] | select(.enabled != false) |
                             select((.expire_date // "") == "" or .expire_date >= $today) |
-                            {name:.name, password:(.uuid // .password)}]
+                            {name:.name, password:(if (.uuid // "") != "" then .uuid else (.password // "") end)}]
                     elif (.password // "") != "" then
                         [{name:"default", password:.password}]
                     else [] end
@@ -9460,14 +10205,25 @@ generate_singbox_config() {
                 # TUIC 使用独立证书目录
                 local cert_path="$CFG/certs/tuic/server.crt"
                 local key_path="$CFG/certs/tuic/server.key"
-                [[ ! -f "$cert_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
+                [[ ! -f "$cert_path" || ! -f "$key_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
+                # 与链接/订阅导出共用同一判据（_anytls_secure 已要求全局 server.crt 与 server.key 均存在）：
+                # 仅当全局证书对完整、可信且 SNI 匹配时才启用全局证书，保证入站与导出端策略完全一致。
+                if _anytls_secure "$(echo "$cfg" | jq -r '.sni // empty')" 2>/dev/null; then
+                    cert_path="$CFG/certs/server.crt"
+                    key_path="$CFG/certs/server.key"
+                fi
                 
                 local tuic_users
+                # 旧版迁移只保存了 uuid、漏存独立 password：uuid 与顶层一致的用户回退到顶层
+                # password，避免重建后把 UUID 当密码导致原客户端认证失败。
                 tuic_users=$(echo "$cfg" | jq -c --arg today "$(date '+%Y-%m-%d')" '
+                    . as $top |
                     if (.users | type) == "array" then
                         [.users[] | select(.enabled != false) |
                             select((.expire_date // "") == "" or .expire_date >= $today) |
-                            {uuid:(.uuid // ""), password:(.password // .uuid)}]
+                            {uuid:(.uuid // ""), password:(.password //
+                                (if (.uuid // "") == ($top.uuid // "") and ($top.password // "") != ""
+                                 then $top.password else .uuid end))}]
                     elif (.uuid // "") != "" and (.password // "") != "" then
                         [{uuid:.uuid, password:.password}]
                     else [] end
@@ -9520,11 +10276,11 @@ generate_singbox_config() {
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local sni=$(echo "$cfg" | jq -r '.sni // "bing.com"')
 
-                # 智能证书选择：优先复用 ACME 证书，否则用 anytls 独立自签证书（与 hy2 分支同构）
+                # 智能证书选择：优先复用完整的 ACME 证书对（crt + key），否则用 anytls 独立自签证书（与 hy2 分支同构）
                 local cert_path="$CFG/certs/anytls/server.crt"
                 local key_path="$CFG/certs/anytls/server.key"
-                [[ ! -f "$cert_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
-                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
+                [[ ! -f "$cert_path" || ! -f "$key_path" ]] && { cert_path="$CFG/certs/server.crt"; key_path="$CFG/certs/server.key"; }
+                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]]; then
                     local cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
                     if [[ "$sni" == "$cert_domain" ]]; then
                         cert_path="$CFG/certs/server.crt"
@@ -9533,13 +10289,14 @@ generate_singbox_config() {
                 fi
 
                 # 构建用户列表：显式 users 表不回退顶层密码；旧格式才用默认密码
+                # AnyTLS 凭据选择规则（与 _cfg_effective 严格一致）：优先非空 .password，其次 .uuid。
                 local users_json="[]"
                 local _today=$(date '+%Y-%m-%d')
                 users_json=$(echo "$cfg" | jq -c --arg today "$_today" '
                     if (.users | type) == "array" then
                         [.users[] | select(.enabled != false) |
                             select((.expire_date // "") == "" or .expire_date >= $today) |
-                            {name:.name, password:(.password // .uuid)}]
+                            {name:.name, password:(if (.password // "") != "" then .password else (.uuid // "") end)}]
                     elif (.password // "") != "" then
                         [{name:"default", password:.password}]
                     else [] end
@@ -9571,6 +10328,7 @@ generate_singbox_config() {
         if [[ -n "$inbound" ]]; then
             if jq -e '(.users? | type == "array") and (.users | length == 0)' <<< "$inbound" >/dev/null 2>&1; then
                 _warn "$proto inbound $port 无启用用户，跳过该端口"
+                skipped_no_users=$((skipped_no_users + 1))
             else
                 inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
                 ((success_count++))
@@ -9581,6 +10339,10 @@ generate_singbox_config() {
     
     if [[ $success_count -eq 0 ]]; then
         rm -f "$CFG/singbox.json"
+        if [[ $skipped_no_users -gt 0 ]]; then
+            _warn "Sing-box 所有协议均无启用用户，已清除 singbox.json"
+            return 2
+        fi
         _err "没有有效的 Sing-box 协议配置"
         return 1
     fi
@@ -9694,11 +10456,28 @@ generate_singbox_config() {
         _err "Sing-box 配置 JSON 格式错误"
         return 1
     fi
+    # 原生校验（若已安装 sing-box）：失败则保留原配置、不覆盖
+    if command -v sing-box >/dev/null 2>&1; then
+        local sb_out sb_rc=0
+        local -a sb_to=()
+        command -v timeout >/dev/null 2>&1 && sb_to=(timeout 30)
+        sb_out=$("${sb_to[@]}" sing-box check -c "$sb_tmp" 2>&1) || sb_rc=$?
+        if [[ $sb_rc -ne 0 ]]; then
+            rm -f "$sb_tmp"
+            _err "Sing-box 配置校验失败(sing-box check)，已保留原配置: $(printf '%s' "$sb_out" | tail -n 3 | tr '\n' ' ')"
+            return 1
+        fi
+    fi
     mv -f "$sb_tmp" "$CFG/singbox.json"
     chmod 600 "$CFG/singbox.json" 2>/dev/null || true
     
     _ok "Sing-box 配置生成成功 ($success_count 个协议)"
     return 0
+    }
+    _sb_render_body || _sb_rc=$?
+    unset -f _sb_render_body 2>/dev/null || true
+    [[ $_sb_locked -eq 1 ]] && _lockdir_release "$_sb_apply_lock"
+    return "$_sb_rc"
 }
 
 # 创建 Sing-box 服务
@@ -10056,10 +10835,10 @@ gen_server_config() {
     
     register_protocol "vless" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni")"
+        public_key "$pubkey" short_id "$sid" sni "$sni")" || return 1
     
     _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
-        "gen_vless_link %s $port $uuid $pubkey $sid $sni"
+        "gen_vless_link %s $(_q "$port") $(_q "$uuid") $(_q "$pubkey") $(_q "$sid") $(_q "$sni")"
     echo "server" > "$CFG/role"
 }
 
@@ -10070,10 +10849,10 @@ gen_vless_xhttp_server_config() {
     
     register_protocol "vless-xhttp" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni" path "$path")"
+        public_key "$pubkey" short_id "$sid" sni "$sni" path "$path")" || return 1
     
     _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$pubkey|$sid|$sni|$path" \
-        "gen_vless_xhttp_link %s $port $uuid $pubkey $sid $sni $path"
+        "gen_vless_xhttp_link %s $(_q "$port") $(_q "$uuid") $(_q "$pubkey") $(_q "$sid") $(_q "$sni") $(_q "$path")"
     echo "server" > "$CFG/role"
 }
 
@@ -10120,14 +10899,14 @@ gen_hy2_server_config() {
     # 写入数据库（Sing-box 从数据库读取配置生成 singbox.json）
     register_protocol "hy2" "$(build_config \
         password "$password" port "$port" sni "$sni" \
-        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")"
+        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")" || return 1
     
     # 保存 join 信息
     local extra_lines=()
     [[ "$hop_enable" == "1" ]] && extra_lines=("" "# 端口跳跃已启用" "# 客户端请手动将端口改为: ${hop_start}-${hop_end}")
     
     _save_join_info "hy2" "HY2|%s|$port|$password|$sni" \
-        "gen_hy2_link %s $port $password $sni" "${extra_lines[@]}"
+        "gen_hy2_link %s $(_q "$port") $(_q "$password") $(_q "$sni")" "${extra_lines[@]}"
     cp "$CFG/hy2.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -10139,9 +10918,9 @@ gen_trojan_server_config() {
     
     [[ ! -f "$CFG/certs/server.crt" ]] && gen_self_cert "$sni"
 
-    register_protocol "trojan" "$(build_config password "$password" port "$port" sni "$sni")"
+    register_protocol "trojan" "$(build_config password "$password" port "$port" sni "$sni")" || return 1
     _save_join_info "trojan" "TROJAN|%s|$port|$password|$sni" \
-        "gen_trojan_link %s $port $password $sni"
+        "gen_trojan_link %s $(_q "$port") $(_q "$password") $(_q "$sni")"
     echo "server" > "$CFG/role"
 }
 
@@ -10154,9 +10933,9 @@ gen_trojan_ws_server_config() {
     _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
 
     register_protocol "trojan-ws" "$(build_config \
-        password "$password" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+        password "$password" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
     _save_join_info "trojan-ws" "TROJAN-WS|%s|$outer_port|$password|$sni|$path" \
-        "gen_trojan_ws_link %s $outer_port $password $sni $path"
+        "gen_trojan_ws_link %s $(_q "$outer_port") $(_q "$password") $(_q "$sni") $(_q "$path")"
     echo "server" > "$CFG/role"
 }
 
@@ -10169,9 +10948,9 @@ gen_vless_ws_server_config() {
     _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
 
     register_protocol "vless-ws" "$(build_config \
-        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
     _save_join_info "vless-ws" "VLESS-WS|%s|$outer_port|$uuid|$sni|$path" \
-        "gen_vless_ws_link %s $outer_port $uuid $sni $path"
+        "gen_vless_ws_link %s $(_q "$outer_port") $(_q "$uuid") $(_q "$sni") $(_q "$path")"
     echo "server" > "$CFG/role"
 }
 
@@ -10182,9 +10961,9 @@ gen_vless_ws_notls_server_config() {
     
     # 无需证书，直接使用外部端口
     register_protocol "vless-ws-notls" "$(build_config \
-        uuid "$uuid" port "$port" path "$path" host "$host")"
+        uuid "$uuid" port "$port" path "$path" host "$host")" || return 1
     _save_join_info "vless-ws-notls" "VLESS-WS-CF|%s|$port|$uuid|$path|$host" \
-        "gen_vless_ws_notls_link %s $port $uuid $path $host"
+        "gen_vless_ws_notls_link %s $(_q "$port") $(_q "$uuid") $(_q "$path") $(_q "$host")"
     echo "server" > "$CFG/role"
 }
 
@@ -10198,9 +10977,9 @@ gen_vmess_ws_server_config() {
     _has_master_protocol || _handle_standalone_cert "$sni" "$force_new_cert"
 
     register_protocol "vmess-ws" "$(build_config \
-        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")"
+        uuid "$uuid" port "$port" outer_port "$outer_port" sni "$sni" path "$path")" || return 1
     _save_join_info "vmess-ws" "VMESSWS|%s|$outer_port|$uuid|$sni|$path" \
-        "gen_vmess_ws_link %s $outer_port $uuid $sni $path"
+        "gen_vmess_ws_link %s $(_q "$outer_port") $(_q "$uuid") $(_q "$sni") $(_q "$path")"
     echo "server" > "$CFG/role"
 }
 
@@ -10211,9 +10990,9 @@ gen_vless_vision_server_config() {
     
     [[ ! -f "$CFG/certs/server.crt" ]] && gen_self_cert "$sni"
 
-    register_protocol "vless-vision" "$(build_config uuid "$uuid" port "$port" sni "$sni")"
+    register_protocol "vless-vision" "$(build_config uuid "$uuid" port "$port" sni "$sni")" || return 1
     _save_join_info "vless-vision" "VLESS-VISION|%s|$port|$uuid|$sni" \
-        "gen_vless_vision_link %s $port $uuid $sni"
+        "gen_vless_vision_link %s $(_q "$port") $(_q "$uuid") $(_q "$sni")"
     echo "server" > "$CFG/role"
 }
 
@@ -10222,9 +11001,9 @@ gen_ss2022_server_config() {
     local password="$1" port="$2" method="${3:-2022-blake3-aes-128-gcm}"
     mkdir -p "$CFG"
 
-    register_protocol "ss2022" "$(build_config password "$password" port "$port" method "$method")"
+    register_protocol "ss2022" "$(build_config password "$password" port "$port" method "$method")" || return 1
     _save_join_info "ss2022" "SS2022|%s|$port|$method|$password" \
-        "gen_ss2022_link %s $port $method $password"
+        "gen_ss2022_link %s $(_q "$port") $(_q "$method") $(_q "$password")"
     echo "server" > "$CFG/role"
 }
 
@@ -10233,9 +11012,9 @@ gen_ss_legacy_server_config() {
     local password="$1" port="$2" method="${3:-aes-256-gcm}"
     mkdir -p "$CFG"
 
-    register_protocol "ss-legacy" "$(build_config password "$password" port "$port" method "$method")"
+    register_protocol "ss-legacy" "$(build_config password "$password" port "$port" method "$method")" || return 1
     _save_join_info "ss-legacy" "SS|%s|$port|$method|$password" \
-        "gen_ss_legacy_link %s $port $method $password"
+        "gen_ss_legacy_link %s $(_q "$port") $(_q "$method") $(_q "$password")"
     echo "server" > "$CFG/role"
 }
 
@@ -10253,7 +11032,11 @@ gen_snell_server_config() {
         _has_ipv6 && ipv6_enabled="true"
     fi
 
-    cat > "$CFG/snell.conf" << EOF
+    # 先写私有临时文件，待 DB 注册成功后才原子发布，防止写库失败污染或覆盖正式配置
+    local tmp_cfg
+    tmp_cfg=$(mktemp "$CFG/.snell.conf.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_cfg" 2>/dev/null || true
+    cat > "$tmp_cfg" << EOF
 [snell-server]
 listen = $(_fmt_hostport "$listen_addr" "$port")
 psk = $psk
@@ -10261,10 +11044,15 @@ ipv6 = $ipv6_enabled
 obfs = off
 EOF
 
-    register_protocol "snell" "$(build_config psk "$psk" port "$port" version "$version")"
+    if ! register_protocol "snell" "$(build_config psk "$psk" port "$port" version "$version")"; then
+        rm -f "$tmp_cfg"
+        return 1
+    fi
+    mv -f "$tmp_cfg" "$CFG/snell.conf" || { rm -f "$tmp_cfg"; return 1; }
+    chmod 600 "$CFG/snell.conf" 2>/dev/null || true
 
     _save_join_info "snell" "SNELL|%s|$port|$psk|$version" \
-        "gen_snell_link %s $port $psk $version"
+        "gen_snell_link %s $(_q "$port") $(_q "$psk") $(_q "$version")"
     cp "$CFG/snell.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -10322,14 +11110,14 @@ gen_tuic_server_config() {
     # 写入数据库（Sing-box 从数据库读取配置生成 singbox.json）
     register_protocol "tuic" "$(build_config \
         uuid "$uuid" password "$password" port "$port" sni "$sni" \
-        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")"
+        hop_enable "$hop_enable" hop_start "$hop_start" hop_end "$hop_end")" || return 1
     
     # 保存 join 信息
     local extra_lines=()
     [[ "$hop_enable" == "1" ]] && extra_lines=("" "# 端口跳跃已启用" "# 客户端请手动将端口改为: ${hop_start}-${hop_end}")
     
     _save_join_info "tuic" "TUIC|%s|$port|$uuid|$password|$sni" \
-        "gen_tuic_link %s $port $uuid $password $sni" "${extra_lines[@]}"
+        "gen_tuic_link %s $(_q "$port") $(_q "$uuid") $(_q "$password") $(_q "$sni")" "${extra_lines[@]}"
     cp "$CFG/tuic.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -10364,9 +11152,9 @@ gen_anytls_server_config() {
         _ok "AnyTLS 自签证书生成完成"
     fi
 
-    register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")"
+    register_protocol "anytls" "$(build_config password "$password" port "$port" sni "$sni")" || return 1
     _save_join_info "anytls" "ANYTLS|%s|$port|$password|$sni" \
-        "gen_anytls_link %s $port $password $sni"
+        "gen_anytls_link %s $(_q "$port") $(_q "$password") $(_q "$sni")"
     cp "$CFG/anytls.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -10376,8 +11164,11 @@ gen_naive_server_config() {
     local username="$1" password="$2" port="$3" domain="$4"
     mkdir -p "$CFG"
     
-    # NaïveProxy 必须使用域名 + Caddy 自动申请证书
-    cat > "$CFG/Caddyfile" << EOF
+    # 先把候选 Caddyfile 写入私有临时文件，待 DB 注册成功后才原子发布，避免写库失败覆盖现有正式配置
+    local tmp_cfg
+    tmp_cfg=$(mktemp "$CFG/.Caddyfile.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_cfg" 2>/dev/null || true
+    cat > "$tmp_cfg" << EOF
 {
     order forward_proxy before file_server
     admin off
@@ -10402,19 +11193,25 @@ gen_naive_server_config() {
     }
 }
 EOF
-    chmod 600 "$CFG/Caddyfile" 2>/dev/null || true
+    chmod 600 "$tmp_cfg" 2>/dev/null || true
     
+    if ! register_protocol "naive" "$(build_config username "$username" password "$password" port "$port" domain "$domain")"; then
+        rm -f "$tmp_cfg"
+        return 1
+    fi
+    mv -f "$tmp_cfg" "$CFG/Caddyfile" || { rm -f "$tmp_cfg"; return 1; }
+    chmod 600 "$CFG/Caddyfile" 2>/dev/null || true
+
     # 创建日志目录；共享 Web root 只在首页缺失时创建并登记 placeholder。
     mkdir -p /var/log/caddy
     create_webroot_placeholder || {
         _err "无法安全创建 NaïveProxy placeholder"
         return 1
     }
-    
-    register_protocol "naive" "$(build_config username "$username" password "$password" port "$port" domain "$domain")"
+
     # 链接使用域名而不是 IP
     _save_join_info "naive" "NAIVE|$domain|$port|$username|$password" \
-        "gen_naive_link $domain $port $username $password"
+        "gen_naive_link $(_q "$domain") $(_q "$port") $(_q "$username") $(_q "$password")"
     cp "$CFG/naive.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -10459,7 +11256,10 @@ gen_snell_shadowtls_server_config() {
         fi
     fi
 
-    cat > "$CFG/$snell_conf" << EOF
+    local tmp_cfg
+    tmp_cfg=$(mktemp "$CFG/.${snell_conf}.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_cfg" 2>/dev/null || true
+    cat > "$tmp_cfg" << EOF
 [snell-server]
 listen = $listen_addr:$snell_backend_port
 psk = $psk
@@ -10467,9 +11267,14 @@ $ipv6_line
 obfs = off
 EOF
     
-    register_protocol "$protocol_name" "$(build_config \
+    if ! register_protocol "$protocol_name" "$(build_config \
         psk "$psk" port "$port" sni "$sni" stls_password "$stls_password" \
-        snell_backend_port "$snell_backend_port" version "$version")"
+        snell_backend_port "$snell_backend_port" version "$version")"; then
+        rm -f "$tmp_cfg"
+        return 1
+    fi
+    mv -f "$tmp_cfg" "$CFG/$snell_conf" || { rm -f "$tmp_cfg"; return 1; }
+    chmod 600 "$CFG/$snell_conf" 2>/dev/null || true
     echo "server" > "$CFG/role"
 }
 
@@ -10487,7 +11292,10 @@ gen_ss2022_shadowtls_server_config() {
         [[ $ss_backend_port -gt 65535 ]] && ss_backend_port=$((port - 10000))
     fi
     
-    cat > "$CFG/ss2022-shadowtls-backend.json" << EOF
+    local tmp_cfg
+    tmp_cfg=$(mktemp "$CFG/.ss2022-shadowtls-backend.json.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_cfg" 2>/dev/null || true
+    cat > "$tmp_cfg" << EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
@@ -10500,9 +11308,14 @@ gen_ss2022_shadowtls_server_config() {
 }
 EOF
     
-    register_protocol "ss2022-shadowtls" "$(build_config \
+    if ! register_protocol "ss2022-shadowtls" "$(build_config \
         password "$password" port "$port" method "$method" sni "$sni" \
-        stls_password "$stls_password" ss_backend_port "$ss_backend_port")"
+        stls_password "$stls_password" ss_backend_port "$ss_backend_port")"; then
+        rm -f "$tmp_cfg"
+        return 1
+    fi
+    mv -f "$tmp_cfg" "$CFG/ss2022-shadowtls-backend.json" || { rm -f "$tmp_cfg"; return 1; }
+    chmod 600 "$CFG/ss2022-shadowtls-backend.json" 2>/dev/null || true
     echo "server" > "$CFG/role"
 }
 
@@ -10519,7 +11332,7 @@ gen_socks_server_config() {
     else
         config_json=$(build_config username "$username" password "$password" port "$port" auth_mode "$auth_mode" listen_addr "$listen_addr")
     fi
-    register_protocol "socks" "$config_json"
+    register_protocol "socks" "$config_json" || return 1
 
     # SOCKS5 的 join 信息
     local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
@@ -10577,7 +11390,10 @@ gen_snell_v5_server_config() {
     local ipv6_enabled="false"
     [[ "$listen_addr" == "::" ]] && ipv6_enabled="true"
 
-    cat > "$CFG/snell-v5.conf" << EOF
+    local tmp_cfg
+    tmp_cfg=$(mktemp "$CFG/.snell-v5.conf.tmp.XXXXXX") || return 1
+    chmod 600 "$tmp_cfg" 2>/dev/null || true
+    cat > "$tmp_cfg" << EOF
 [snell-server]
 listen = $(_fmt_hostport "$listen_addr" "$port")
 psk = $psk
@@ -10586,9 +11402,14 @@ ipv6 = $ipv6_enabled
 obfs = off
 EOF
 
-    register_protocol "snell-v5" "$(build_config psk "$psk" port "$port" version "$version")"
+    if ! register_protocol "snell-v5" "$(build_config psk "$psk" port "$port" version "$version")"; then
+        rm -f "$tmp_cfg"
+        return 1
+    fi
+    mv -f "$tmp_cfg" "$CFG/snell-v5.conf" || { rm -f "$tmp_cfg"; return 1; }
+    chmod 600 "$CFG/snell-v5.conf" 2>/dev/null || true
     _save_join_info "snell-v5" "SNELL-V5|%s|$port|$psk|$version" \
-        "gen_snell_v5_link %s $port $psk $version"
+        "gen_snell_v5_link %s $(_q "$port") $(_q "$psk") $(_q "$version")"
     cp "$CFG/snell-v5.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
@@ -10990,7 +11811,7 @@ svc() { # svc action service_name
         local err
         err=$(mktemp) || err="/dev/null"
         "$@" 2>"$err" || {
-            [[ "$err" != "/dev/null" && -s "$err" ]] && { _err "服务${action}失败:"; cat "$err"; }
+            [[ "$err" != "/dev/null" && -s "$err" ]] && { _err "服务${action}失败:"; cat "$err" >&2; }
             [[ "$err" != "/dev/null" ]] && rm -f "$err"
             return 1
         }
@@ -11005,6 +11826,7 @@ svc() { # svc action service_name
             disable) rc-update del "$name" default &>/dev/null ;;
             reload)  rc-service "$name" reload &>/dev/null || rc-service "$name" restart &>/dev/null ;;
             status)
+                [[ -f "/etc/init.d/$name" ]] || return 1
                 rc-service "$name" status &>/dev/null && return 0
                 local pidfile="/run/${name}.pid"
                 [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && return 0
@@ -11016,7 +11838,7 @@ svc() { # svc action service_name
     else
         case "$action" in
             start|restart)
-                _svc_try systemctl "$action" "$name" || { _err "详细状态信息:"; systemctl status "$name" --no-pager -l || true; return 1; }
+                _svc_try systemctl "$action" "$name" || { _err "详细状态信息:"; systemctl status "$name" --no-pager -l >&2 || true; return 1; }
                 ;;
             stop|enable|disable) systemctl "$action" "$name" &>/dev/null ;;
             reload) systemctl reload "$name" &>/dev/null || systemctl restart "$name" &>/dev/null ;;
@@ -11330,8 +12152,7 @@ WARP_OFFICIAL_PORT=40000  # 官方客户端 SOCKS5 端口
 db_set_warp_mode() {
     local mode="$1"
     [[ ! -f "$DB_FILE" ]] && init_db
-    local tmp=$(mktemp)
-    jq --arg m "$mode" '.routing.warp_mode = $m' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --arg m "$mode" '.routing.warp_mode = $m'
 }
 
 # 获取 WARP 模式
@@ -11339,6 +12160,19 @@ db_get_warp_mode() {
     [[ ! -f "$DB_FILE" ]] && echo "wgcf" && return
     local mode=$(jq -r '.routing.warp_mode // "wgcf"' "$DB_FILE" 2>/dev/null)
     echo "$mode"
+}
+
+# 记录/查询 WARP 官方客户端软件包是否由本项目安装（区分「本项目安装」与「复用主机已有/归属未知」）
+db_set_warp_official_owned() {
+    local owned="$1"
+    [[ "$owned" == "true" || "$owned" == "false" ]] || return 1
+    [[ ! -f "$DB_FILE" ]] && init_db
+    _db_apply --argjson v "$owned" '.routing.warp_official_owned = $v'
+}
+
+db_get_warp_official_owned() {
+    [[ ! -f "$DB_FILE" ]] && echo "unknown" && return
+    jq -r 'if .routing.warp_official_owned == true then "true" elif .routing.warp_official_owned == false then "false" else "unknown" end' "$DB_FILE" 2>/dev/null || echo "unknown"
 }
 
 # WARP 状态检测 (支持双模式)
@@ -11865,9 +12699,12 @@ install_warp_official() {
         return 1
     fi
     
-    # 检查是否已安装
+    # 检查是否已安装（若主机上已预先存在，视为复用共享客户端，标记归属为 false，卸载时不卸包不停服）
     if check_cmd warp-cli; then
-        echo -e "  ${C}▸${NC} WARP 客户端已安装 ${G}✓${NC}"
+        if [[ "$(db_get_warp_official_owned 2>/dev/null)" != "true" ]]; then
+            db_set_warp_official_owned false 2>/dev/null || true
+        fi
+        echo -e "  ${C}▸${NC} WARP 客户端已安装（复用现有客户端，卸载本项目时将保留） ${G}✓${NC}"
         return 0
     fi
     
@@ -11945,6 +12782,8 @@ install_warp_official() {
         _err "WARP 官方客户端安装失败"
         return 1
     fi
+    # 明确记录：此 cloudflare-warp 软件包由本项目安装（完整卸载时才允许停服卸包）
+    db_set_warp_official_owned true 2>/dev/null || true
     
     # 启动 warp-svc 服务
     echo -ne "  ${C}▸${NC} 启动 WARP 服务..."
@@ -12316,29 +13155,72 @@ reconnect_warp_official() {
     return 0
 }
 
-# 卸载 WARP 官方客户端
+# 卸载 WARP 官方客户端（仅当软件包明确由本项目安装时才停服卸包；复用或历史归属未知时保留共享服务）
 uninstall_warp_official() {
+    local warp_owned
+    warp_owned=$(db_get_warp_official_owned 2>/dev/null)
+    if [[ "$warp_owned" != "true" ]]; then
+        _warn "WARP 官方客户端为系统复用或归属未知，保留主机 cloudflare-warp 软件包与 warp-svc 服务（仅移除本项目集成）"
+        return 0
+    fi
     _info "卸载 WARP 官方客户端..."
     
     # 断开连接
-    warp-cli disconnect 2>/dev/null
+    warp-cli disconnect 2>/dev/null || true
     
     # 停止服务
-    systemctl stop warp-svc 2>/dev/null
-    systemctl disable warp-svc 2>/dev/null
+    systemctl stop warp-svc 2>/dev/null || true
+    systemctl disable warp-svc 2>/dev/null || true
     
-    # 卸载软件包
+    # 卸载软件包（校验返回码并确认软件包/warp-cli 实际消失后才写 owned=false，失败保留归属供重试）
+    local remove_rc=0
     if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
-        apt-get remove -y cloudflare-warp 2>/dev/null
-        apt-get autoremove -y 2>/dev/null
+        if apt-get remove -y cloudflare-warp 2>/dev/null; then
+            apt-get autoremove -y 2>/dev/null || true
+        else
+            remove_rc=1
+        fi
+    elif [[ "$DISTRO" == "centos" ]]; then
+        if ! yum remove -y cloudflare-warp 2>/dev/null; then
+            remove_rc=1
+        fi
+    else
+        remove_rc=1
+    fi
+    if [[ $remove_rc -eq 0 ]]; then
+        if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
+            if command -v dpkg-query >/dev/null 2>&1; then
+                local _warp_pkg_st=""
+                _warp_pkg_st=$(dpkg-query -W -f='${db:Status-Status}' cloudflare-warp 2>/dev/null || true)
+                case "$_warp_pkg_st" in
+                    ""|not-installed|config-files) ;;
+                    *) remove_rc=1 ;;
+                esac
+            elif command -v dpkg >/dev/null 2>&1; then
+                dpkg -s cloudflare-warp 2>/dev/null | grep -Eq '^Status:.* installed$' && remove_rc=1
+            fi
+        elif [[ "$DISTRO" == "centos" ]] && command -v rpm >/dev/null 2>&1; then
+            rpm -q cloudflare-warp >/dev/null 2>&1 && remove_rc=1
+        fi
+    fi
+    if [[ $remove_rc -eq 0 ]] && check_cmd warp-cli; then
+        remove_rc=1
+    fi
+    if [[ $remove_rc -ne 0 ]]; then
+        _err "卸载 cloudflare-warp 软件包失败（软件包或 warp-cli 仍存在），已保留 warp_official_owned=true 供排查后重试"
+        return 1
+    fi
+
+    if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
         rm -f /etc/apt/sources.list.d/cloudflare-client.list
         rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     elif [[ "$DISTRO" == "centos" ]]; then
-        yum remove -y cloudflare-warp 2>/dev/null
         rm -f /etc/yum.repos.d/cloudflare-warp.repo
     fi
+    db_set_warp_official_owned false 2>/dev/null || true
     
     _ok "WARP 官方客户端已卸载"
+    return 0
 }
 
 # 卸载 WARP (支持双模式)
@@ -12347,7 +13229,10 @@ uninstall_warp() {
     _info "卸载 WARP..."
     
     if [[ "$warp_mode" == "official" ]]; then
-        uninstall_warp_official
+        if ! uninstall_warp_official; then
+            _err "WARP 官方客户端卸载未完成，已保留模式与归属状态供重试"
+            return 1
+        fi
     else
         # 卸载 WGCF
         rm -f "$WARP_CONF_FILE"
@@ -12415,7 +13300,7 @@ db_add_routing_rule() {
     local outbound="$2"     # 出口标识: direct, warp, chain:节点名
     local domains="$3"      # 自定义域名 (仅 custom 类型)
     
-    [[ ! -f "$DB_FILE" ]] && echo '{}' > "$DB_FILE"
+    [[ -f "$DB_FILE" ]] || init_db
 
     # 获取 IP 版本选项 (第4个参数)
     local ip_version="${4:-prefer_ipv4}"
@@ -12434,7 +13319,6 @@ db_add_routing_rule() {
     local rule_domains="$domains"
     [[ "$rule_type" != "custom" && "$rule_type" != "all" ]] && rule_domains="${ROUTING_PRESETS[$rule_type]:-}"
     
-    local tmp=$(mktemp)
     
     # 规则优先级排序：
     # 1. 直连规则 (outbound=direct) - 最高优先级
@@ -12445,46 +13329,41 @@ db_add_routing_rule() {
     if [[ "$rule_type" == "custom" ]]; then
         if [[ "$outbound" == "direct" ]]; then
             # 直连的 custom 规则插入到最开头
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
-                '.routing_rules = ([{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] + (.routing_rules // []))' \
-                "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+            _db_apply --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+                '.routing_rules = ([{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] + (.routing_rules // []))'
         else
             # 非直连的 custom 规则插入到直连规则之后
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+            _db_apply --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
                 '.routing_rules = (
                     ((.routing_rules // []) | map(select(.outbound == "direct"))) + 
                     [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] +
                     ((.routing_rules // []) | map(select(.outbound != "direct")))
-                )' \
-                "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                )'
         fi
     elif [[ "$rule_type" == "all" ]]; then
         # all 规则追加到末尾，优先级最低
-        jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+        _db_apply --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
             '.routing_rules = (
                 ((.routing_rules // []) | map(select(.type != $type or ((.ip_version // "prefer_ipv4") != $ip_ver))))
-            ) + [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}]' \
-            "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+            ) + [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}]'
     else
         # 预设规则：删除同类型旧规则
         if [[ "$outbound" == "direct" ]]; then
             # 直连的预设规则插入到最开头
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+            _db_apply --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
                 '.routing_rules = (
                     [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] +
                     ((.routing_rules // []) | map(select(.type != $type)))
-                )' \
-                "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                )'
         else
             # 非直连的预设规则：插入到直连和 custom 规则之后
-            jq --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
+            _db_apply --arg id "$rule_id" --arg type "$rule_type" --arg out "$outbound" --arg domains "$rule_domains" --arg ip_ver "$ip_version" \
                 '.routing_rules = (
                     ((.routing_rules // []) | map(select(.outbound == "direct"))) + 
                     ((.routing_rules // []) | map(select(.type == "custom" and .outbound != "direct"))) + 
                     [{id: $id, type: $type, outbound: $out, domains: $domains, ip_version: $ip_ver}] +
                     ((.routing_rules // []) | map(select(.type != "custom" and .type != $type and .outbound != "direct")))
-                )' \
-                "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                )'
         fi
     fi
 }
@@ -12496,13 +13375,12 @@ db_del_routing_rule() {
     local mode="${2:-by_id}"  # 默认按 id 删除
     [[ ! -f "$DB_FILE" ]] && return
     
-    local tmp=$(mktemp)
     if [[ "$mode" == "by_type" ]]; then
         # 按 type 删除 (删除所有同类型规则)
-        jq --arg type "$identifier" '.routing_rules = [.routing_rules[]? | select(.type != $type)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+        _db_apply --arg type "$identifier" '.routing_rules = [.routing_rules[]? | select(.type != $type)]'
     else
         # 按 id 删除 (只删除单个规则)
-        jq --arg id "$identifier" '.routing_rules = [.routing_rules[]? | select(.id != $id)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+        _db_apply --arg id "$identifier" '.routing_rules = [.routing_rules[]? | select(.id != $id)]'
     fi
 }
 
@@ -12533,8 +13411,7 @@ db_has_routing_rule_by_type_and_ip_version() {
 # 数据库：清空所有分流规则
 db_clear_routing_rules() {
     [[ ! -f "$DB_FILE" ]] && return
-    local tmp=$(mktemp)
-    jq '.routing_rules = []' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply '.routing_rules = []'
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -12550,7 +13427,7 @@ db_add_balancer_group() {
     shift 2
     local nodes=("$@")
 
-    [[ ! -f "$DB_FILE" ]] && echo '{}' > "$DB_FILE"
+    [[ -f "$DB_FILE" ]] || init_db
 
     # 构建节点数组
     local nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
@@ -12563,10 +13440,8 @@ db_add_balancer_group() {
         '{name: $name, strategy: $strategy, nodes: $nodes}')
 
     # 写入数据库
-    local tmp=$(mktemp)
-    jq --argjson group "$group_json" \
-        '.balancer_groups = (.balancer_groups // []) + [$group]' \
-        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --argjson group "$group_json" \
+        '.balancer_groups = (.balancer_groups // []) + [$group]'
 }
 
 # 数据库：获取所有负载均衡组
@@ -12586,10 +13461,8 @@ db_get_balancer_group() {
 db_delete_balancer_group() {
     local name="$1"
     [[ ! -f "$DB_FILE" ]] && return
-    local tmp=$(mktemp)
-    jq --arg name "$name" \
-        '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]' \
-        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --arg name "$name" \
+        '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
 }
 
 # 数据库：检查负载均衡组是否存在
@@ -12610,10 +13483,8 @@ db_update_balancer_nodes() {
     [[ ! -f "$DB_FILE" ]] && return 1
 
     local nodes_json=$(printf '%s\n' "${nodes[@]}" | jq -R . | jq -s .)
-    local tmp=$(mktemp)
-    jq --arg name "$name" --argjson nodes "$nodes_json" \
-        '.balancer_groups = [.balancer_groups[]? | if .name == $name then .nodes = $nodes else . end]' \
-        "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --arg name "$name" --argjson nodes "$nodes_json" \
+        '.balancer_groups = [.balancer_groups[]? | if .name == $name then .nodes = $nodes else . end]'
 }
 
 # 获取可用的出口列表
@@ -13815,17 +14686,41 @@ _del_routing_rule() {
 
 # 重新生成代理配置的辅助函数
 _regenerate_proxy_configs() {
+    # 返回 0 仅当所有已安装核心的“预检 + 重载”都成功；任一核心预检失败则保留原配置、
+    # 不重启该核心（避免用失败/过期的配置重启并误报成功），并返回非 0。
+    local rc=0
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
-        generate_xray_config
-        svc restart vless-reality 2>/dev/null
+        if generate_xray_config; then
+            _traffic_collect_to_journal 2>/dev/null || true
+            svc restart vless-reality 2>/dev/null || { _err "Xray 服务重启失败"; rc=1; }
+        else
+            _err "Xray 配置重建失败，已保留原配置，未重启 Xray"
+            rc=1
+        fi
     fi
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        generate_singbox_config
-        svc restart vless-singbox 2>/dev/null
+        local sb_gen_rc=0
+        generate_singbox_config || sb_gen_rc=$?
+        if [[ $sb_gen_rc -eq 0 ]]; then
+            svc restart vless-singbox 2>/dev/null || { _err "Sing-box 服务重启失败"; rc=1; }
+        elif [[ $sb_gen_rc -eq 2 ]]; then
+            if svc status vless-singbox 2>/dev/null; then
+                svc stop vless-singbox 2>/dev/null || { _err "Sing-box 无启用用户，但停止服务失败"; rc=1; }
+            fi
+        else
+            rc=1
+            if [[ ! -f "$CFG/singbox.json" ]] && svc status vless-singbox 2>/dev/null; then
+                svc stop vless-singbox 2>/dev/null || true
+                _err "Sing-box 无有效配置，已停止服务"
+            else
+                _err "Sing-box 配置重建失败，已保留原配置，未重启 Sing-box"
+            fi
+        fi
     fi
+    return "$rc"
 }
 
 # WARP 管理菜单 (二选一模式)
@@ -13929,10 +14824,14 @@ manage_warp() {
                 if [[ "$current_mode" == "official" ]]; then
                     # 切换到 WGCF
                     _info "切换到 WGCF 模式..."
-                    warp-cli disconnect 2>/dev/null
-                    # 停止 warp-svc 服务，避免与 WGCF 冲突
-                    systemctl stop warp-svc 2>/dev/null
-                    systemctl disable warp-svc 2>/dev/null
+                    if [[ "$(db_get_warp_official_owned 2>/dev/null)" == "true" ]]; then
+                        warp-cli disconnect 2>/dev/null
+                        # 停止本项目独占安装的 warp-svc 服务，避免与 WGCF 冲突
+                        systemctl stop warp-svc 2>/dev/null
+                        systemctl disable warp-svc 2>/dev/null
+                    else
+                        _info "保留主机共享的 WARP 官方客户端服务，仅切换本项目出口模式为 WGCF"
+                    fi
                     if register_warp; then
                         db_set_warp_mode "wgcf"
                         _regenerate_proxy_configs
@@ -14114,12 +15013,11 @@ setup_warp_ipv6_chain() {
             selected_node_name="${node_names[$((node_choice-1))]}"
             
             # 标记该节点为通过 WARP 连接
-            local tmp=$(mktemp)
-            jq --arg name "$selected_node_name" '
+            _db_apply --arg name "$selected_node_name" '
                 .chain_proxy.nodes = [.chain_proxy.nodes[]? | 
                     if .name == $name then .via_warp = true else . end
                 ]
-            ' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+            '
             
             _ok "已选择节点: $selected_node_name (通过 WARP)"
         elif [[ "$node_choice" == "$i" ]]; then
@@ -14624,8 +15522,7 @@ db_get_chain_nodes() { jq -r '.chain_proxy.nodes // []' "$DB_FILE" 2>/dev/null; 
 db_get_chain_node() { jq -r --arg name "$1" '.chain_proxy.nodes[] | select(.name == $name)' "$DB_FILE" 2>/dev/null; }
 db_get_chain_active() { jq -r '.chain_proxy.active // empty' "$DB_FILE" 2>/dev/null; }
 db_set_chain_active() {
-    local tmp=$(mktemp)
-    jq --arg name "$1" '.chain_proxy.active = $name' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --arg name "$1" '.chain_proxy.active = $name'
 }
 db_add_chain_node() {
     local node_json="$1"
@@ -14633,14 +15530,12 @@ db_add_chain_node() {
     if ! echo "$node_json" | jq empty 2>/dev/null; then
         return 1
     fi
-    local tmp=$(mktemp)
-    jq --argjson node "$node_json" '.chain_proxy.nodes = ((.chain_proxy.nodes // []) + [$node])' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --argjson node "$node_json" '.chain_proxy.nodes = ((.chain_proxy.nodes // []) + [$node])'
 }
 db_del_chain_node() {
-    local tmp=$(mktemp)
-    jq --arg name "$1" '.chain_proxy.nodes = [.chain_proxy.nodes[] | select(.name != $name)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    _db_apply --arg name "$1" '.chain_proxy.nodes = [.chain_proxy.nodes[] | select(.name != $name)]'
     # 如果删除的是当前激活节点，清空激活状态
-    [[ "$(db_get_chain_active)" == "$1" ]] && jq 'del(.chain_proxy.active)' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+    [[ "$(db_get_chain_active)" == "$1" ]] && _db_apply 'del(.chain_proxy.active)'
 }
 
 # 检查链式代理节点是否存在 (返回 0=存在, 1=不存在)
@@ -15620,8 +16515,7 @@ _import_alice_nodes() {
 
     if [[ $deleted -gt 0 ]]; then
         echo -e "  ${C}▸${NC} 清理了 $deleted 个旧节点"
-        local tmp=$(mktemp)
-        jq '.routing_rules = [.routing_rules[]? | select(.outbound | (startswith("chain:Alice-TW-SOCKS5-") | not))]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+        _db_apply '.routing_rules = [.routing_rules[]? | select(.outbound | (startswith("chain:Alice-TW-SOCKS5-") | not))]'
     fi
 
     echo -e "  ${C}▸${NC} 开始导入 8 个节点..."
@@ -16098,11 +16992,8 @@ create_load_balance_group() {
         }')
     
     # 保存到数据库
-    local tmp_file="${DB_FILE}.tmp"
-    if jq --argjson cfg "$lb_config" \
-        '.balancer_groups = ((.balancer_groups // []) + [$cfg])' \
-        "$DB_FILE" > "$tmp_file"; then
-        mv "$tmp_file" "$DB_FILE"
+    if _db_apply --argjson cfg "$lb_config" \
+        '.balancer_groups = ((.balancer_groups // []) + [$cfg])'; then
         
         echo ""
         echo -e "  ${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
@@ -16314,11 +17205,9 @@ manage_chain_proxy() {
                 if [[ "$idx" == "0" ]]; then
                     continue
                 elif [[ "$idx" == "all" ]]; then
-                    local tmp=$(mktemp)
-                    jq 'del(.chain_proxy)' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                    _db_apply 'del(.chain_proxy)'
                     # 清理所有引用链式代理节点的分流规则
-                    tmp=$(mktemp)
-                    jq '.routing_rules = [.routing_rules[]? | select(.outbound | startswith("chain:") | not)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                    _db_apply '.routing_rules = [.routing_rules[]? | select(.outbound | startswith("chain:") | not)]'
                     _ok "已删除所有节点"
                     _ok "已清理相关分流规则"
                     _regenerate_proxy_configs
@@ -16327,8 +17216,7 @@ manage_chain_proxy() {
                     if [[ -n "$name" ]]; then
                         db_del_chain_node "$name"
                         # 清理引用该节点的分流规则
-                        local tmp=$(mktemp)
-                        jq --arg out "chain:$name" '.routing_rules = [.routing_rules[]? | select(.outbound != $out)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                        _db_apply --arg out "chain:$name" '.routing_rules = [.routing_rules[]? | select(.outbound != $out)]'
                         _ok "已删除: $name"
                         _regenerate_proxy_configs
                     fi
@@ -16375,15 +17263,13 @@ manage_chain_proxy() {
                 if [[ "$del_idx" == "0" ]]; then
                     continue
                 elif [[ "$del_idx" == "all" ]]; then
-                    local tmp=$(mktemp)
-                    jq 'del(.balancer_groups)' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                    _db_apply 'del(.balancer_groups)'
                     _ok "已删除所有负载均衡组"
                     _regenerate_proxy_configs
                 elif [[ -n "$del_idx" && "$del_idx" =~ ^[0-9]+$ ]]; then
                     local group_name=$(echo "$balancer_groups" | jq -r ".[$((del_idx-1))].name // empty")
                     if [[ -n "$group_name" ]]; then
-                        local tmp=$(mktemp)
-                        jq --arg name "$group_name" '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]' "$DB_FILE" > "$tmp" && mv "$tmp" "$DB_FILE"
+                        _db_apply --arg name "$group_name" '.balancer_groups = [.balancer_groups[]? | select(.name != $name)]'
                         _ok "已删除: $group_name"
                         _regenerate_proxy_configs
                     else
@@ -18004,35 +18890,51 @@ uninstall_specific_protocol() {
     [[ ! "$confirm" =~ ^[yY]$ ]] && return
     
     _info "卸载 $selected_protocol..."
+    local _uninstall_rc=0
     
     # 停止相关服务
     if [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
-        # Xray 协议：需要重新生成配置
-        # 根据选择的端口进行卸载
+        # Xray 协议：先确认 DB 删除成功，再清理 join 文件并重建/重载配置；写库失败立即中止，不改动配置与服务。
         if [[ "$SELECTED_PORT" == "all" ]]; then
             echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
+            if ! unregister_protocol "$selected_protocol"; then
+                _err "从数据库删除协议 $selected_protocol 失败，已中止卸载（配置与服务未改动）"
+                _pause
+                return 1
+            fi
             rm -f "$CFG/${selected_protocol}.join"
         else
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             
             # 删除指定端口实例
             if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
+                if ! db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"; then
+                    _err "从数据库删除协议 $selected_protocol 端口 $SELECTED_PORT 失败，已中止卸载（配置与服务未改动）"
+                    _pause
+                    return 1
+                fi
                 
                 # 检查是否还有其他端口实例
                 local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
                 if [[ -z "$remaining_ports" ]]; then
                     # 没有剩余端口，完全卸载
                     echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
+                    if db_exists "$core" "$selected_protocol" && ! db_del "$core" "$selected_protocol"; then
+                        _err "从数据库清理协议 $selected_protocol 失败，已中止卸载"
+                        _pause
+                        return 1
+                    fi
                     rm -f "$CFG/${selected_protocol}.join"
                 else
                     echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
                 fi
             else
                 # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
+                if ! unregister_protocol "$selected_protocol"; then
+                    _err "从数据库删除协议 $selected_protocol 失败，已中止卸载（配置与服务未改动）"
+                    _pause
+                    return 1
+                fi
                 rm -f "$CFG/${selected_protocol}.join"
             fi
         fi
@@ -18041,14 +18943,15 @@ uninstall_specific_protocol() {
         local remaining_xray=$(get_xray_protocols)
         if [[ -n "$remaining_xray" ]]; then
             _info "重新生成 Xray 配置..."
-            svc stop vless-reality 2>/dev/null
-            rm -f "$CFG/config.json"
-            
+            # 先渲染并预检新配置：generate_xray_config 失败时会保留原 config.json，
+            # 此时不得停服务/删配置，否则其它仍在服务的端口会被一并拖停。成功后只重启一次。
             if generate_xray_config; then
                 _ok "Xray 配置已更新"
-                svc start vless-reality
+                _traffic_collect_to_journal 2>/dev/null || true
+                svc restart vless-reality 2>/dev/null || { _err "Xray 服务重启失败"; _uninstall_rc=1; }
             else
-                _err "Xray 配置生成失败"
+                _err "Xray 配置生成失败：已保留原配置与运行中的服务，其它端口不受影响"
+                _uninstall_rc=1
             fi
         else
             _info "没有其他 Xray 协议，停止 Xray 服务..."
@@ -18057,48 +18960,64 @@ uninstall_specific_protocol() {
             _ok "Xray 服务已停止"
         fi
     elif [[ " $SINGBOX_PROTOCOLS " == *" $selected_protocol "* ]]; then
-        # Sing-box 协议 (hy2/tuic)：需要重新生成配置
-        
-        # 在修改数据库前按精确 DB 记录清理当前端口跳跃规则；证书属于整个协议，
-        # 必须等端口删除完成并确认协议已不存在后再处理。
+        # Sing-box 协议 (hy2/tuic/anytls)：先只读快照待清理 NAT 规则，等 DB 删除成功后才执行外部清理与重建。
+        local _nat_rules_snapshot=""
         if [[ "$selected_protocol" == "hy2" || "$selected_protocol" == "tuic" ]]; then
             if [[ "$SELECTED_PORT" == "all" ]]; then
-                cleanup_hy2_nat_rules "$selected_protocol"
+                _nat_rules_snapshot=$(_collect_hy2_nat_rules "$selected_protocol")
             else
-                cleanup_hy2_nat_rules "$selected_protocol" "$SELECTED_PORT"
+                _nat_rules_snapshot=$(_collect_hy2_nat_rules "$selected_protocol" "$SELECTED_PORT")
             fi
         fi
         
         # 根据选择的端口进行卸载
         if [[ "$SELECTED_PORT" == "all" ]]; then
             echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
+            if ! unregister_protocol "$selected_protocol"; then
+                _err "从数据库删除协议 $selected_protocol 失败，已中止卸载（配置、服务与 NAT 规则均未改动）"
+                _pause
+                return 1
+            fi
             rm -f "$CFG/${selected_protocol}.join"
         else
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             
             # 删除指定端口实例
             if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
+                if ! db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"; then
+                    _err "从数据库删除协议 $selected_protocol 端口 $SELECTED_PORT 失败，已中止卸载（配置、服务与 NAT 规则均未改动）"
+                    _pause
+                    return 1
+                fi
                 
                 # 检查是否还有其他端口实例
                 local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
                 if [[ -z "$remaining_ports" ]]; then
                     # 没有剩余端口，完全卸载
                     echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
+                    if db_exists "$core" "$selected_protocol" && ! db_del "$core" "$selected_protocol"; then
+                        _err "从数据库清理协议 $selected_protocol 失败，已中止卸载"
+                        _pause
+                        return 1
+                    fi
                     rm -f "$CFG/${selected_protocol}.join"
                 else
                     echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
                 fi
             else
                 # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
+                if ! unregister_protocol "$selected_protocol"; then
+                    _err "从数据库删除协议 $selected_protocol 失败，已中止卸载（配置、服务与 NAT 规则均未改动）"
+                    _pause
+                    return 1
+                fi
                 rm -f "$CFG/${selected_protocol}.join"
             fi
         fi
 
+        # DB 已确认删除成功，此时才清理对应的 NAT 规则与不再使用的协议证书
         if [[ "$selected_protocol" == "hy2" || "$selected_protocol" == "tuic" ]]; then
+            _delete_hy2_nat_rules_list "$_nat_rules_snapshot"
             cleanup_protocol_cert_if_unused "$selected_protocol"
         fi
         
@@ -18106,14 +19025,26 @@ uninstall_specific_protocol() {
         local remaining_singbox=$(get_singbox_protocols)
         if [[ -n "$remaining_singbox" ]]; then
             _info "重新生成 Sing-box 配置..."
-            svc stop vless-singbox 2>/dev/null
-            rm -f "$CFG/singbox.json"
-            
-            if generate_singbox_config; then
+            # 同 Xray：预检失败保留原配置且不停服务；仅当生成器因“无任何有效用户”(rc=2)而主动
+            # 删除了 singbox.json 时才停服务，避免内存中残留已失效凭据继续生效。
+            local sb_gen_rc=0
+            generate_singbox_config || sb_gen_rc=$?
+            if [[ $sb_gen_rc -eq 0 ]]; then
                 _ok "Sing-box 配置已更新"
-                svc start vless-singbox
+                svc restart vless-singbox 2>/dev/null || { _err "Sing-box 服务重启失败"; _uninstall_rc=1; }
+            elif [[ $sb_gen_rc -eq 2 ]]; then
+                if svc status vless-singbox 2>/dev/null; then
+                    svc stop vless-singbox 2>/dev/null || { _err "Sing-box 无启用用户，但停止服务失败"; _uninstall_rc=1; }
+                fi
+                [[ $_uninstall_rc -eq 0 ]] && _ok "Sing-box 剩余协议无启用用户，已清除配置并停止服务"
             else
-                _err "Sing-box 配置生成失败"
+                _uninstall_rc=1
+                if [[ ! -f "$CFG/singbox.json" ]]; then
+                    svc stop vless-singbox 2>/dev/null || true
+                    _err "Sing-box 无有效配置，已停止服务"
+                else
+                    _err "Sing-box 配置生成失败：已保留原配置与运行中的服务，其它端口不受影响"
+                fi
             fi
         else
             _info "没有其他 Sing-box 协议，停止 Sing-box 服务..."
@@ -18131,9 +19062,38 @@ uninstall_specific_protocol() {
             _ok "Sing-box 服务已停止"
         fi
     else
-        # 独立协议 (Snell/AnyTLS/ShadowTLS)：停止服务，删除配置和服务文件
+        # 独立协议 (Snell/Naive/ShadowTLS)：先确保 DB 删除成功，再停服并删配置与服务文件
         local service_name="vless-${selected_protocol}"
         
+        if [[ "$SELECTED_PORT" == "all" || "$core" == "standalone" ]]; then
+            echo -e "${CYAN}卸载协议 $selected_protocol...${NC}"
+            if ! unregister_protocol "$selected_protocol"; then
+                _err "从数据库删除协议 $selected_protocol 失败，已中止卸载（配置与服务未改动）"
+                _pause
+                return 1
+            fi
+            rm -f "$CFG/${selected_protocol}.join"
+        else
+            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
+            if ! db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"; then
+                _err "从数据库删除协议 $selected_protocol 端口 $SELECTED_PORT 失败，已中止卸载（配置与服务未改动）"
+                _pause
+                return 1
+            fi
+            local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
+            if [[ -z "$remaining_ports" ]]; then
+                echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
+                if db_exists "$core" "$selected_protocol" && ! db_del "$core" "$selected_protocol"; then
+                    _err "从数据库清理协议 $selected_protocol 失败，已中止卸载"
+                    _pause
+                    return 1
+                fi
+                rm -f "$CFG/${selected_protocol}.join"
+            else
+                echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
+            fi
+        fi
+
         # 停止主服务
         svc stop "$service_name" 2>/dev/null
         
@@ -18141,35 +19101,6 @@ uninstall_specific_protocol() {
         if [[ "$selected_protocol" == "snell-shadowtls" || "$selected_protocol" == "snell-v5-shadowtls" || "$selected_protocol" == "ss2022-shadowtls" ]]; then
             local backend_svc="${BACKEND_NAME[$selected_protocol]}"
             [[ -n "$backend_svc" ]] && svc stop "$backend_svc" 2>/dev/null
-        fi
-        
-        # 根据选择的端口进行卸载
-        if [[ "$SELECTED_PORT" == "all" ]]; then
-            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
-            unregister_protocol "$selected_protocol"
-            rm -f "$CFG/${selected_protocol}.join"
-        else
-            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
-            
-            # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
-                db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
-                
-                # 检查是否还有其他端口实例
-                local remaining_ports=$(db_list_ports "$core" "$selected_protocol")
-                if [[ -z "$remaining_ports" ]]; then
-                    # 没有剩余端口，完全卸载
-                    echo -e "${YELLOW}这是最后一个端口实例，将完全卸载协议${NC}"
-                    db_del "$core" "$selected_protocol"
-                    rm -f "$CFG/${selected_protocol}.join"
-                else
-                    echo -e "${GREEN}协议 $selected_protocol 还有其他端口实例在运行${NC}"
-                fi
-            else
-                # 独立协议不支持多端口，直接卸载
-                unregister_protocol "$selected_protocol"
-                rm -f "$CFG/${selected_protocol}.join"
-            fi
         fi
         
         # 删除配置文件
@@ -18209,7 +19140,13 @@ uninstall_specific_protocol() {
         _info "更新已显式启用的订阅文件..."
         generate_sub_files
     fi
-    _ok "$selected_protocol 已卸载"
+    if [[ $_uninstall_rc -ne 0 ]]; then
+        _warn "$selected_protocol 已从数据库移除，但剩余配置重建/重载失败；请检查后用菜单 14 重建"
+        _pause
+        return 1
+    else
+        _ok "$selected_protocol 已卸载"
+    fi
     _pause
 }
 
@@ -18247,26 +19184,21 @@ do_uninstall() {
     
     _info "停止所有服务..."
     stop_services
+
+    # 移除本项目的定时任务（否则卸载后 cron 仍每分钟调用已不存在的脚本）
+    _cron_remove "--sync-traffic" >/dev/null 2>&1 || true
+    _cron_remove "--check-expire" >/dev/null 2>&1 || true
     
     # 卸载 WARP (如果已安装)
+    # 明确区分「本项目使用过（warp_mode=official）」与「软件包由本项目安装（warp_official_owned=true）」：
+    # 复用主机已有官方客户端或历史归属未知时，绝不断开、不停用 warp-svc、不卸载 cloudflare-warp 软件包。
     local warp_st=$(warp_status 2>/dev/null)
-    if [[ "$warp_st" == "configured" || "$warp_st" == "connected" ]] || check_cmd warp-cli; then
-        _info "卸载 WARP..."
-        local warp_mode=$(db_get_warp_mode 2>/dev/null)
-        if [[ "$warp_mode" == "official" ]] || check_cmd warp-cli; then
-            # 卸载官方客户端
-            warp-cli disconnect 2>/dev/null
-            systemctl stop warp-svc 2>/dev/null
-            systemctl disable warp-svc 2>/dev/null
-            if [[ "$DISTRO" == "ubuntu" || "$DISTRO" == "debian" ]]; then
-                apt-get remove -y cloudflare-warp 2>/dev/null
-                apt-get autoremove -y 2>/dev/null
-                rm -f /etc/apt/sources.list.d/cloudflare-client.list
-                rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            elif [[ "$DISTRO" == "centos" ]]; then
-                yum remove -y cloudflare-warp 2>/dev/null
-                rm -f /etc/yum.repos.d/cloudflare-warp.repo
-            fi
+    local warp_mode=$(db_get_warp_mode 2>/dev/null)
+    if [[ "$warp_st" == "configured" || "$warp_st" == "connected" || "$warp_st" == "registered" \
+          || "$warp_mode" == "official" || -f "$WARP_CONF_FILE" ]]; then
+        _info "清理 WARP 配置..."
+        if [[ "$warp_mode" == "official" ]]; then
+            uninstall_warp_official || _warn "卸载 cloudflare-warp 软件包失败，请手工清理"
         fi
         # 清理 WGCF 相关文件
         rm -f "$CFG/warp.json" 2>/dev/null
@@ -18274,7 +19206,7 @@ do_uninstall() {
         rm -f ~/.wgcf-account.toml 2>/dev/null
         # 清理分流配置
         db_clear_routing_rules 2>/dev/null
-        _ok "WARP 已卸载"
+        _ok "WARP 集成已清理"
     fi
     
     # 清理伪装网页服务和订阅文件
@@ -18490,6 +19422,7 @@ select_ss_version() {
 }
 
 do_install_server() {
+    _REGISTER_FAILED=0
     # check_installed && { _warn "已安装，请先卸载"; return; }
     _header
     echo -e "  ${W}服务端安装向导${NC}"
@@ -19726,6 +20659,13 @@ do_install_server() {
             ;;
     esac
     
+    # 写库失败：此前会继续创建服务并用「现有 DB 的旧服务」判定安装成功
+    if [[ "${_REGISTER_FAILED:-0}" == "1" ]]; then
+        _err "协议注册（写库）失败，安装已中止；现有服务与配置未改动"
+        _pause
+        return 1
+    fi
+
     _info "创建服务..."
     create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
     create_service "$protocol"
@@ -21045,21 +21985,39 @@ reset_sub_uuid() {
     echo "$new_uuid"
 }
 
-# 判断单个协议实例是否还有有效用户（用于订阅生成 fail-closed：显式 users 数组且全禁用/过期则不暴露）
-_cfg_has_active_user() {
-    local cfg="$1"
-    local today
+# 订阅生成用的「生效配置」：显式 users 数组时只取第一个仍生效的用户（enabled 不为 false 且
+# expire_date 未过期，与服务端渲染器的过滤一致），并把它的凭据写入对应字段，
+# 避免继续分发已禁用/已过期用户的顶层凭据；没有生效用户时返回 1（订阅 fail-closed）。
+# 注意：禁用用户的 enabled 为 false，`(.enabled // true)` 会把 false 当作缺省而误判为 true。
+# 用法: cfg=$(_cfg_effective <protocol> <cfg-json>) || continue
+_cfg_effective() {
+    local proto="$1" cfg="$2" today
     today=$(date '+%Y-%m-%d')
-    jq -e --arg today "$today" '
+    jq -ce --arg today "$today" --arg proto "$proto" '
+        . as $c |
         if (.users | type) == "array" then
-            any(.users[];
-                ((.enabled // true) == true) and
-                ((.expire // "") == "" or (.expire > $today))
-            )
-        else
-            true
-        end
-    ' <<< "$cfg" >/dev/null 2>&1
+            ([.users[] | select(.enabled != false)
+                       | select((.expire_date // "") == "" or .expire_date >= $today)][0]) as $u |
+            if $u == null then empty
+            else
+                $c + (
+                    if ($proto | IN("vless","vless-xhttp","vless-ws","vless-vision","vmess-ws")) then
+                        {uuid: $u.uuid}
+                    elif $proto == "tuic" then
+                        {uuid: $u.uuid,
+                         password: ($u.password //
+                            (if ($u.uuid // "") == ($c.uuid // "") and ($c.password // "") != ""
+                             then $c.password else $u.uuid end))}
+                    elif $proto == "socks" then
+                        {username: ($u.name // $c.username), password: (if ($u.uuid // "") != "" then $u.uuid else ($u.password // "") end)}
+                    elif ($proto | IN("hy2","trojan","ss-legacy")) then
+                        {password: (if ($u.uuid // "") != "" then $u.uuid else ($u.password // "") end)}
+                    elif $proto == "anytls" then
+                        {password: (if ($u.password // "") != "" then $u.password else ($u.uuid // "") end)}
+                    else {} end)
+            end
+        else . end
+    ' <<< "$cfg" 2>/dev/null
 }
 
 # 生成 V2Ray/通用 Base64 订阅内容
@@ -21105,7 +22063,7 @@ gen_v2ray_sub() {
         
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
-            _cfg_has_active_user "$cfg" || continue
+            cfg=$(_cfg_effective "$protocol" "$cfg") || continue
             
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -21229,7 +22187,7 @@ gen_clash_sub() {
         
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
-            _cfg_has_active_user "$cfg" || continue
+            cfg=$(_cfg_effective "$protocol" "$cfg") || continue
             
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -21479,7 +22437,7 @@ gen_surge_sub() {
         
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
-            _cfg_has_active_user "$cfg" || continue
+            cfg=$(_cfg_effective "$protocol" "$cfg") || continue
             
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
@@ -21558,29 +22516,43 @@ EOF
 }
 
 # 生成订阅文件。默认只能更新已有显式订阅；首次生成必须来自菜单 6 opt-in。
+# 先在同级临时目录完整生成并校验三份文件，任一生成器失败均不改动已发布目录。
 generate_sub_files() {
     if [[ ! -f "$CFG/sub.info" && "${SUBSCRIPTION_EXPLICIT_ENABLE:-false}" != "true" ]]; then
         _err "订阅服务未显式启用；请使用主菜单 6"
         return 1
     fi
 
-    local sub_uuid=$(get_sub_uuid)
-    local sub_dir="$CFG/subscription/$sub_uuid"
-    mkdir -p "$sub_dir"
-    
+    # 可选参数 $1：显式 UUID；可选参数 $2：指定输出目录（用于事务暂存，发布前不碰正式目录）
+    local sub_uuid="${1:-$(get_sub_uuid)}"
+    local sub_dir="${2:-$CFG/subscription/$sub_uuid}"
+    mkdir -p "$sub_dir" || return 1
+
+    local stage_dir
+    stage_dir=$(mktemp -d "${sub_dir}/.gen.XXXXXX" 2>/dev/null) || { _err "无法创建订阅暂存目录"; return 1; }
+    chmod 700 "$stage_dir" 2>/dev/null || true
+
     _info "生成订阅文件..."
-    
-    # V2Ray/通用订阅
-    gen_v2ray_sub > "$sub_dir/base64"
-    
-    # Clash 订阅
-    gen_clash_sub > "$sub_dir/clash.yaml"
-    
-    # Surge 订阅
-    gen_surge_sub > "$sub_dir/surge.conf"
-    
-    chmod -R 644 "$sub_dir"/*
+
+    if ! gen_v2ray_sub > "$stage_dir/base64" \
+       || ! gen_clash_sub > "$stage_dir/clash.yaml" \
+       || ! gen_surge_sub > "$stage_dir/surge.conf"; then
+        rm -rf "$stage_dir"
+        _err "订阅文件生成失败，已保留原订阅内容"
+        return 1
+    fi
+
+    chmod 644 "$stage_dir/base64" "$stage_dir/clash.yaml" "$stage_dir/surge.conf" 2>/dev/null || true
+    if ! mv -f "$stage_dir/base64" "$sub_dir/base64" \
+       || ! mv -f "$stage_dir/clash.yaml" "$sub_dir/clash.yaml" \
+       || ! mv -f "$stage_dir/surge.conf" "$sub_dir/surge.conf"; then
+        rm -rf "$stage_dir"
+        _err "订阅文件发布失败"
+        return 1
+    fi
+    rm -rf "$stage_dir"
     _ok "订阅文件已生成"
+    return 0
 }
 
 # 配置 Nginx 订阅服务
@@ -21827,16 +22799,17 @@ setup_subscription_interactive() {
     _line
     
     # 询问是否重新生成 UUID
+    local regen_uuid_flag=0 old_uuid="" new_uuid=""
     if [[ -f "$CFG/sub_uuid" ]]; then
         echo -e "  ${Y}检测到已有订阅 UUID${NC}"
         read -rp "  是否重新生成 UUID? [y/N]: " regen_uuid
         if [[ "$regen_uuid" =~ ^[yY]$ ]]; then
-            local old_uuid=$(cat "$CFG/sub_uuid")
-            reset_sub_uuid
-            local new_uuid=$(cat "$CFG/sub_uuid")
-            _ok "UUID 已更新: ${old_uuid:0:8}... → ${new_uuid:0:8}..."
-            # 清理旧的订阅目录
-            rm -rf "$CFG/subscription/$old_uuid" 2>/dev/null
+            # 只记录意图：取消 / nginx 预检失败 / 重载失败时旧 UUID、旧目录、旧链接必须原样保留；
+            # 新 UUID 在全部成功后才提交，旧订阅目录此时才清理。
+            old_uuid=$(cat "$CFG/sub_uuid")
+            new_uuid=$(gen_uuid)
+            regen_uuid_flag=1
+            _info "新 UUID 将在配置全部成功后生效: ${old_uuid:0:8}... → ${new_uuid:0:8}..."
         fi
         echo ""
     fi
@@ -21893,11 +22866,27 @@ setup_subscription_interactive() {
     read -rp "  启用 HTTPS? [Y/n]: " https_choice
     [[ "$https_choice" =~ ^[nN]$ ]] && use_https="false"
     
-    # 生成订阅文件
-    generate_sub_files
-    
-    # 获取订阅 UUID
-    local sub_uuid=$(get_sub_uuid)
+    # 获取订阅 UUID（无论是否轮换 UUID，先在独立暂存目录生成完整三份候选订阅文件；
+    # 绝不在 nginx 预检与重载成功前覆盖已发布的旧目录，也绝不在首次配置失败时提前落盘 sub_uuid）。
+    local sub_uuid sub_uuid_existed=0
+    if [[ $regen_uuid_flag -eq 1 ]]; then
+        sub_uuid="$new_uuid"
+        sub_uuid_existed=1
+    elif [[ -f "$CFG/sub_uuid" ]]; then
+        sub_uuid=$(cat "$CFG/sub_uuid")
+        sub_uuid_existed=1
+    else
+        sub_uuid=$(gen_uuid)
+    fi
+    mkdir -p "$CFG/subscription" || { _err "无法创建订阅目录"; _pause; return 1; }
+    local sub_stage
+    sub_stage=$(mktemp -d "$CFG/subscription/.stage.XXXXXX") || { _err "无法创建订阅暂存目录"; _pause; return 1; }
+    if ! generate_sub_files "$sub_uuid" "$sub_stage"; then
+        rm -rf "$sub_stage"
+        _err "订阅文件生成失败，已保留原订阅内容与 Nginx 配置"
+        _pause
+        return 1
+    fi
     local sub_dir="$CFG/subscription/$sub_uuid"
     local server_name="${sub_domain:-$(get_ipv4)}"
     
@@ -21907,9 +22896,53 @@ setup_subscription_interactive() {
     local nginx_conf="$nginx_conf_dir/vless-sub.conf"
     mkdir -p "$nginx_conf_dir"
     
-    # 删除本项目旧版订阅配置，不触碰发行版默认站点或第三方站点。
-    rm -f /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf 2>/dev/null
-    rm -f /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake 2>/dev/null
+    # 事务化：本项目旧版订阅配置、现有 vless-sub.conf 与现有订阅文件均先「暂存」，
+    # nginx 预检和重载全部成功后才发布订阅文件、落 sub_uuid 与 sub.info；
+    # 任何一步失败都从暂存恢复，旧链接、旧订阅文件内容、旧站点文件、sub.info 均保持原状。
+    local stash; stash=$(mktemp -d "${TMPDIR:-/tmp}/aio-sub-stash.XXXXXX") || { rm -rf "$sub_stage"; _err "无法创建暂存目录"; _pause; return 1; }
+    local _sub_had_webroot=0
+    [[ -e "$WEBROOT_INDEX" || -L "$WEBROOT_INDEX" ]] && _sub_had_webroot=1
+    local _sub_had_old_dir=0
+    if [[ -d "$sub_dir" ]]; then
+        mkdir -p "$stash/old_sub_dir"
+        cp -a "$sub_dir/." "$stash/old_sub_dir/" 2>/dev/null && _sub_had_old_dir=1
+    fi
+    local -a stash_map=()
+    local f
+    for f in /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf \
+             /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake "$nginx_conf"; do
+        if [[ -e "$f" || -L "$f" ]]; then
+            cp -a "$f" "$stash/$(printf '%s' "$f" | tr '/' '_')" && stash_map+=("$f")
+        fi
+    done
+    _sub_txn_rollback() {
+        local g
+        rm -f "$nginx_conf" 2>/dev/null
+        for g in "${stash_map[@]}"; do
+            cp -a "$stash/$(printf '%s' "$g" | tr '/' '_')" "$g" 2>/dev/null
+        done
+        if [[ $_sub_had_old_dir -eq 1 && -d "$stash/old_sub_dir" ]]; then
+            mkdir -p "$sub_dir" 2>/dev/null || true
+            cp -a "$stash/old_sub_dir/." "$sub_dir/" 2>/dev/null || true
+        elif [[ $regen_uuid_flag -eq 1 ]]; then
+            rm -rf "$CFG/subscription/$new_uuid" 2>/dev/null
+        elif [[ $sub_uuid_existed -eq 0 ]]; then
+            rm -rf "$sub_dir" 2>/dev/null
+        fi
+        rm -rf "$sub_stage" 2>/dev/null
+        [[ $_sub_had_webroot -eq 0 ]] && cleanup_webroot_placeholder > /dev/null 2>&1 || true
+        rm -rf "$stash"
+        # 恢复后让 nginx 回到旧配置（失败不致命）
+        if nginx -t > /dev/null 2>&1; then
+            if [[ "$DISTRO" == "alpine" ]]; then rc-service nginx status > /dev/null 2>&1 && rc-service nginx reload > /dev/null 2>&1
+            else systemctl is-active --quiet nginx 2>/dev/null && systemctl reload nginx > /dev/null 2>&1; fi
+        fi
+        return 0
+    }
+    for f in /etc/nginx/conf.d/vless-fake.conf /etc/nginx/http.d/vless-fake.conf \
+             /etc/nginx/sites-enabled/vless-fake /etc/nginx/sites-available/vless-fake; do
+        rm -f "$f" 2>/dev/null
+    done
     
     if [[ "$use_https" == "true" ]]; then
         # HTTPS 模式：需要证书
@@ -22004,12 +23037,91 @@ EOF
     # 共享 Web root 不得覆盖既存首页；仅在路径原先不存在时创建并登记 placeholder。
     create_webroot_placeholder || {
         _err "无法安全创建订阅 placeholder"
-        rm -f "$nginx_conf"
+        _sub_txn_rollback
+        _pause
         return 1
     }
     
+    # 预检 + 重载：全部成功才提交状态
+    if ! nginx -t 2>/dev/null; then
+        _err "Nginx 配置错误，已恢复原配置"
+        nginx -t
+        _sub_txn_rollback
+        _pause
+        return 1
+    fi
+    local reload_ok=1
+    if [[ "$DISTRO" == "alpine" ]]; then
+        if rc-service nginx status > /dev/null 2>&1; then
+            rc-service nginx reload > /dev/null 2>&1 || reload_ok=0
+        else
+            rc-service nginx start > /dev/null 2>&1 || reload_ok=0
+        fi
+    else
+        if systemctl is-active --quiet nginx 2>/dev/null; then
+            systemctl reload nginx > /dev/null 2>&1 || reload_ok=0
+        else
+            systemctl start nginx > /dev/null 2>&1 || reload_ok=0
+        fi
+    fi
+    if [[ $reload_ok -ne 1 ]]; then
+        _err "Nginx 重载/启动失败，已恢复原配置，订阅状态未改动"
+        _sub_txn_rollback
+        _pause
+        return 1
+    fi
+    
+    # —— 提交点：先发布暂存的订阅文件，再落 sub_uuid 与 sub.info；任一失败都回滚到旧状态 ——
+    mkdir -p "$sub_dir" 2>/dev/null || {
+        _err "无法创建订阅发布目录，已恢复原配置"
+        _sub_txn_rollback
+        _pause
+        return 1
+    }
+    if [[ -f "$sub_stage/base64" || -f "$sub_stage/clash.yaml" || -f "$sub_stage/surge.conf" ]]; then
+        if ! mv -f "$sub_stage/base64" "$sub_dir/base64" \
+           || ! mv -f "$sub_stage/clash.yaml" "$sub_dir/clash.yaml" \
+           || ! mv -f "$sub_stage/surge.conf" "$sub_dir/surge.conf"; then
+            _err "无法发布新的订阅文件，已恢复原配置"
+            _sub_txn_rollback
+            _pause
+            return 1
+        fi
+    elif [[ ! -f "$sub_dir/base64" || ! -f "$sub_dir/clash.yaml" || ! -f "$sub_dir/surge.conf" ]]; then
+        _err "缺少待发布的订阅文件，已恢复原配置"
+        _sub_txn_rollback
+        _pause
+        return 1
+    fi
+    rm -rf "$sub_stage" 2>/dev/null
+    if [[ $regen_uuid_flag -eq 1 || $sub_uuid_existed -eq 0 ]]; then
+        local uuid_tmp
+        uuid_tmp=$(mktemp "$CFG/sub_uuid.tmp.XXXXXX") && printf '%s\n' "$sub_uuid" > "$uuid_tmp" \
+            && chmod 600 "$uuid_tmp" && mv -f "$uuid_tmp" "$CFG/sub_uuid" || {
+            [[ -n "${uuid_tmp:-}" ]] && rm -f "$uuid_tmp"
+            _err "无法保存订阅 UUID，已恢复原配置"
+            _sub_txn_rollback
+            _pause
+            return 1
+        }
+    fi
     # 保存订阅配置（安全写入，权限 0600，禁止 source 执行）
-    _write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$use_https"
+    if ! _write_sub_info "$sub_uuid" "$sub_port" "$sub_domain" "$use_https"; then
+        _err "无法保存订阅配置，已恢复原配置"
+        if [[ $regen_uuid_flag -eq 1 ]]; then
+            printf '%s\n' "$old_uuid" > "$CFG/sub_uuid"
+        elif [[ $sub_uuid_existed -eq 0 ]]; then
+            rm -f "$CFG/sub_uuid"
+        fi
+        _sub_txn_rollback
+        _pause
+        return 1
+    fi
+    if [[ $regen_uuid_flag -eq 1 ]]; then
+        rm -rf "$CFG/subscription/$old_uuid" 2>/dev/null
+        _ok "UUID 已更新: ${old_uuid:0:8}... → ${new_uuid:0:8}..."
+    fi
+    rm -rf "$stash"
     
     # 添加域名到 hosts（解决部分 VPS 环境下的本地回环问题）
     if [[ -n "$sub_domain" ]]; then
@@ -22018,32 +23130,10 @@ EOF
             _info "已添加域名到 /etc/hosts（优化本地访问）"
         fi
     fi
-    
-    # 测试并重载 Nginx
-    if nginx -t 2>/dev/null; then
-        if [[ "$DISTRO" == "alpine" ]]; then
-            rc-update add nginx default 2>/dev/null
-            if rc-service nginx status >/dev/null 2>&1; then
-                rc-service nginx reload 2>/dev/null
-            else
-                rc-service nginx start 2>/dev/null
-            fi
-        else
-            systemctl enable nginx 2>/dev/null
-            if systemctl is-active --quiet nginx 2>/dev/null; then
-                systemctl reload nginx 2>/dev/null
-            else
-                systemctl start nginx 2>/dev/null
-            fi
-        fi
-        _ok "订阅服务已配置"
-    else
-        _err "Nginx 配置错误"
-        nginx -t
-        rm -f "$nginx_conf"
-        _pause
-        return
-    fi
+    # 开机自启仅在整个事务成功后设置
+    if [[ "$DISTRO" == "alpine" ]]; then rc-update add nginx default 2>/dev/null
+    else systemctl enable nginx 2>/dev/null; fi
+    _ok "订阅服务已配置"
     
     echo ""
     show_sub_links
@@ -23798,16 +24888,30 @@ _gen_user_share_link() {
             tuic) 
                 local password
                 password=$(echo "$cfg" | jq -r --arg name "$user_name" --arg uuid "$uuid" '
+                    . as $top |
                     if (.users | type) == "array" then
                         ([.users[] | select((.name // "") == $name or (.uuid // "") == $uuid)][0] |
-                            (.password // .uuid // empty))
+                            (.password //
+                                (if (.uuid // "") == ($top.uuid // "") and ($top.password // "") != ""
+                                 then $top.password else .uuid end) // empty))
                     else
                         .password // empty
                     end
                 ')
                 link=$(gen_tuic_link "$server_host" "$display_port" "$uuid" "$password" "$sni" "$remark") 
                 ;;
-            anytls) link=$(gen_anytls_link "$server_host" "$display_port" "$uuid" "$sni" "$remark") ;;
+            anytls) # 与 sing-box anytls 入站共用凭据优先级
+                local anytls_pw
+                anytls_pw=$(echo "$cfg" | jq -r --arg name "$user_name" --arg uuid "$uuid" '
+                    if (.users | type) == "array" then
+                        ([.users[] | select((.name // "") == $name or (.uuid // "") == $uuid)][0] |
+                            (if (.password // "") != "" then .password else (.uuid // "") end)) // empty
+                    else
+                        .password // empty
+                    end
+                ')
+                link=$(gen_anytls_link "$server_host" "$display_port" "${anytls_pw:-$uuid}" "$sni" "$remark")
+                ;;
             socks) link=$(gen_socks_link "$server_host" "$display_port" "$user_name" "$uuid" "$remark") ;;
         esac
         [[ -n "$link" ]] && echo "$link"
@@ -24151,7 +25255,7 @@ _add_user() {
                 expire_date=$(date -v+${expire_input}d '+%Y-%m-%d' 2>/dev/null)
             fi
             expire_display="$expire_date (${expire_input}天后)"
-        elif [[ "$expire_input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        elif _valid_ymd "$expire_input"; then
             # 输入的是日期
             expire_date="$expire_input"
             expire_display="$expire_date"
@@ -24185,8 +25289,14 @@ _add_user() {
     [[ "$confirm" =~ ^[nN]$ ]] && return
     
     # 添加到数据库 (包含 expire_date)
-    if db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date"; then
-        _ok "用户 $name 添加成功"
+    local add_rc=0
+    db_add_user "$core" "$proto" "$name" "$uuid" "$quota_gb" "$expire_date" || add_rc=$?
+    if [[ $add_rc -eq 0 || $add_rc -eq 3 ]]; then
+        if [[ $add_rc -eq 3 ]]; then
+            _warn "用户 $name 已写入数据库，但配置重建/服务重载失败；请检查服务后用菜单 14 重建，无需重复添加"
+        else
+            _ok "用户 $name 添加成功"
+        fi
         
         # 如果有自定义路由，设置路由
         if [[ -n "$user_routing" ]]; then
@@ -24196,7 +25306,7 @@ _add_user() {
         
         # db_add_user 已以 db.json 为事实源完成一次全量重建；不要再对旧派生文件
         # 执行 VLESS 专用局部 patch，否则会串写其它 VLESS inbound/协议 schema。
-        _ok "配置已更新"
+        [[ $add_rc -eq 0 ]] && _ok "配置已更新"
     else
         _err "添加失败"
     fi
@@ -24245,11 +25355,15 @@ _delete_user() {
             read -rp "  确认删除用户 $name? [y/N]: " confirm
             [[ ! "$confirm" =~ ^[yY]$ ]] && return
             
-            if db_del_user "$core" "$proto" "$name"; then
+            local del_rc=0
+            db_del_user "$core" "$proto" "$name" || del_rc=$?
+            if [[ $del_rc -eq 0 ]]; then
                 _ok "用户 $name 已删除"
                 
                 # db_del_user 已完成一次全量重建，避免再次运行 VLESS 专用局部 patch。
                 _ok "配置已更新"
+            elif [[ $del_rc -eq 3 ]]; then
+                _warn "用户 $name 已从数据库删除，但配置重建/服务重载失败；请检查服务后用菜单 14 重建"
             else
                 _err "删除失败"
             fi
@@ -24493,10 +25607,10 @@ _set_user_expire_date() {
             elif [[ "$expire_input" =~ ^[0-9]+$ ]]; then
                 new_expire=$(date -d "+${expire_input} days" '+%Y-%m-%d' 2>/dev/null)
                 [[ -z "$new_expire" ]] && new_expire=$(date -v+${expire_input}d '+%Y-%m-%d' 2>/dev/null)
-            elif [[ "$expire_input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            elif _valid_ymd "$expire_input"; then
                 new_expire="$expire_input"
             else
-                _err "无效格式"
+                _err "无效格式（日期需为真实存在的 YYYY-MM-DD）"
                 return
             fi
             
@@ -24568,7 +25682,7 @@ _configure_tg_notify() {
         # 检查定时任务状态
         local cron_status="${R}○ 未启用${NC}"
         local current_interval=$(get_traffic_interval)
-        if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+        if _cron_has --sync-traffic; then
             cron_status="${G}● 每${current_interval}分钟${NC}"
         fi
         
@@ -24644,7 +25758,7 @@ _configure_tg_notify() {
                         _ok "TG 通知已启用"
                         
                         # 自动启动流量统计定时任务
-                        if ! crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                        if ! _cron_has --sync-traffic; then
                             echo ""
                             _info "TG 通知需要定时任务来检测流量..."
                             setup_traffic_cron
@@ -24660,7 +25774,7 @@ _configure_tg_notify() {
                 read -rp "  检测间隔 (1-60) [${current_interval}]: " new_interval
                 new_interval="${new_interval:-$current_interval}"
                 if [[ "$new_interval" =~ ^[0-9]+$ ]] && [[ "$new_interval" -ge 1 ]] && [[ "$new_interval" -le 60 ]]; then
-                    if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                    if _cron_has --sync-traffic; then
                         setup_traffic_cron "$new_interval"
                     else
                         set_traffic_interval "$new_interval"
@@ -24952,7 +26066,7 @@ _configure_traffic_stats() {
         # 检查定时任务状态
         local cron_status="${R}○ 未启用${NC}"
         local current_interval=$(get_traffic_interval)
-        if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+        if _cron_has --sync-traffic; then
             cron_status="${G}● 已启用 (每${current_interval}分钟)${NC}"
         fi
         
@@ -24988,7 +26102,7 @@ _configure_traffic_stats() {
                 read -rp "  检测间隔 (1-60) [${current_interval}]: " new_interval
                 new_interval="${new_interval:-$current_interval}"
                 if [[ "$new_interval" =~ ^[0-9]+$ ]] && [[ "$new_interval" -ge 1 ]] && [[ "$new_interval" -le 60 ]]; then
-                    if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                    if _cron_has --sync-traffic; then
                         setup_traffic_cron "$new_interval"
                     else
                         set_traffic_interval "$new_interval"
@@ -25165,8 +26279,6 @@ do_update() {
         _err "无法验证下载脚本的 SHA-256，已中止更新"
         return 1
     fi
-    printf '%s\n' "$remote_hash" > "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null || true
-
     if [[ "$remote_hash" == "$current_hash" ]]; then
         rm -f "$tmp_file"
         _ok "已是最新 master 制品"
@@ -25187,7 +26299,26 @@ do_update() {
         _err "远端制品较旧(v${remote_ver} < v${VERSION})，已跳过"
         return 1
     fi
+    # 校验通过的远端制品才写缓存（避免错误页污染更新提示）
+    printf '%s\n' "$remote_hash" > "$SCRIPT_HASH_CACHE_FILE" 2>/dev/null || true
     printf '%s\n' "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null || true
+
+    # 与仓库发布的 SHA256SUMS 清单交叉核对：拦截传输截断、CDN 新旧文件混杂，并强制发布纪律
+    # （脚本与清单必须同时更新）。注意：它不能防御「仓库本身被篡改」（攻击者可同时改清单）。
+    if [[ "${VLESS_UPDATE_SKIP_MANIFEST:-0}" != "1" ]]; then
+        local manifest_hash=""
+        manifest_hash=$(_fetch_manifest_sha) || manifest_hash=""
+        if ! _is_sha256 "$manifest_hash"; then
+            rm -f "$tmp_file"
+            _err "无法获取官方 SHA256SUMS 清单，已中止更新（网络问题请重试；确需跳过可设 VLESS_UPDATE_SKIP_MANIFEST=1）"
+            return 1
+        fi
+        if [[ "$manifest_hash" != "$remote_hash" ]]; then
+            rm -f "$tmp_file"
+            _err "下载的脚本与 SHA256SUMS 清单不一致（可能是 CDN 缓存尚未同步），已中止更新，请稍后重试"
+            return 1
+        fi
+    fi
 
     _line
     read -rp "  master 制品已有变化，是否更新? [Y/n]: " confirm
@@ -25213,8 +26344,17 @@ do_update() {
     script_path=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
     local system_script="/usr/local/bin/vless-server.sh"
 
-    # 备份当前脚本
-    cp "$script_path" "${script_path}.bak" 2>/dev/null
+    # 备份当前脚本：先在同目录生成独立暂存副本并逐字节核对，通过后才原子更新 .bak。
+    # 备份失败则中止更新（保持当前脚本与上一份 .bak 均完整），不得带着缺失/过期/不完整的备份继续替换。
+    local bak_tmp
+    bak_tmp=$(mktemp "${script_path}.bak.XXXXXX" 2>/dev/null) || bak_tmp=""
+    if [[ -z "$bak_tmp" ]] || ! cp -p "$script_path" "$bak_tmp" 2>/dev/null \
+        || ! cmp -s "$script_path" "$bak_tmp" || ! mv -f "$bak_tmp" "${script_path}.bak" 2>/dev/null; then
+        [[ -n "$bak_tmp" ]] && rm -f "$bak_tmp" 2>/dev/null
+        rm -f "$tmp_file" 2>/dev/null
+        _err "无法为当前脚本创建完整备份（${script_path}.bak），已中止更新；当前脚本和原有备份均未改动"
+        return 1
+    fi
 
     # 替换当前运行的脚本（生产模式启动新进程执行 --apply-configs，避免旧内存函数重渲染）
     if mv "$tmp_file" "$script_path" && chmod +x "$script_path"; then
@@ -25400,7 +26540,7 @@ main_menu() {
                 11) show_logs; skip_pause=true ;;
                 12) do_update ;;
                 13) do_uninstall ;;
-                14) _regenerate_proxy_configs; _ok "配置已重建并重载"; _pause ;;
+                14) if _regenerate_proxy_configs; then _ok "配置已重建并重载"; else _err "配置重建或重载失败，请按上方提示检查（原配置已保留）"; fi; _pause ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
             esac
@@ -25418,6 +26558,38 @@ main_menu() {
 
 # 本地隔离回归可 source 完整脚本后直接调用真实函数；不执行 CLI/main_menu。
 # 仅显式环境变量生效，普通安装/升级路径行为不变。
+_apply_configs_cli() {
+    # 非交互重建并重载所有已安装引擎配置（供 do_update 新进程及迁移器调用）
+    local flag="${1:-}"
+    init_db || return 1
+    if ! db_validate; then
+        echo "错误: 数据库 $DB_FILE 不可读或结构损坏，已中止；未改动任何配置与服务" >&2
+        return 1
+    fi
+    local _apply_rc=0
+    if [[ -n "$(get_xray_protocols 2>/dev/null)" ]]; then
+        rebuild_and_reload_xray "silent" || _apply_rc=1
+    fi
+    if [[ -n "$(get_singbox_protocols 2>/dev/null)" ]]; then
+        if rebuild_and_reload_singbox "silent"; then
+            if [[ "$flag" == "--ensure-singbox" ]]; then
+                if [[ "$DISTRO" == "alpine" ]]; then
+                    [[ -f /etc/init.d/vless-singbox ]] || create_singbox_service
+                else
+                    [[ -f /etc/systemd/system/vless-singbox.service ]] || create_singbox_service
+                fi
+                svc enable vless-singbox 2>/dev/null || true
+                if ! svc status vless-singbox 2>/dev/null; then
+                    svc start vless-singbox 2>/dev/null || _apply_rc=1
+                fi
+            fi
+        else
+            _apply_rc=1
+        fi
+    fi
+    return "$_apply_rc"
+}
+
 if [[ "${VLESS_SOURCE_ONLY:-0}" == "1" ]]; then
     return 0 2>/dev/null || exit 0
 fi
@@ -25425,21 +26597,17 @@ fi
 # 命令行参数处理
 case "${1:-}" in
     --apply-configs)
-        # 非交互重建并重载所有已安装引擎配置（供 do_update 新进程调用）
-        init_db || exit 1
-        _apply_rc=0
-        if [[ -n "$(get_xray_protocols 2>/dev/null)" ]]; then
-            rebuild_and_reload_xray "silent" || _apply_rc=1
-        fi
-        if [[ -n "$(get_singbox_protocols 2>/dev/null)" ]]; then
-            rebuild_and_reload_singbox "silent" || _apply_rc=1
-        fi
-        exit "$_apply_rc"
+        _apply_configs_cli "${2:-}"
+        exit $?
         ;;
     --sync-traffic)
-        # 静默模式：用于定时任务
-        init_db
-        sync_all_user_traffic "true"
+        # 静默模式：用于定时任务（写库或重试重载失败时返回非 0，避免 cron 静默吞错）
+        init_db || exit 1
+        _sync_rc=0
+        sync_all_user_traffic "true" || _sync_rc=$?
+        if [[ $_sync_rc -ne 0 ]] || _reload_pending xray; then
+            exit 1
+        fi
         exit 0
         ;;
     --show-traffic)
@@ -25466,19 +26634,25 @@ case "${1:-}" in
         # 输出结果到终端
         echo "  即将过期提醒: $warnings 条"
         echo "  禁用过期用户: $disabled 个"
+        # 重建/重载失败时必须以非 0 退出，让 cron/监控可见，并由下一轮重试
+        if _reload_pending xray || _reload_pending singbox; then
+            echo "警告: 过期用户已在数据库禁用，但配置重建或服务重载失败，运行中进程可能仍接受旧凭据；下轮将重试。日志: $CFG/expire.log" >&2
+            exit 1
+        fi
         echo "完成。日志: $CFG/expire.log"
         exit 0
         ;;
     --setup-expire-cron)
         # 安装过期检查定时任务
-        init_db
-        install_expire_check_cron
+        init_db || exit 1
+        install_expire_check_cron || exit 1
         exit 0
         ;;
     --help|-h)
         echo "用法: $0 [选项]"
         echo ""
         echo "选项:"
+        echo "  --apply-configs      重建已安装核心配置并重载服务 (供更新/迁移调用)"
         echo "  --sync-traffic       同步流量数据到数据库 (用于定时任务)"
         echo "  --show-traffic       显示实时流量统计"
         echo "  --check-expire       检查并禁用过期用户 (用于定时任务)"

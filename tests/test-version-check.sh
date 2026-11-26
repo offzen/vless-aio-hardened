@@ -27,7 +27,7 @@ extract_fn() { # $1=fn_name
 }
 
 for fn in _script_sha256 _is_sha256 _is_semver_version _extract_script_version \
-          _version_gt _get_latest_script_hash _has_script_update \
+          _script_file_plausible _version_gt _get_latest_script_hash _has_script_update \
           _get_script_update_info; do
   extract_fn "$fn"
 done
@@ -52,7 +52,11 @@ _fetch_script_tmp() {
   [[ "$FETCH_SHOULD_FAIL" == "0" ]] || return 1
   local f
   f=$(mktemp "$CFG/remote.XXXXXX") || return 1
-  printf '#!/bin/bash\nreadonly VERSION="%s"\n# %s\n' "$STUB_REMOTE_VER" "$STUB_REMOTE_BODY" > "$f"
+  if [[ -n "${STUB_REMOTE_RAW:-}" ]]; then
+    printf '%s\n' "$STUB_REMOTE_RAW" > "$f"
+  else
+    printf '#!/bin/bash\nreadonly VERSION="%s"\n# %s\n' "$STUB_REMOTE_VER" "$STUB_REMOTE_BODY" > "$f"
+  fi
   printf '%s\n' "$f"
 }
 
@@ -102,9 +106,31 @@ FETCH_SHOULD_FAIL=0
 STUB_REMOTE_VER="dev"
 STUB_REMOTE_BODY="remote-build-b"
 rm -f "$SCRIPT_VERSION_CACHE_FILE"
-remote_hash=$(_get_latest_script_hash "true" "false")
-check "脏哈希缓存被替换" "$(_is_sha256 "$remote_hash" && echo yes || echo no)" "yes"
+remote_hash=$(_get_latest_script_hash "true" "false" || true)
+check "脏哈希缓存被清除且非语义化远端不被采信" "$([[ -z "$remote_hash" && ! -s "$SCRIPT_HASH_CACHE_FILE" ]] && echo yes || echo no)" "yes"
 check "非语义化远端 VERSION 不写缓存" "$([[ -f "$SCRIPT_VERSION_CACHE_FILE" ]] && echo exists || echo absent)" "absent"
+
+# 脏哈希缓存遇到合法远端时被替换
+STUB_REMOTE_VER="3.4.10-h99"
+printf 'not-a-hash\n' > "$SCRIPT_HASH_CACHE_FILE"
+remote_hash=$(_get_latest_script_hash "true" "false")
+check "脏哈希缓存被合法远端替换" "$(_is_sha256 "$remote_hash" && echo yes || echo no)" "yes"
+
+# 回归（审计 F7）：远端返回错误页/非脚本时不得写缓存，也不得触发假更新提示
+good_hash="$(printf 'c%.0s' {1..64})"
+printf '%s\n' "$good_hash" > "$SCRIPT_HASH_CACHE_FILE"
+printf '%s\n' "$VERSION" > "$SCRIPT_VERSION_CACHE_FILE"
+STUB_CURRENT_HASH="$good_hash"
+STUB_REMOTE_RAW='<html><body>502 Bad Gateway</body></html>'
+_get_latest_script_hash "false" "true" >/dev/null 2>&1; rc=$?
+check "错误页不被采信（返回非 0）" "$([[ $rc -ne 0 ]] && echo yes || echo no)" "yes"
+check "错误页不覆盖哈希缓存" "$(cat "$SCRIPT_HASH_CACHE_FILE")" "$good_hash"
+check "错误页后不提示更新" "$(is_update)" "no"
+STUB_REMOTE_RAW='#!/bin/bash
+# no version line here'
+_get_latest_script_hash "false" "true" >/dev/null 2>&1; rc=$?
+check "缺少版本号的脚本不被采信" "$([[ $rc -ne 0 ]] && echo yes || echo no)" "yes"
+STUB_REMOTE_RAW=""
 
 echo ""
 echo "########## 3. 哈希差异 + VERSION 防降级 ##########"
