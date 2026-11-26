@@ -78,7 +78,7 @@ sudo /usr/local/bin/vless-server.sh --help
 - `USAGE.md`：完整使用手册
 - `RELEASE-H15.md` / `RELEASE-H16.md` / `RELEASE-H17.md`：各版本发布与升级手册
 - `CHANGELOG.md` / `FIXES.md`：版本更新清单与修复摘要
-- `SHA256SUMS` / `PROVENANCE.json`：文件哈希清单与版本来源记录
+- `SHA256SUMS`：文件哈希清单（供在线更新与离线包校验）
 
 ## 发行身份与验证
 

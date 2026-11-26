@@ -278,7 +278,7 @@ sing-box check -c /etc/vless-reality/singbox.json
 - 仓库：`https://github.com/offzen/vless-aio-hardened`
 - 脚本：`https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh`
 
-菜单 12 会下载远程 `master` 制品，比较本地与远程 SHA-256，并在替换前检查 Bash shebang 和语法。它不会把 release/tag 当作制品身份源，也不验证签名或 `PROVENANCE.json`；脚本内语义化 `VERSION` 只用于兼容发现和拒绝降级。需要完整发行包一致性时应按第 3.1 节同时下载全部文件并核对 `SHA256SUMS`。替换完成后的三个自动应用步骤会全部尝试；任一步骤失败时返回非零、保留新脚本与 `.bak`，仍须按第 9 节复核。
+菜单 12 会下载远程 `master` 制品，比较本地与远程 SHA-256，并与同源 `SHA256SUMS` 交叉核对，在替换前检查 Bash shebang 和语法。脚本内语义化 `VERSION` 用于兼容发现和拒绝降级；公开正式发版制品同时随 GitHub Release 提供 `SHA256SUMS` 与官方 Sigstore 构建证明（`gh attestation verify`）。需要完整发行包一致性时应按第 3.1 节核对 `SHA256SUMS`。替换完成后的三个自动应用步骤会全部尝试；任一步骤失败时返回非零、保留新脚本与 `.bak`，仍须按第 9 节复核。
 
 ### 完全卸载
 
@@ -305,7 +305,7 @@ CI 入口为 `bash tests/run-ci.sh <mode>`，模式：`syntax`、`static`（Shel
 
 边界：CI Web 只覆盖函数/HTTP/service spy；Docker 为私有 leaf pin，不证明公网 CA、强沙箱或自动回滚；干净 Debian/systemd 与 Alpine/OpenRC 的真实 init 全生命周期未自动化；sing-box 协议、`ss-legacy`、SOCKS5 无逐用户流量计量。
 
-发布元数据（`SHA256SUMS`、`PROVENANCE.json`、`ci.yml` 中的产品 SHA）在任何文件变更后用 `bash scripts/refresh-manifest.sh` 一键重算；仅文档变更不要求重复已绿的产品门禁。
+仓库哈希清单（`SHA256SUMS`）在任何文件变更后用 `bash scripts/refresh-manifest.sh` 一键重算；正式发布通过不可变 `v*` tag 触发 `.github/workflows/release.yml`（`preflight → workflow_call ci.yml → Sigstore 证明与 Release 资产上传`）。仅文档变更不要求重复已绿的产品门禁。
 
 安装只需要 `vless-server.sh` 与校验文件；`tests/` 与 `.github/` 属于仓库自身的测试与 CI 基础设施，不参与安装，也不随发行制品提供。
 

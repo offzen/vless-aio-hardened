@@ -26,6 +26,13 @@ shell_files() {
         shopt -u nullglob
         files+=("${gh_scripts[@]}")
     fi
+    if [[ -d scripts ]]; then
+        local -a repo_scripts=()
+        shopt -s nullglob
+        repo_scripts=(scripts/*.sh)
+        shopt -u nullglob
+        files+=("${repo_scripts[@]}")
+    fi
     local -a test_scripts=()
     shopt -s nullglob
     test_scripts=(tests/*.sh)

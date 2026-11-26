@@ -1,0 +1,131 @@
+name: Release & Provenance
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Verify Tag Metadata, Manifest & Public Hygiene
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches script VERSION, SHA256SUMS & hygiene
+        run: |
+          set -euo pipefail
+          tag_ver="${GITHUB_REF_NAME#v}"
+          script_ver="$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' vless-server.sh | head -n1)"
+          if [[ -z "$script_ver" || "$tag_ver" != "$script_ver" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} mismatches vless-server.sh VERSION (${script_ver:-<missing>})"
+            exit 1
+          fi
+          sha256sum -c SHA256SUMS
+          bash scripts/refresh-manifest.sh --check
+          python3 scripts/check-public-hygiene.py
+
+  ci:
+    name: Full Verification Gate
+    if: github.server_url == 'https://github.com'
+    needs: [preflight]
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  release:
+    name: Package, Attest & Publish Release
+    if: github.server_url == 'https://github.com'
+    needs: [preflight, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Assemble and verify release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+          cp -p vless-server.sh migrate-anytls-singbox.sh release-dist/
+          (
+            cd release-dist
+            sha256sum vless-server.sh migrate-anytls-singbox.sh > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+          # Cross-check staged product hash against repository SHA256SUMS
+          repo_sha="$(awk '$2 == "vless-server.sh" {print $1; exit}' SHA256SUMS)"
+          dist_sha="$(awk '$2 == "vless-server.sh" {print $1; exit}' release-dist/SHA256SUMS)"
+          [[ -n "$repo_sha" && "$repo_sha" == "$dist_sha" ]] || {
+            echo "::error::Staged product SHA mismatch (repo=$repo_sha dist=$dist_sha)"
+            exit 1
+          }
+
+      - name: Attest build provenance (Sigstore / GitHub Attestations)
+        if: ${{ github.event.repository.private == false }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'release-dist/*'
+
+      - name: Create or update GitHub Release with verified assets
+        if: ${{ github.event.repository.private == false }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes_file="$(mktemp)"
+          trap 'rm -f -- "$notes_file"' EXIT
+          python3 - "$GITHUB_REF_NAME" "$notes_file" <<'PY'
+          import pathlib, re, sys
+
+          tag = sys.argv[1]
+          ver = tag.lstrip("v")
+          out = pathlib.Path(sys.argv[2])
+          changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+
+          body = ""
+          m_h = re.search(r"-h(\d+)$", ver)
+          if m_h:
+              h_label = f"H{m_h.group(1)}"
+              m = re.search(rf"(?ms)^## {re.escape(h_label)}\b[^\n]*\n(.*?)(?=^## |\Z)", changelog)
+              if m:
+                  body = m.group(1).strip()
+          if not body:
+              m = re.search(rf"(?ms)^## \[?v?{re.escape(ver)}\]?[^\n]*\n(.*?)(?=^## |\Z)", changelog)
+              if m:
+                  body = m.group(1).strip()
+          if not body and m_h:
+              rel_doc = pathlib.Path(f"RELEASE-H{m_h.group(1)}.md")
+              if rel_doc.is_file():
+                  body = rel_doc.read_text(encoding="utf-8").strip()
+
+          out.write_text((body + "\n") if body else f"Release {tag}\n", encoding="utf-8")
+          PY
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$notes_file"
+          else
+            gh release edit "$GITHUB_REF_NAME" --notes-file "$notes_file"
+          fi
+          gh release upload "$GITHUB_REF_NAME" release-dist/* --clobber
+
+      - name: Report private release candidate verification
+        if: ${{ github.event.repository.private == true }}
+        run: echo "::notice::Release candidate verification completed. Attested releases are published only from the public release repository."

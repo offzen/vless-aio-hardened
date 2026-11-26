@@ -1,0 +1,81 @@
+name: Private Forgejo Linux CI
+
+on:
+  push:
+    branches:
+      - master
+      - 'release/**'
+      - 'ci/**'
+      - 'fix/**'
+      - 'dev/**'
+  pull_request:
+    branches:
+      - master
+      - 'release/**'
+  workflow_dispatch:
+
+jobs:
+  forgejo-ci:
+    name: Private Forgejo Linux Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install CI dependencies
+        run: |
+          set -euo pipefail
+          SUDO=''
+          [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          need=()
+          for p in gawk:gawk mawk:mawk unzip:unzip jq:jq shellcheck:shellcheck curl:curl git:git python3:python3; do
+            command -v "${p%%:*}" >/dev/null 2>&1 || need+=("${p##*:}")
+          done
+          if ((${#need[@]})); then
+            $SUDO apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq "${need[@]}"
+          fi
+          printf 'awk: %s\n' "$(command -v gawk) $(command -v mawk)"
+
+      - name: Verify manifest, hygiene, version bump, static checks, dual AWK & upgrade
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = false
+          sha256sum -c SHA256SUMS
+          bash scripts/refresh-manifest.sh --check
+          python3 scripts/check-public-hygiene.py
+          bash check-version-bump.sh
+          bash tests/run-ci.sh syntax
+          bash tests/run-ci.sh static
+          bash tests/run-ci.sh unit --awk-bin mawk
+          bash tests/run-ci.sh unit --awk-bin gawk
+          bash tests/run-ci.sh stateful-upgrade
+
+      - name: Verify pinned native cores (and isolated gates when runner supports them)
+        run: |
+          set -euo pipefail
+          cores=$(mktemp -d)
+          trap 'rm -rf -- "$cores"' EXIT
+          bash tests/install-ci-xray.sh "$cores/xray"
+          bash tests/install-ci-singbox.sh "$cores/singbox"
+          export XRAY_BIN="$cores/xray/xray"
+          export XRAY_LOCATION_ASSET="$cores/xray"
+          export SINGBOX_BIN="$cores/singbox/sing-box"
+          for mode in xray-e2e auth-e2e singbox-e2e; do
+            bash tests/run-ci.sh "$mode"
+          done
+          if unshare --user --map-root-user --mount --pid --fork true 2>/dev/null \
+            || { command -v sudo >/dev/null 2>&1 && sudo -n unshare --user --map-root-user --mount --pid --fork true 2>/dev/null; }; then
+            bash tests/run-ci.sh webroot-e2e
+          else
+            echo "::warning::webroot-e2e NOT RUN: unprivileged Forgejo container runner blocks unshare(CLONE_NEWUSER). Must pass on GitHub Actions / host runner before release."
+          fi
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            bash tests/run-ci.sh installer-e2e
+          else
+            echo "::warning::installer-e2e NOT RUN: no Docker daemon reachable from Forgejo container runner. Must pass on GitHub Actions / Docker host before release."
+          fi

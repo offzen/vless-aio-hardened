@@ -68,6 +68,10 @@ production host. The Docker build downloads its disposable dependency image/pack
 the test container itself runs with `--network none`, all capabilities dropped, and a
 read-only repository mount.
 
-## Rolling release CI
+## CI & Release workflows
 
-The master/`ci/**` push and pull-request workflow (`.github/workflows/ci.yml`) verifies, in order: the product SHA-256 pinned in the workflow, `SHA256SUMS`, `scripts/refresh-manifest.sh --check`, the version-bump gate, Bash syntax, the ShellCheck error gate, the `mawk` and `gawk` unit suites, `stateful-upgrade` (it needs the full Git history, hence `fetch-depth: 0`), and then the pinned-core jobs `xray-e2e`, `auth-e2e`, `singbox-e2e`, `webroot-e2e` and `installer-e2e`. It does not deploy, create tags or publish assets. `tests/test-h16-audit-fixes.sh` is picked up by the unit-suite auto-discovery and also runs under both AWK engines.
+- **Public GitHub Actions CI (`.github/workflows/ci.yml`)**: runs on `master` / `ci/**` pushes, `master` pull requests, `workflow_call`, and `workflow_dispatch` with two parallel fail-closed jobs:
+  1. `Static, Manifest, Dual-AWK Unit & Upgrade`: verifies full history (`fetch-depth: 0`), `SHA256SUMS`, `scripts/refresh-manifest.sh --check`, `scripts/check-public-hygiene.py`, `check-version-bump.sh`, `syntax`, `static` (ShellCheck error gate), `unit` under both `mawk` and `gawk`, and `stateful-upgrade`.
+  2. `Pinned Cores, Webroot & Isolated Installer E2E`: installs pinned Xray 26.3.27 and sing-box 1.14.4 and runs `xray-e2e`, `auth-e2e`, `singbox-e2e`, `webroot-e2e`, and `installer-e2e` with zero skips.
+- **Public Tag Release & Provenance (`.github/workflows/release.yml`)**: triggers on `v*` tag pushes only; runs `preflight` (tag == `VERSION`, `SHA256SUMS`, public hygiene) -> `ci` (`uses: ./.github/workflows/ci.yml`) -> `release` (stages `vless-server.sh`, `migrate-anytls-singbox.sh`, release `SHA256SUMS`, signs official Sigstore provenance via `actions/attest-build-provenance@v2`, and publishes assets to GitHub Release on public repositories).
+- **Private Forgejo CI (`.gitea/workflows/ci.yml`)**: self-contained workflow for private Forgejo/Gitea runners, separated cleanly from the public GitHub workflow.

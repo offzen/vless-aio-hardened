@@ -1,41 +1,94 @@
-{
-  "name": "Rolling source verification",
-  "on": {
-    "push": {
-      "branches": [
-        "master",
-        "ci/**"
-      ]
-    },
-    "pull_request": {}
-  },
-  "permissions": {
-    "contents": "read"
-  },
-  "jobs": {
-    "rolling-source": {
-      "runs-on": "ubuntu-latest",
-      "steps": [
-        {
-          "uses": "actions/checkout@v4",
-          "with": {
-            "persist-credentials": false,
-            "fetch-depth": 0
-          }
-        },
-        {
-          "name": "Install CI dependencies (no-op on GitHub-hosted runners)",
-          "run": "set -euo pipefail\nSUDO=''; [ \"$(id -u)\" -ne 0 ] && SUDO=sudo\nneed=()\nfor p in gawk:gawk mawk:mawk unzip:unzip jq:jq shellcheck:shellcheck curl:curl git:git; do\n  command -v \"${p%%:*}\" >/dev/null 2>&1 || need+=(\"${p##*:}\")\ndone\nif ((${#need[@]})); then\n  $SUDO apt-get update -qq\n  DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \"${need[@]}\"\nfi\nprintf 'awk: %s\\n' \"$(command -v gawk) $(command -v mawk)\"\n"
-        },
-        {
-          "name": "Verify candidate bindings, static checks, dual AWK and upgrade",
-          "run": "set -euo pipefail\ntest \"$(git rev-parse --is-shallow-repository)\" = false\nprintf '%s  %s\\n' 'f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548' vless-server.sh | sha256sum -c -\nsha256sum -c SHA256SUMS\nbash scripts/refresh-manifest.sh --check\nbash check-version-bump.sh\nbash tests/run-ci.sh syntax\nbash tests/run-ci.sh static\nbash tests/run-ci.sh unit --awk-bin mawk\nbash tests/run-ci.sh unit --awk-bin gawk\nbash tests/run-ci.sh stateful-upgrade\n"
-        },
-        {
-          "name": "Verify pinned native cores, webroot and isolated installer",
-          "run": "set -euo pipefail\ncores=$(mktemp -d)\ntrap 'rm -rf -- \"$cores\"' EXIT\nbash tests/install-ci-xray.sh \"$cores/xray\"\nbash tests/install-ci-singbox.sh \"$cores/singbox\"\nexport XRAY_BIN=\"$cores/xray/xray\" XRAY_LOCATION_ASSET=\"$cores/xray\" SINGBOX_BIN=\"$cores/singbox/sing-box\"\nis_self_hosted_container=false\nif [[ \"${FORGEJO_ACTIONS:-}\" == \"true\" || \"${GITEA_ACTIONS:-}\" == \"true\" || ( -n \"${GITHUB_SERVER_URL:-}\" && \"${GITHUB_SERVER_URL}\" != \"https://github.com\" ) ]]; then\n  is_self_hosted_container=true\nfi\nfor mode in xray-e2e auth-e2e singbox-e2e webroot-e2e installer-e2e; do\n  if [[ \"$is_self_hosted_container\" == \"true\" ]]; then\n    if [[ \"$mode\" == webroot-e2e ]] && ! unshare --user --map-root-user --mount --pid --fork true 2>/dev/null && ! { command -v sudo >/dev/null 2>&1 && sudo -n unshare --user --map-root-user --mount --pid --fork true 2>/dev/null; }; then\n      echo \"::warning::webroot-e2e NOT RUN: unprivileged self-hosted container runner blocks unshare(CLONE_NEWUSER). Must pass on a host/GitHub-hosted runner before release.\"\n      continue\n    fi\n    if [[ \"$mode\" == installer-e2e ]] && ! { command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; }; then\n      echo \"::warning::installer-e2e NOT RUN: no Docker daemon is reachable from this self-hosted container runner. Must pass on a Docker-capable host/GitHub-hosted runner before release.\"\n      continue\n    fi\n  fi\n  bash tests/run-ci.sh \"$mode\"\ndone\n"
-        }
-      ]
-    }
-  }
-}
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - 'ci/**'
+  pull_request:
+    branches:
+      - master
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  static-and-unit:
+    name: Static, Manifest, Dual-AWK Unit & Upgrade
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Ensure CI dependencies
+        run: |
+          set -euo pipefail
+          need=()
+          for p in gawk:gawk mawk:mawk unzip:unzip jq:jq shellcheck:shellcheck curl:curl git:git python3:python3; do
+            command -v "${p%%:*}" >/dev/null 2>&1 || need+=("${p##*:}")
+          done
+          if ((${#need[@]})); then
+            sudo apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive sudo apt-get install -y -qq "${need[@]}"
+          fi
+          printf 'awk: %s\n' "$(command -v gawk) $(command -v mawk)"
+
+      - name: Verify manifest, hygiene, version bump, static checks, dual AWK & upgrade
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --is-shallow-repository)" = false
+          sha256sum -c SHA256SUMS
+          bash scripts/refresh-manifest.sh --check
+          python3 scripts/check-public-hygiene.py
+          base_args=()
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            base_args=(--base "$PR_BASE_SHA")
+          elif [[ "$EVENT_NAME" == "push" && -n "$PUSH_BEFORE_SHA" ]]; then
+            base_args=(--base "$PUSH_BEFORE_SHA")
+          fi
+          bash check-version-bump.sh "${base_args[@]}"
+          bash tests/run-ci.sh syntax
+          bash tests/run-ci.sh static
+          bash tests/run-ci.sh unit --awk-bin mawk
+          bash tests/run-ci.sh unit --awk-bin gawk
+          bash tests/run-ci.sh stateful-upgrade
+
+  native-and-container-e2e:
+    name: Pinned Cores, Webroot & Isolated Installer E2E
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify pinned native cores, webroot & isolated installer (fail-closed)
+        run: |
+          set -euo pipefail
+          cores=$(mktemp -d)
+          trap 'rm -rf -- "$cores"' EXIT
+          bash tests/install-ci-xray.sh "$cores/xray"
+          bash tests/install-ci-singbox.sh "$cores/singbox"
+          export XRAY_BIN="$cores/xray/xray"
+          export XRAY_LOCATION_ASSET="$cores/xray"
+          export SINGBOX_BIN="$cores/singbox/sing-box"
+          for mode in xray-e2e auth-e2e singbox-e2e webroot-e2e installer-e2e; do
+            bash tests/run-ci.sh "$mode"
+          done
