@@ -1,3 +1,7 @@
+# FIXES — H18
+
+产品 SHA-256：`08001f1e9fc911ea2792df7ee0e4341ebb6645efa0192ce26e3f6e78983aefdb`（兼容握手：`3.4.10-h18`）。针对 H17（`0d3cb73`）静态审计全部 8 组确定实现缺陷（F01–F08）及 R01/R03 可靠性与控制面性能改进的整改摘要见 [CHANGELOG.md](./CHANGELOG.md) 与 [RELEASE-H18.md](./RELEASE-H18.md)：外部订阅全字段 YAML 双引号序列化与控制字符 fail-closed 拒绝（同时修复 VLESS Reality `publicKey`/`shortId` 导出 `null`）；菜单与外部 Clash/Surge 统一 TLS 验证策略（默认校验、不复用本机证书推断外部节点）；`_is_real_cert` / `_anytls_secure` / HY2 统一为全链密码学+SAN+有效期+公私钥配对校验并彻底移除 issuer 子串回退；sing-box 区分无用户自动停服与管理员手动停服，重新启用用户时自动拉起；`_nginx_install_conf` 同目录备份校验前置并禁止无备份删原配置；Clash YAML 导入统一单一导出器、区分 VLESS TLS 与 Reality、支持任意键序与 flow mapping 及 TUIC 全链路闭环；Debian `install_deps` 改用 `dpkg-query` 严格安装态与命令检查；`fetch_subscription` 经 `curl -K -` 隐藏订阅 URL 并在提示/列表脱敏；流量采集显式告警 reset 后采样缺口并改为单遍日志索引。
+
 # FIXES — H17
 
 产品 SHA-256：`f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`（兼容握手：`3.4.10-h17`）。针对第二轮外部审计 16 项缺陷、`034c2853` 复审全部 13 项功能边界（R01–R13）与双核心更新测试缺口（T01），以及 `718c53f`/`ffdc318` 复核新增并发与边角缺陷（N0–N9、D1–D4）的整改摘要见 [CHANGELOG.md](./CHANGELOG.md) 与 [RELEASE-H17.md](./RELEASE-H17.md)：同核心配置生成与重载改为 `.reload-apply.<core>.lock` 整段串行并经 `db.lock` 围栏取快照，闭合旧批次覆盖新配置与 `pre-arm` 误清竞态并清理死代码；旧单用户迁移与统计按协议对齐生效凭据优先级（密码型协议优先顶层 `password` 且 `anytls` 同步落盘 `password`）；AnyTLS 迁移器持久化阶段状态并在冲突/重启失败时恢复旧服务与保留状态继承运行态，续接以 DB 当前端口为准、`--dry-run` 允许预览、`port_listening` 消除 `pipefail` SIGPIPE；区分 WARP 官方客户端归属、以 `dpkg-query` 精准校验卸载结果（避免 `rc` 态误判）并由 `do_uninstall` 统一复用 `uninstall_warp_official`；流量入账完整保留当前未清批次全部 ID 并传播失败退出码；按端口卸载、独立协议安装与沿用 UUID 的订阅重配置均事务化；统一 HY2 双字段凭据、TUIC/HY2/AnyTLS 证书对校验与 `db_validate` 严格对象类型检查。

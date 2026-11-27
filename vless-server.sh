@@ -30,7 +30,7 @@ readonly RELEASE_CHANNEL="master"
 #   1) 3.4.10-h5 及更早的存量客户端只认语义化版本号，靠它识别本制品并放行下载；
 #   2) 本版更新器用它做"防降级"方向判断（远端更旧一律拒绝）。
 # 格式受老客户端硬约束：^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$，且必须单调递增。
-readonly VERSION="3.4.10-h17"
+readonly VERSION="3.4.10-h18"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/offzen/vless-aio-hardened"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
@@ -2417,8 +2417,11 @@ _rebuild_and_reload_xray_impl() {
     if generate_xray_config 2>/dev/null; then
         # 检查 Xray 服务是否在运行
         if svc status vless-reality 2>/dev/null; then
-            # 重启会清零 Xray 内存中的流量计数器：先把未同步的增量落盘到 pending 日志（尽力而为）
-            _traffic_collect_to_journal 2>/dev/null || true
+            # 重启会清零 Xray 内存中的流量计数器：先尽力把未同步增量写入 pending 日志；
+            # 若写入失败明确告警，但仍继续重启以防吊销凭据滞留。
+            if ! _traffic_collect_to_journal 2>/dev/null; then
+                [[ -z "$silent" ]] && _warn "重启前流量计数器落盘失败，本次重启前增量可能存在采样缺口"
+            fi
             # 重启服务确保配置生效 (reload 可能不可靠)
             if svc restart vless-reality 2>/dev/null; then
                 [[ -z "$silent" ]] && _ok "配置已更新并重载"
@@ -2472,12 +2475,14 @@ rebuild_and_reload_singbox() {
 _rebuild_and_reload_singbox_impl() {
     local silent="${1:-}"
     local gen_rc=0
+    local auto_stop_marker="$CFG/.singbox-stopped-empty"
     
     # 重新生成 Sing-box 配置（rc=0 正常生成；rc=2 全部协议均无启用用户并已清配置；rc=1 真正生成/预检失败）
     generate_singbox_config || gen_rc=$?
     if [[ $gen_rc -eq 0 ]]; then
         # 检查 Sing-box 服务是否在运行
         if svc status vless-singbox 2>/dev/null; then
+            rm -f "$auto_stop_marker" 2>/dev/null || true
             # 重载服务
             if svc restart vless-singbox 2>/dev/null; then
                 [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并重载"
@@ -2486,15 +2491,28 @@ _rebuild_and_reload_singbox_impl() {
                 [[ -z "$silent" ]] && _warn "配置已更新，服务重载失败"
                 return 1
             fi
+        elif [[ -e "$auto_stop_marker" && ! -e "$CFG/paused" ]]; then
+            # 服务先前因「无启用用户」被自动停止；现在已有有效用户且未被管理员手动暂停，自动恢复启动。
+            # 启动失败时保留 auto_stop_marker 并返回 1，让外层保留 .reload-pending.singbox 供后续重试。
+            if svc start vless-singbox 2>/dev/null; then
+                rm -f "$auto_stop_marker" 2>/dev/null || true
+                [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并自动恢复启动"
+                return 0
+            else
+                [[ -z "$silent" ]] && _warn "配置已更新，自动恢复启动 Sing-box 失败"
+                return 1
+            fi
         else
             [[ -z "$silent" ]] && _ok "Sing-box 配置已更新"
             return 0
         fi
     elif [[ $gen_rc -eq 2 ]]; then
         # 所有 Sing-box 协议均无启用用户（例如最后一位用户到期/被禁用）：
-        # 清除配置并停止服务即为预期收敛状态；停服成功（或本已停止）返回 0 以确认待办，停服失败才返回 1 继续重试。
+        # 清除配置并停止服务即为预期收敛状态；若服务原本在运行则记录自动停服标记，
+        # 以便后续重新启用用户时能自动拉起，而不误启动管理员主动停止的服务。
         if svc status vless-singbox 2>/dev/null; then
             if svc stop vless-singbox 2>/dev/null; then
+                ( umask 077; : > "$auto_stop_marker" ) 2>/dev/null || true
                 [[ -z "$silent" ]] && _ok "Sing-box 无启用用户，已清除配置并停止服务"
                 return 0
             else
@@ -2775,11 +2793,13 @@ get_user_traffic() {
     echo $((uplink + downlink))
 }
 
-# ── 流量计数器 → 持久化日志（pending journal）───────────────────────────────
-# Xray 的统计计数器只在进程内存里：`statsquery -reset` 会在返回当前值的同时原子清零，
-# 进程重启也会清零。因此「读出即落盘」：先把读出的增量追加到 $CFG/cache/traffic.pending，
-# 再由 sync 逐用户写入 db.json，只有写库成功的条目才从日志里删除；写库失败（锁超时、
-# jq 失败）的增量留到下一轮重试，不会丢失。
+# ── 流量计数器 → 持久化日志（pending journal，best-effort 计量）──────────────
+# Xray 的统计计数器只在进程内存里：`statsquery -reset` 会在返回当前值的同时清零内存计数，
+# 进程重启也会清零。因此属于尽力而为（best-effort）采样，不承诺金融级无损计费：
+#   1) 先把 statsquery -reset 原始响应落地到临时文件，再解析并追加到 $CFG/cache/traffic.pending；
+#      若在 reset 之后落盘失败会显式告警并记录采样缺口（返回非 0）。
+#   2) 落盘后的条目带唯一 ID，sync 入账成功后才从日志移除；写库失败（锁超时、jq 失败）
+#      保留到下一轮幂等重试，不会重复入账。
 _traffic_pending_file() { printf '%s/cache/traffic.pending' "$CFG"; }
 _traffic_lock_dir()     { printf '%s/cache/traffic.lock' "$CFG"; }
 _TRAFFIC_SYNC_ACTIVE=0
@@ -2792,30 +2812,38 @@ _traffic_collect_to_journal() {
     mkdir -p -m 700 "$CFG/cache" 2>/dev/null || return 1
     _lockdir_acquire "$(_traffic_lock_dir)" 100 || return 1
 
-    local tmp rc=0
-    tmp=$(mktemp "$CFG/cache/traffic.collect.XXXXXX") || { _lockdir_release "$(_traffic_lock_dir)"; return 1; }
-    chmod 600 "$tmp" 2>/dev/null || true
+    local raw_tmp tmp rc=0
+    raw_tmp=$(mktemp "$CFG/cache/traffic.raw.XXXXXX") || { _lockdir_release "$(_traffic_lock_dir)"; return 1; }
+    tmp=$(mktemp "$CFG/cache/traffic.collect.XXXXXX") || { rm -f "$raw_tmp"; _lockdir_release "$(_traffic_lock_dir)"; return 1; }
+    chmod 600 "$raw_tmp" "$tmp" 2>/dev/null || true
     local -a to=()
     command -v timeout >/dev/null 2>&1 && to=(timeout 10)
-    # statsquery -reset 原子地返回并清零；API 不可达时不会清零，直接放弃本轮
-    if "${to[@]}" xray api statsquery --server="127.0.0.1:${XRAY_API_PORT}" -reset 2>/dev/null \
-        | jq -r '.stat[]? | select((.name // .Name) | startswith("user>>>")) | "\(.name // .Name) \(.value // .Value // 0)"' > "$tmp" 2>/dev/null \
-        && [[ ${PIPESTATUS[0]} -eq 0 ]]; then
-        if [[ -s "$tmp" ]]; then
-            # 每条日志带唯一标识（name value id），供入账幂等去重
-            local _batch; _batch="$(date +%s%N 2>/dev/null || date +%s)-$$-$RANDOM"
-            ( umask 077; awk -v b="$_batch" '{print $0, b "-" NR}' "$tmp" >> "$(_traffic_pending_file)" ) || rc=1
+    # 先单独执行 statsquery -reset 并落盘原始响应：API 不可达时不触发清零；
+    # 若 reset 已成功但后续解析或追加日志失败，显式告警标记采样缺口。
+    if "${to[@]}" xray api statsquery --server="127.0.0.1:${XRAY_API_PORT}" -reset > "$raw_tmp" 2>/dev/null; then
+        if jq -r '.stat[]? | select((.name // .Name) | startswith("user>>>")) | "\(.name // .Name) \(.value // .Value // 0)"' "$raw_tmp" > "$tmp" 2>/dev/null; then
+            if [[ -s "$tmp" ]]; then
+                # 每条日志带唯一标识（name value id），供入账幂等去重
+                local _batch; _batch="$(date +%s%N 2>/dev/null || date +%s)-$$-$RANDOM"
+                if ! ( umask 077; awk -v b="$_batch" '{print $0, b "-" NR}' "$tmp" >> "$(_traffic_pending_file)" ); then
+                    _warn "Xray 计数器已清零但追加流量暂存日志失败（可能存在采样缺口）"
+                    rc=1
+                fi
+            fi
+        else
+            _warn "Xray 计数器已清零但解析统计响应失败（可能存在采样缺口）"
+            rc=1
         fi
     else
         rc=1
     fi
-    rm -f "$tmp"
+    rm -f "$raw_tmp" "$tmp"
     _lockdir_release "$(_traffic_lock_dir)"
     return "$rc"
 }
 
 # 同步所有用户流量到数据库
-# 用法: sync_all_user_traffic [reset]   （reset 参数仅为兼容旧调用保留，计数始终先落盘再清零）
+# 用法: sync_all_user_traffic [reset]   （reset 参数仅为兼容旧调用保留；实际由 statsquery -reset 后落盘 pending journal）
 sync_all_user_traffic() {
     [[ ! -f "$DB_FILE" ]] && return 1
 
@@ -2871,19 +2899,53 @@ _sync_all_user_traffic_locked() {
 
     [[ -s "$pending" ]] || return "$sync_failed"
 
-    local keep_list agg
+    local keep_list idx_tsv
     keep_list=$(mktemp "$CFG/cache/traffic.keep.XXXXXX") || return 1
-    agg=$(mktemp "$CFG/cache/traffic.agg.XXXXXX") || { rm -f "$keep_list"; return 1; }
-    chmod 600 "$keep_list" "$agg" 2>/dev/null || true
-    # 同名计数可能在日志里出现多次（多轮未处理），先按名求和
-    awk '{s[$1]+=$2} END{for(k in s) printf "%s %.0f\n", k, s[k]}' "$pending" > "$agg"
+    idx_tsv=$(mktemp "$CFG/cache/traffic.idx.XXXXXX") || { rm -f "$keep_list"; return 1; }
+    chmod 600 "$keep_list" "$idx_tsv" 2>/dev/null || true
+
+    # 一次性扫描 pending 日志，按 email 聚合总流量与全部幂等条目 JSON，消除逐用户 O(U*L) 重复扫描
+    local -A _t_totals=()
+    local -A _t_entries=()
+    if awk '
+        NF < 2 { next }
+        {
+            k = $1; v = $2 + 0; id = $3
+            if (index(k, "user>>>") != 1) next
+            rest = substr(k, 8)
+            p = index(rest, ">>>traffic>>>")
+            if (p <= 1) next
+            dir = substr(rest, p + 13)
+            if (dir != "uplink" && dir != "downlink") next
+            email = substr(rest, 1, p - 1)
+            c[$0]++
+            if (id == "") id = "L-" k "-" $2 "-" c[$0]
+            printf "%s\t%s\t%.0f\n", email, id, v
+        }
+    ' "$pending" | jq -Rrn '
+        [inputs | split("\t") | select(length == 3) | {e: .[0], id: .[1], v: (.[2] | tonumber)}]
+        | group_by(.e)
+        | .[]
+        | {e: .[0].e, total: ([.[].v] | add // 0), entries: map({id, v})}
+        | "\(.e)\t\(.total)\t\(.entries | tojson)"
+    ' > "$idx_tsv" 2>/dev/null; then
+        local _e _tot _ents
+        while IFS=$'\t' read -r _e _tot _ents; do
+            [[ -n "$_e" ]] || continue
+            _t_totals["$_e"]="$_tot"
+            _t_entries["$_e"]="$_ents"
+        done < "$idx_tsv"
+    else
+        sync_failed=1
+    fi
+    rm -f "$idx_tsv"
 
     local notify_percent
     notify_percent=$(tg_get_config "notify_quota_percent")
     notify_percent=${notify_percent:-80}
     local -a alert_thresholds=(80 90 95)
     local need_reload=false
-    local proto users user email uplink downlink traffic
+    local proto users user email traffic
 
     # 遍历所有 Xray 协议
     for proto in $(db_list_protocols "xray"); do
@@ -2894,18 +2956,10 @@ _sync_all_user_traffic_locked() {
             [[ -z "$user" ]] && continue
             email="${user}@${proto}"
 
-            uplink=$(awk -v k="user>>>${email}>>>traffic>>>uplink" '$1==k{print $2}' "$agg")
-            downlink=$(awk -v k="user>>>${email}>>>traffic>>>downlink" '$1==k{print $2}' "$agg")
-            uplink=${uplink:-0}
-            downlink=${downlink:-0}
-            traffic=$((uplink + downlink))
-            [[ "$traffic" -gt 0 ]] || continue
+            traffic="${_t_totals[$email]:-0}"
+            [[ "$traffic" =~ ^[0-9]+$ && "$traffic" -gt 0 ]] || continue
 
-            local _entries
-            _entries=$(awk -v e="$email" 'BEGIN{u="user>>>" e ">>>traffic>>>uplink"; d="user>>>" e ">>>traffic>>>downlink"}
-                ($1==u||$1==d){c[$0]++; id=($3!="" ? $3 : "L-" $1 "-" $2 "-" c[$0]); print id, $2}' "$pending" \
-                | jq -Rn '[inputs | split(" ") | {id: .[0], v: (.[1] | tonumber)}]' 2>/dev/null)
-            [[ -n "$_entries" ]] || _entries='[]'
+            local _entries="${_t_entries[$email]:-[]}"
             if ! db_update_user_traffic "xray" "$proto" "$user" "$traffic" "$_entries"; then
                 # 写库失败：保留这个用户的日志条目待下轮重试，同时置位失败码让 cron 可见（不阻塞其它用户）
                 printf '%s\n%s\n' "user>>>${email}>>>traffic>>>uplink" "user>>>${email}>>>traffic>>>downlink" >> "$keep_list"
@@ -2913,22 +2967,31 @@ _sync_all_user_traffic_locked() {
                 continue
             fi
 
-            # 检查配额
-            local quota used percent
-            quota=$(db_get_user_field "xray" "$proto" "$user" "quota")
-            used=$(db_get_user_field "xray" "$proto" "$user" "used")
-            quota=${quota:-0}; used=${used:-0}
+            # 单次 jq 读取配额/已用/启用/告警状态，避免每用户多次整库解析
+            local quota=0 used=0 enabled="true" exceeded_notified="false" last_alert=0 percent
+            IFS=$'\t' read -r quota used enabled exceeded_notified last_alert < <(
+                jq -r --arg p "$proto" --arg n "$user" '
+                    .xray[$p] as $cfg |
+                    (if $cfg == null then null
+                     elif ($cfg | type) == "array" then
+                        [$cfg[].users // [] | .[] | select(.name == $n)][0]
+                     else
+                        ($cfg.users // [] | map(select(.name == $n)) | .[0])
+                     end) as $u |
+                    if $u == null then "0\t0\ttrue\tfalse\t0"
+                    else "\($u.quota // 0)\t\($u.used // 0)\t\(if $u.enabled == false then "false" else "true" end)\t\(if $u.quota_exceeded_notified == true then "true" else "false" end)\t\($u.last_alert_percent // 0)"
+                    end
+                ' "$DB_FILE" 2>/dev/null
+            ) || true
+            quota=${quota:-0}; used=${used:-0}; last_alert=${last_alert:-0}
             if [[ "$quota" -gt 0 ]]; then
                 percent=$((used * 100 / quota))
 
                 if [[ "$used" -ge "$quota" ]]; then
                     # 超限：仍处于启用状态就禁用（不依赖一次性通知标记，重置/重新启用后可再次触发）
-                    local enabled exceeded_notified
-                    enabled=$(db_get_user_field "xray" "$proto" "$user" "enabled")
                     if [[ "$enabled" != "false" ]]; then
                         if _db_set_user_enabled_nowrite "xray" "$proto" "$user" "false" 2>/dev/null; then
                             need_reload=true
-                            exceeded_notified=$(db_get_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified")
                             if [[ "$exceeded_notified" != "true" ]]; then
                                 db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
                                 tg_send_over_quota "$user" "$proto" "$used" "$quota"
@@ -2939,9 +3002,7 @@ _sync_all_user_traffic_locked() {
                     fi
                 elif [[ "$percent" -ge "$notify_percent" ]]; then
                     # 告警检查：只在跨越新的阈值档位时发送
-                    local last_alert should_alert=false current_threshold=0 threshold
-                    last_alert=$(db_get_user_alert_state "xray" "$proto" "$user" "last_alert_percent")
-                    last_alert=${last_alert:-0}
+                    local should_alert=false current_threshold=0 threshold
                     for threshold in "${alert_thresholds[@]}"; do
                         if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
                             should_alert=true
@@ -2968,7 +3029,7 @@ _sync_all_user_traffic_locked() {
     else
         : > "$pending" || sync_failed=1
     fi
-    rm -f "$keep_list" "$agg"
+    rm -f "$keep_list"
 
     # 批量处理完成后通知外层释放 traffic.lock 再统一重载配置（仅当配置生成成功后才重启服务）
     if [[ "$need_reload" == "true" ]]; then
@@ -3214,44 +3275,160 @@ _has_master_protocol() {
     [[ "$master_port" == "8443" ]]
 }
 
-# 检查证书是否为 CA 签发的真实证书（优先使用 openssl verify 验证系统信任链，回退 issuer 校验）
+# 检查证书是否为受信任 CA 签发的有效服务端证书（严格密码学验证，禁止 issuer 名称回退）：
+#   1) 拆分 fullchain PEM：首个证书为 leaf，其余为中间链（传入 -untrusted）；
+#   2) 校验有效期（-checkend 0）及 openssl verify -purpose sslserver（可选 -verify_hostname）；
+#   3) 可选校验叶证书公钥与私钥文件配对一致。
+# 用法: _is_real_cert [expected_host] [key_file] [cert_file]
 _is_real_cert() {
-    [[ ! -f "$CFG/certs/server.crt" ]] && return 1
-    if openssl verify "$CFG/certs/server.crt" >/dev/null 2>&1; then
-        return 0
+    local expected_host="${1:-}" key_file="${2:-}" cert_file="${3:-$CFG/certs/server.crt}"
+    [[ -f "$cert_file" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+
+    local tmpd
+    tmpd=$(mktemp -d) || return 1
+    chmod 700 "$tmpd" 2>/dev/null || true
+
+    # 拆分 leaf 与中间证书链，兼容 acme.sh 输出的 fullchain.pem
+    awk -v leaf="$tmpd/leaf.pem" -v chain="$tmpd/chain.pem" '
+        /-----BEGIN CERTIFICATE-----/ { in_c = 1; n++ }
+        in_c {
+            if (n == 1) print > leaf
+            else print > chain
+        }
+        /-----END CERTIFICATE-----/ { in_c = 0 }
+    ' "$cert_file" 2>/dev/null
+
+    if [[ ! -s "$tmpd/leaf.pem" ]]; then
+        rm -rf -- "$tmpd"
+        return 1
     fi
-    local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-    local subject=$(openssl x509 -in "$CFG/certs/server.crt" -noout -subject 2>/dev/null)
-    # 自签证书（issuer == subject）一律判定非 CA 证书，防止伪造 CN 含 R3/E1 绕过
-    [[ -n "$issuer" && -n "$subject" && "${issuer#issuer=}" == "${subject#subject=}" ]] && return 1
-    [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || \
-    [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || \
-    [[ "$issuer" == *"R12"* ]] || [[ "$issuer" == *"R13"* ]] || [[ "$issuer" == *"R14"* ]] || \
-    [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"E5"* ]] || [[ "$issuer" == *"E6"* ]] || \
-    [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]] || \
-    [[ "$issuer" == *"Google Trust Services"* ]]
+
+    # 校验叶证书未过期且当前有效
+    if ! openssl x509 -in "$tmpd/leaf.pem" -noout -checkend 0 >/dev/null 2>&1; then
+        rm -rf -- "$tmpd"
+        return 1
+    fi
+
+    local -a vargs=(-purpose sslserver)
+    if [[ "${VLESS_SOURCE_ONLY:-0}" == "1" && -n "${VLESS_TEST_CA_BUNDLE:-}" && -f "${VLESS_TEST_CA_BUNDLE}" ]]; then
+        vargs+=(-CAfile "$VLESS_TEST_CA_BUNDLE" -no-CApath)
+        if openssl verify -help 2>&1 | grep -q -- '-no-CAstore'; then
+            vargs+=(-no-CAstore)
+        fi
+    fi
+    [[ -s "$tmpd/chain.pem" ]] && vargs+=(-untrusted "$tmpd/chain.pem")
+    [[ -n "$expected_host" ]] && vargs+=(-verify_hostname "$expected_host")
+
+    if ! openssl verify "${vargs[@]}" "$tmpd/leaf.pem" >/dev/null 2>&1; then
+        rm -rf -- "$tmpd"
+        return 1
+    fi
+
+    if [[ -n "$key_file" ]]; then
+        if [[ ! -f "$key_file" ]]; then
+            rm -rf -- "$tmpd"
+            return 1
+        fi
+        local cert_pub key_pub
+        cert_pub=$(openssl x509 -in "$tmpd/leaf.pem" -noout -pubkey 2>/dev/null) || cert_pub=""
+        key_pub=$(openssl pkey -in "$key_file" -pubout 2>/dev/null) || key_pub=""
+        if [[ -z "$cert_pub" || "$cert_pub" != "$key_pub" ]]; then
+            rm -rf -- "$tmpd"
+            return 1
+        fi
+    fi
+
+    rm -rf -- "$tmpd"
+    return 0
 }
 
 # 把渲染好的 nginx 配置装入 <dest>（可选 <enabled_link> 软链接）；nginx -t 失败则回滚：
-# 有旧文件就恢复旧文件，没有就删除新文件和链接。返回 0=已生效配置通过测试, 1=已回滚
+#   - 原 dest 存在时必须先在同目录完成完整备份与字节核对，备份失败立即中止（绝不覆盖/删原配置）；
+#   - 新配置在目标同目录暂存并原子替换，回滚保留原 symlink 目标并在恢复失败时保留备份路径。
+# 返回 0=已生效配置通过测试, 1=未生效或已回滚
 _nginx_install_conf() {
-    local src="$1" dest="$2" link="${3:-}" bak="" link_existed=false
-    [[ -e "$dest" ]] && { bak=$(mktemp) && cp -p "$dest" "$bak" 2>/dev/null || bak=""; }
-    [[ -n "$link" && ( -e "$link" || -L "$link" ) ]] && link_existed=true
-    cp -f "$src" "$dest" || { [[ -n "$bak" ]] && rm -f "$bak"; return 1; }
-    chmod 644 "$dest" 2>/dev/null || true
-    [[ -n "$link" ]] && ln -sf "$dest" "$link" 2>/dev/null
+    local src="$1" dest="$2" link="${3:-}"
+    local dest_dir dest_base dest_existed=false bak="" stage=""
+    local link_existed=false link_was_symlink=false orig_link_target=""
+    dest_dir=$(dirname -- "$dest")
+    dest_base=$(basename -- "$dest")
+
+    [[ -r "$src" ]] || { _err "Nginx 源配置不可读: $src"; return 1; }
+    [[ -d "$dest_dir" ]] || { _err "Nginx 目标目录不存在: $dest_dir"; return 1; }
+
+    if [[ -e "$dest" || -L "$dest" ]]; then
+        dest_existed=true
+        bak=$(mktemp "${dest_dir}/.${dest_base}.bak.XXXXXX" 2>/dev/null) || {
+            _err "无法创建 Nginx 原配置备份文件，已中止覆盖: $dest"
+            return 1
+        }
+        if ! cp -p "$dest" "$bak" 2>/dev/null || ! cmp -s "$dest" "$bak"; then
+            rm -f -- "$bak" 2>/dev/null || true
+            _err "Nginx 原配置备份校验失败，已中止覆盖: $dest"
+            return 1
+        fi
+    fi
+
+    if [[ -n "$link" && ( -e "$link" || -L "$link" ) ]]; then
+        link_existed=true
+        if [[ -L "$link" ]]; then
+            link_was_symlink=true
+            orig_link_target=$(readlink "$link" 2>/dev/null || true)
+        fi
+    fi
+
+    _nginx_rollback() {
+        local rb_ok=true
+        if [[ "$dest_existed" == true ]]; then
+            if [[ -n "$bak" && -f "$bak" ]]; then
+                if cp -pf "$bak" "$dest" 2>/dev/null && cmp -s "$bak" "$dest"; then
+                    rm -f -- "$bak" 2>/dev/null || true
+                else
+                    _err "警告: 恢复 Nginx 原配置失败，已保留备份文件: $bak"
+                    rb_ok=false
+                fi
+            else
+                _err "警告: 缺少有效备份，拒绝删除原 Nginx 配置: $dest"
+                rb_ok=false
+            fi
+        else
+            rm -f -- "$dest" 2>/dev/null || true
+        fi
+        if [[ -n "$link" ]]; then
+            if [[ "$link_existed" == false ]]; then
+                rm -f -- "$link" 2>/dev/null || true
+            elif [[ "$link_was_symlink" == true && -n "$orig_link_target" ]]; then
+                ln -snf "$orig_link_target" "$link" 2>/dev/null || true
+            fi
+        fi
+        if [[ "$rb_ok" == true ]] && ! nginx -t &>/dev/null; then
+            _warn "Nginx 回滚后配置检查仍未通过，请人工核对: $dest"
+        fi
+    }
+
+    stage=$(mktemp "${dest_dir}/.${dest_base}.stage.XXXXXX" 2>/dev/null) || {
+        [[ -n "$bak" ]] && rm -f -- "$bak" 2>/dev/null || true
+        _err "无法创建 Nginx 暂存文件: $dest_dir"
+        return 1
+    }
+    if ! cp -f "$src" "$stage" 2>/dev/null || ! chmod 644 "$stage" 2>/dev/null || ! mv -f "$stage" "$dest" 2>/dev/null; then
+        rm -f -- "$stage" 2>/dev/null || true
+        _nginx_rollback
+        return 1
+    fi
+
+    if [[ -n "$link" ]] && ! ln -sf "$dest" "$link" 2>/dev/null; then
+        _nginx_rollback
+        return 1
+    fi
+
     if nginx -t &>/dev/null; then
-        [[ -n "$bak" ]] && rm -f "$bak"
+        [[ -n "$bak" ]] && rm -f -- "$bak" 2>/dev/null || true
         return 0
     fi
     nginx -t 2>&1 | tail -n 5 >&2
-    if [[ -n "$bak" ]]; then
-        cp -pf "$bak" "$dest"; rm -f "$bak"
-    else
-        rm -f "$dest"
-        [[ -n "$link" && "$link_existed" == false ]] && rm -f "$link"
-    fi
+    _nginx_rollback
     return 1
 }
 
@@ -6643,14 +6820,25 @@ gen_tuic_link() {
     printf '%s\n' "tuic://${uuid}:${password}@${ip}:${port}?congestion_control=bbr&alpn=h3&sni=${sni}&udp_relay_mode=native${insecure}#${name}"
 }
 
-# 判断给定 SNI 是否正由真实 ACME 证书对（server.crt + server.key 均存在）服务（返回 0=真证书 / 1=自签兜底）。
-# 入站渲染器与所有链接/订阅导出共用此单一判据：缺全局私钥时入站不会启用全局证书，导出端亦不得去掉 allow_insecure / skip-cert-verify。
+# 判断给定 SNI 是否正由受信任 CA 签发的真实证书对（server.crt + server.key 完整配对且 SAN 匹配）服务。
+# 返回 0=真证书 / 1=自签兜底。入站渲染器与所有链接/订阅/菜单导出共用此单一判据。
 _anytls_secure() {
     local sni="$1"
     [[ -z "$sni" ]] && return 1
     [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]] || return 1
-    _is_real_cert || return 1
-    [[ "$sni" == "$(cat "$CFG/cert_domain")" ]]
+    [[ "$sni" == "$(cat "$CFG/cert_domain")" ]] || return 1
+    _is_real_cert "$sni" "$CFG/certs/server.key"
+}
+
+# 本机协议统一 TLS 跳过校验策略：仅在真实可信证书匹配 SNI 时返回 false，自签兜底返回 true。
+# 绝不用于判断外部订阅节点。
+_local_tls_skip_verify() {
+    local sni="${1:-}"
+    if [[ -n "$sni" ]] && _anytls_secure "$sni" 2>/dev/null; then
+        printf 'false'
+    else
+        printf 'true'
+    fi
 }
 
 gen_anytls_link() {
@@ -6754,12 +6942,22 @@ test_latency() {
 # 软件安装
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 检查 Debian/Ubuntu 软件包是否处于严格完全安装态（排除 rc 残留配置、iU 未配置、iF/iH 半安装）
+_dpkg_pkg_installed() {
+    local pkg="$1" status=""
+    status=$(dpkg-query -W -f='${Status}\n' "$pkg" 2>/dev/null) || return 1
+    [[ "$status" == "install ok installed" ]]
+}
+
 # 安装系统依赖
 install_deps() {
     _info "检查系统依赖..."
+    local req_cmds=(curl jq unzip openssl socat ip)
     if [[ "$DISTRO" == "alpine" ]]; then
         _info "更新软件包索引..."
-        if ! timeout 60 apk update 2>&1 | grep -E '^(fetch|OK)' | sed 's/^/  /'; then
+        local upd_rc=0
+        timeout 60 apk update 2>&1 | awk '/^(fetch|OK)/ {print "  " $0}'; upd_rc=${PIPESTATUS[0]}
+        if [[ $upd_rc -ne 0 ]]; then
             if ! apk update &>/dev/null; then
                 _err "更新软件包索引失败（可能超时）"
                 return 1
@@ -6768,60 +6966,80 @@ install_deps() {
         
         local deps="curl jq unzip iproute2 iptables ip6tables gcompat libc6-compat openssl socat bind-tools xz"
         _info "安装依赖: $deps"
-        if ! timeout 180 apk add --no-cache $deps 2>&1 | grep -E '^(\(|OK|Installing|Executing)' | sed 's/^/  /'; then
-            # 检查实际安装结果
-            local missing=""
-            for dep in $deps; do
-                apk info -e "$dep" &>/dev/null || missing="$missing $dep"
-            done
-            if [[ -n "$missing" ]]; then
-                _err "依赖安装失败:$missing"
-                return 1
-            fi
+        local add_rc=0
+        timeout 180 apk add --no-cache $deps 2>&1 | awk '/^(\(|OK|Installing|Executing)/ {print "  " $0}'; add_rc=${PIPESTATUS[0]}
+        local missing="" dep cmd
+        for dep in $deps; do
+            apk info -e "$dep" &>/dev/null || missing="$missing $dep"
+        done
+        for cmd in "${req_cmds[@]}"; do
+            command -v "$cmd" >/dev/null 2>&1 || missing="$missing cmd:$cmd"
+        done
+        if [[ -n "$missing" ]]; then
+            _err "依赖安装失败 (apk exit=$add_rc):$missing"
+            return 1
         fi
         _ok "依赖安装完成"
     elif [[ "$DISTRO" == "centos" ]]; then
         _info "安装 EPEL 源..."
-        if ! timeout 120 yum install -y epel-release 2>&1 | grep -E '^(Installing|Verifying|Complete)' | sed 's/^/  /'; then
-            if ! rpm -q epel-release &>/dev/null; then
-                _err "EPEL 源安装失败（可能超时）"
-                return 1
-            fi
+        local epel_rc=0
+        timeout 120 yum install -y epel-release 2>&1 | awk '/^(Installing|Verifying|Complete)/ {print "  " $0}'; epel_rc=${PIPESTATUS[0]}
+        if [[ $epel_rc -ne 0 ]] && ! rpm -q epel-release &>/dev/null; then
+            _err "EPEL 源安装失败（可能超时，yum exit=$epel_rc）"
+            return 1
         fi
         
         local deps="curl jq unzip iproute iptables vim-common openssl socat bind-utils xz"
         _info "安装依赖: $deps"
-        if ! timeout 300 yum install -y $deps 2>&1 | grep -E '^(Installing|Verifying|Complete|Downloading)' | sed 's/^/  /'; then
-            # 检查实际安装结果
-            local missing=""
-            for dep in $deps; do
-                rpm -q "$dep" &>/dev/null || missing="$missing $dep"
-            done
-            if [[ -n "$missing" ]]; then
-                _err "依赖安装失败:$missing"
-                return 1
-            fi
+        local yum_rc=0
+        timeout 300 yum install -y $deps 2>&1 | awk '/^(Installing|Verifying|Complete|Downloading)/ {print "  " $0}'; yum_rc=${PIPESTATUS[0]}
+        local missing="" dep cmd
+        for dep in $deps; do
+            rpm -q "$dep" &>/dev/null || missing="$missing $dep"
+        done
+        for cmd in "${req_cmds[@]}"; do
+            command -v "$cmd" >/dev/null 2>&1 || missing="$missing cmd:$cmd"
+        done
+        if [[ -n "$missing" ]]; then
+            _err "依赖安装失败 (yum exit=$yum_rc):$missing"
+            return 1
         fi
         _ok "依赖安装完成"
     elif [[ "$DISTRO" == "debian" || "$DISTRO" == "ubuntu" ]]; then
         _info "更新软件包索引..."
-        # 移除 -qq 让用户能看到进度，避免交互卡住
-        if ! DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 | grep -E '^(Hit|Get|Fetched|Reading)' | head -10 | sed 's/^/  /'; then
-            # 即使 grep 没匹配到也继续，只要 apt-get 成功即可
-            :
+        # 分离 apt-get 真实退出码与进度展示；awk 完整消费 stdin 避免 head 触发 SIGPIPE
+        local upd_rc=0
+        DEBIAN_FRONTEND=noninteractive apt-get update 2>&1 \
+            | awk '/^(Hit|Get|Fetched|Reading)/ && ++n <= 10 {print "  " $0}'; upd_rc=${PIPESTATUS[0]}
+        if [[ $upd_rc -ne 0 ]]; then
+            _warn "软件包索引更新失败（apt-get update 退出码 $upd_rc），尝试继续安装"
         fi
         
         local deps="curl jq unzip iproute2 xxd openssl socat dnsutils xz-utils iptables"
         _info "安装依赖: $deps"
-        # 使用 DEBIAN_FRONTEND 避免交互，显示简化进度，移除 timeout 避免死锁
-        if ! DEBIAN_FRONTEND=noninteractive apt-get install -y $deps 2>&1 | grep -E '^(Setting up|Unpacking|Processing|Get:|Fetched)' | sed 's/^/  /'; then
-            # 检查实际安装结果
-            if ! dpkg -l $deps >/dev/null 2>&1; then
-                _err "依赖安装失败"
-                return 1
-            fi
+        local apt_rc=0
+        DEBIAN_FRONTEND=noninteractive apt-get install -y $deps 2>&1 \
+            | awk '/^(Setting up|Unpacking|Processing|Get:|Fetched)/ {print "  " $0}'; apt_rc=${PIPESTATUS[0]}
+        # 无论 apt-get 退出码如何，逐项校验严格安装态（install ok installed）与关键命令可执行性；
+        # dpkg -l 对残留配置(rc)/未配置(iU) 仍返回 0，不能作为安装完整依据。
+        local missing="" dep cmd
+        for dep in $deps; do
+            _dpkg_pkg_installed "$dep" || missing="$missing $dep"
+        done
+        for cmd in "${req_cmds[@]}"; do
+            command -v "$cmd" >/dev/null 2>&1 || missing="$missing cmd:$cmd"
+        done
+        if [[ -n "$missing" ]]; then
+            _err "依赖安装失败 (apt-get exit=$apt_rc):$missing"
+            return 1
+        fi
+        if [[ $apt_rc -ne 0 ]]; then
+            _warn "apt-get install 返回非零 ($apt_rc)，但所有必需依赖均处于完整已安装状态"
         fi
         _ok "依赖安装完成"
+    else
+        _err "不支持的发行版: ${DISTRO:-unknown}"
+        return 1
     fi
 }
 
@@ -7399,10 +7617,9 @@ setup_cert_and_nginx() {
         if openssl x509 -in "$CFG/certs/server.crt" -noout -checkend 2592000 >/dev/null 2>&1; then
             CERT_DOMAIN=$(cat "$CFG/cert_domain")
             
-            # 检查是否是自签名证书
+            # 检查是否是真实受信任 CA 证书（统一复用密码学链与主机名校验，禁止 issuer 字符串回退）
             local is_self_signed=true
-            local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-            if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
+            if _is_real_cert "$CERT_DOMAIN" "$CFG/certs/server.key" 2>/dev/null; then
                 is_self_signed=false
             fi
             
@@ -7558,16 +7775,10 @@ ask_sni_config() {
         return 0
     fi
     
-    # 如果有证书域名，检查是否是真实证书
+    # 如果有证书域名，检查是否是受信任 CA 签发的真实证书
     if [[ -n "$cert_domain" && -f "$CFG/certs/server.crt" ]]; then
-        local is_real_cert=false
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
-            is_real_cert=true
-        fi
-        
         # 真实证书：直接使用证书域名，不询问
-        if [[ "$is_real_cert" == "true" ]]; then
+        if _is_real_cert "$cert_domain" "$CFG/certs/server.key" 2>/dev/null; then
             _ok "使用证书域名: $cert_domain" >&2
             echo "$cert_domain"
             return 0
@@ -7663,11 +7874,10 @@ ask_cert_config() {
     local default_sni="${1:-bing.com}"
     local protocol="${2:-unknown}"
     
-    # 检查是否已有 ACME 证书，如果有则直接复用
+    # 检查是否已有有效受信任 ACME 证书，如果有则直接复用
     if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
         local existing_domain=$(cat "$CFG/cert_domain")
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]]; then
+        if _is_real_cert "$existing_domain" "$CFG/certs/server.key" 2>/dev/null; then
             _ok "检测到现有 ACME 证书: $existing_domain，自动复用" >&2
             echo "$existing_domain"
             return 0
@@ -10148,15 +10358,13 @@ generate_singbox_config() {
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
                 
-                # 智能证书选择：优先使用 ACME 证书对（server.crt + server.key 均存在），否则使用 hy2 独立自签证书
+                # 智能证书选择：与 TUIC/AnyTLS/导出端共用 _anytls_secure 判据，
+                # 仅当全局证书对完整、密码学可信且 SNI 匹配时启用全局证书，否则使用 hy2 独立自签证书
                 local cert_path="$CFG/certs/hy2/server.crt"
                 local key_path="$CFG/certs/hy2/server.key"
-                if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" && -f "$CFG/certs/server.key" ]]; then
-                    local cert_domain=$(cat "$CFG/cert_domain" 2>/dev/null)
-                    if [[ "$sni" == "$cert_domain" ]]; then
-                        cert_path="$CFG/certs/server.crt"
-                        key_path="$CFG/certs/server.key"
-                    fi
+                if _anytls_secure "$sni" 2>/dev/null; then
+                    cert_path="$CFG/certs/server.crt"
+                    key_path="$CFG/certs/server.key"
                 fi
                 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
@@ -11901,7 +12109,7 @@ _start_core_service() {
 
 start_services() {
     local failed_services=()
-    rm -f "$CFG/paused"
+    rm -f "$CFG/paused" "$CFG/.singbox-stopped-empty"
     
     # 初始化数据库
     init_db
@@ -12013,6 +12221,8 @@ stop_services() {
     fi
     
     # 停止 Sing-box 服务 (Hy2/TUIC)
+    # 管理员主动停服时清除「无启用用户自动停服」标记，避免后续启用用户越权自动拉起
+    rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
     if is_service_active vless-singbox; then
         svc stop vless-singbox 2>/dev/null && stopped_services+=("vless-singbox")
     fi
@@ -14705,10 +14915,18 @@ _regenerate_proxy_configs() {
         local sb_gen_rc=0
         generate_singbox_config || sb_gen_rc=$?
         if [[ $sb_gen_rc -eq 0 ]]; then
-            svc restart vless-singbox 2>/dev/null || { _err "Sing-box 服务重启失败"; rc=1; }
+            if svc restart vless-singbox 2>/dev/null; then
+                rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+            else
+                _err "Sing-box 服务重启失败"; rc=1
+            fi
         elif [[ $sb_gen_rc -eq 2 ]]; then
             if svc status vless-singbox 2>/dev/null; then
-                svc stop vless-singbox 2>/dev/null || { _err "Sing-box 无启用用户，但停止服务失败"; rc=1; }
+                if svc stop vless-singbox 2>/dev/null; then
+                    ( umask 077; : > "$CFG/.singbox-stopped-empty" ) 2>/dev/null || true
+                else
+                    _err "Sing-box 无启用用户，但停止服务失败"; rc=1
+                fi
             fi
         else
             rc=1
@@ -18142,6 +18360,10 @@ show_single_protocol_info() {
     local config_ip="$ipv4"
     [[ -z "$config_ip" ]] && config_ip="[$ipv6]"
     
+    # 本机协议统一 TLS 策略（真证书匹配 SNI 时严格校验 skip-cert-verify=false，自签兜底才 true）
+    local tls_scv
+    tls_scv=$(_local_tls_skip_verify "$sni")
+
     case "$protocol" in
         vless)
             echo -e "  UUID: ${G}$uuid${NC}"
@@ -18178,7 +18400,7 @@ show_single_protocol_info() {
             [[ -n "$path" ]] && echo -e "  Path/ServiceName: ${G}$path${NC}"
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-Vless-Vision = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=tcp, flow=xtls-rprx-vision, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Vless-Vision = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=tcp, flow=xtls-rprx-vision, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             ;;
         vless-ws)
             echo -e "  UUID: ${G}$uuid${NC}"
@@ -18186,7 +18408,7 @@ show_single_protocol_info() {
             [[ -n "$path" ]] && echo -e "  Path/ServiceName: ${G}$path${NC}"
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-Vless-WS = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Vless-WS = VLESS, ${config_ip}, ${display_port}, \"${uuid}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Clash Meta 配置:${NC}"
             echo -e "  ${C}- name: ${country_code}-VLESS-WS-TLS${NC}"
@@ -18196,7 +18418,7 @@ show_single_protocol_info() {
             echo -e "  ${C}  uuid: ${uuid}${NC}"
             echo -e "  ${C}  network: ws${NC}"
             echo -e "  ${C}  tls: true${NC}"
-            echo -e "  ${C}  skip-cert-verify: true${NC}"
+            echo -e "  ${C}  skip-cert-verify: ${tls_scv}${NC}"
             echo -e "  ${C}  servername: ${sni}${NC}"
             echo -e "  ${C}  ws-opts:${NC}"
             echo -e "  ${C}    path: ${path}${NC}"
@@ -18218,10 +18440,10 @@ show_single_protocol_info() {
             [[ -n "$path" ]] && echo -e "  Path: ${G}$path${NC}"
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-VMess-WS = vmess, ${config_ip}, ${display_port}, ${uuid}, tls=true, ws=true, ws-path=${path}, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-VMess-WS = vmess, ${config_ip}, ${display_port}, ${uuid}, tls=true, ws=true, ws-path=${path}, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-VMess-WS = VMess, ${config_ip}, ${display_port}, aes-128-gcm, \"${uuid}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-VMess-WS = VMess, ${config_ip}, ${display_port}, aes-128-gcm, \"${uuid}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Clash 配置:${NC}"
             echo -e "  ${C}- name: ${country_code}-VMess-WS${NC}"
@@ -18232,7 +18454,7 @@ show_single_protocol_info() {
             echo -e "  ${C}  alterId: 0${NC}"
             echo -e "  ${C}  cipher: auto${NC}"
             echo -e "  ${C}  tls: true${NC}"
-            echo -e "  ${C}  skip-cert-verify: true${NC}"
+            echo -e "  ${C}  skip-cert-verify: ${tls_scv}${NC}"
             echo -e "  ${C}  network: ws${NC}"
             echo -e "  ${C}  ws-opts:${NC}"
             echo -e "  ${C}    path: ${path}${NC}"
@@ -18268,10 +18490,10 @@ show_single_protocol_info() {
             fi
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-Hysteria2 = hysteria2, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Hysteria2 = hysteria2, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-Hysteria2 = Hysteria2, ${config_ip}, ${display_port}, \"${password}\", udp=true, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Hysteria2 = Hysteria2, ${config_ip}, ${display_port}, \"${password}\", udp=true, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Clash Meta 配置:${NC}"
             echo -e "  ${C}- name: ${country_code}-Hysteria2${NC}"
@@ -18280,17 +18502,17 @@ show_single_protocol_info() {
             echo -e "  ${C}  port: ${display_port}${NC}"
             echo -e "  ${C}  password: ${password}${NC}"
             echo -e "  ${C}  sni: ${sni}${NC}"
-            echo -e "  ${C}  skip-cert-verify: true${NC}"
+            echo -e "  ${C}  skip-cert-verify: ${tls_scv}${NC}"
             ;;
         trojan)
             echo -e "  密码: ${G}$password${NC}"
             echo -e "  SNI: ${G}$sni${NC}"
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-Trojan = trojan, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Trojan = trojan, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-Trojan = trojan, ${config_ip}, ${display_port}, \"${password}\", udp=true, over-tls=true, sni=${sni}${NC}"
+            echo -e "  ${C}${country_code}-Trojan = trojan, ${config_ip}, ${display_port}, \"${password}\", udp=true, over-tls=true, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Clash 配置:${NC}"
             echo -e "  ${C}- name: ${country_code}-Trojan${NC}"
@@ -18299,7 +18521,7 @@ show_single_protocol_info() {
             echo -e "  ${C}  port: ${display_port}${NC}"
             echo -e "  ${C}  password: ${password}${NC}"
             echo -e "  ${C}  sni: ${sni}${NC}"
-            echo -e "  ${C}  skip-cert-verify: true${NC}"
+            echo -e "  ${C}  skip-cert-verify: ${tls_scv}${NC}"
             ;;
         trojan-ws)
             echo -e "  密码: ${G}$password${NC}"
@@ -18307,10 +18529,10 @@ show_single_protocol_info() {
             [[ -n "$path" ]] && echo -e "  Path: ${G}$path${NC}"
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, ws=true, ws-path=${path}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, ws=true, ws-path=${path}, skip-cert-verify=${tls_scv}${NC}"
             echo ""
             echo -e "  ${Y}Loon 配置:${NC}"
-            echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, \"${password}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=true${NC}"
+            echo -e "  ${C}${country_code}-Trojan-WS = trojan, ${config_ip}, ${display_port}, \"${password}\", transport=ws, path=${path}, host=${sni}, udp=true, over-tls=true, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             ;;
         anytls)
             echo -e "  密码: ${G}$password${NC}"
@@ -18318,9 +18540,7 @@ show_single_protocol_info() {
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
             # 真证书时 skip-cert-verify=false（客户端校验证书）；自签兜底时 true 兼容
-            local anytls_scv=true
-            _anytls_secure "$sni" && anytls_scv=false
-            echo -e "  ${C}${country_code}-AnyTLS = anytls, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=${anytls_scv}${NC}"
+            echo -e "  ${C}${country_code}-AnyTLS = anytls, ${config_ip}, ${display_port}, password=${password}, sni=${sni}, skip-cert-verify=${tls_scv}${NC}"
             ;;
         naive)
             local domain=$(echo "$cfg" | jq -r '.domain // empty')
@@ -18374,19 +18594,21 @@ show_single_protocol_info() {
             fi
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-TUIC = tuic-v5, ${config_ip}, ${display_port}, password=${password}, uuid=${uuid}, sni=${sni}, skip-cert-verify=true, alpn=h3${NC}"
+            echo -e "  ${C}${country_code}-TUIC = tuic-v5, ${config_ip}, ${display_port}, password=${password}, uuid=${uuid}, sni=${sni}, skip-cert-verify=${tls_scv}, alpn=h3${NC}"
 
             ;;
         socks)
             local use_tls=$(echo "$cfg" | jq -r '.tls // "false"')
             local socks_sni=$(echo "$cfg" | jq -r '.sni // ""')
+            local socks_scv
+            socks_scv=$(_local_tls_skip_verify "$socks_sni")
             echo -e "  用户名: ${G}$username${NC}"
             echo -e "  密码: ${G}$password${NC}"
             if [[ "$use_tls" == "true" ]]; then
                 echo -e "  TLS: ${G}启用${NC} (SNI: $socks_sni)"
                 echo ""
                 echo -e "  ${Y}Surge 配置:${NC}"
-                echo -e "  ${C}${country_code}-SOCKS5-TLS = socks5-tls, ${config_ip}, ${display_port}, ${username}, ${password}, skip-cert-verify=true, sni=${socks_sni}${NC}"
+                echo -e "  ${C}${country_code}-SOCKS5-TLS = socks5-tls, ${config_ip}, ${display_port}, ${username}, ${password}, skip-cert-verify=${socks_scv}, sni=${socks_sni}${NC}"
                 echo ""
                 echo -e "  ${Y}Clash 配置:${NC}"
                 echo -e "  ${C}- name: ${country_code}-SOCKS5-TLS${NC}"
@@ -18396,7 +18618,7 @@ show_single_protocol_info() {
                 echo -e "  ${C}  username: ${username}${NC}"
                 echo -e "  ${C}  password: ${password}${NC}"
                 echo -e "  ${C}  tls: true${NC}"
-                echo -e "  ${C}  skip-cert-verify: true${NC}"
+                echo -e "  ${C}  skip-cert-verify: ${socks_scv}${NC}"
             else
                 echo -e "  TLS: ${D}未启用${NC}"
                 echo ""
@@ -19031,10 +19253,18 @@ uninstall_specific_protocol() {
             generate_singbox_config || sb_gen_rc=$?
             if [[ $sb_gen_rc -eq 0 ]]; then
                 _ok "Sing-box 配置已更新"
-                svc restart vless-singbox 2>/dev/null || { _err "Sing-box 服务重启失败"; _uninstall_rc=1; }
+                if svc restart vless-singbox 2>/dev/null; then
+                    rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+                else
+                    _err "Sing-box 服务重启失败"; _uninstall_rc=1
+                fi
             elif [[ $sb_gen_rc -eq 2 ]]; then
                 if svc status vless-singbox 2>/dev/null; then
-                    svc stop vless-singbox 2>/dev/null || { _err "Sing-box 无启用用户，但停止服务失败"; _uninstall_rc=1; }
+                    if svc stop vless-singbox 2>/dev/null; then
+                        ( umask 077; : > "$CFG/.singbox-stopped-empty" ) 2>/dev/null || true
+                    else
+                        _err "Sing-box 无启用用户，但停止服务失败"; _uninstall_rc=1
+                    fi
                 fi
                 [[ $_uninstall_rc -eq 0 ]] && _ok "Sing-box 剩余协议无启用用户，已清除配置并停止服务"
             else
@@ -19050,7 +19280,7 @@ uninstall_specific_protocol() {
             _info "没有其他 Sing-box 协议，停止 Sing-box 服务..."
             svc stop vless-singbox 2>/dev/null
             svc disable vless-singbox 2>/dev/null
-            rm -f "$CFG/singbox.json"
+            rm -f "$CFG/singbox.json" "$CFG/.singbox-stopped-empty"
             # 删除 Sing-box 服务文件
             if [[ "$DISTRO" == "alpine" ]]; then
                 rc-update del vless-singbox default 2>/dev/null
@@ -20958,65 +21188,154 @@ EXTERNAL_LINKS_FILE="$CFG/external_links.txt"
 EXTERNAL_SUBS_FILE="$CFG/external_subs.txt"
 EXTERNAL_CACHE_DIR="$CFG/external_nodes_cache"
 
+# ── 外部订阅安全解析与序列化辅助函数 ────────────────────────────────────────
+# 安全 URL 解码：仅展开 %XX 十六进制字节，绝不解释字面反斜线转义（避免 printf '%b' 误解释 \n/\t）
+_urldecode() {
+    local s="${1//+/ }" out="" hex ch
+    # 明确拒绝 %00 空字节
+    if [[ "$s" == *%00* ]]; then
+        return 1
+    fi
+    while [[ "$s" =~ ^([^%]*)%([0-9A-Fa-f]{2})(.*)$ ]]; do
+        out+="${BASH_REMATCH[1]}"
+        hex="${BASH_REMATCH[2]}"
+        printf -v ch "\\x${hex}"
+        out+="$ch"
+        s="${BASH_REMATCH[3]}"
+    done
+    printf '%s' "${out}${s}"
+}
+
+# 检测字符串是否包含任意 ASCII 控制字符（含 CR/LF/TAB/DEL），用于拒绝凭据/配置注入
+_has_ctrl_chars() {
+    local s="${1:-}"
+    [[ "$s" == *$'\r'* || "$s" == *$'\n'* || "$s" == *$'\t'* ]] && return 0
+    local LC_ALL=C
+    [[ "$s" =~ [[:cntrl:]] ]]
+}
+
+# 校验多个外部字段均不含控制字符；任一命中返回 1（fail-closed，不靠静默删字符篡改凭据）
+_reject_ctrl_fields() {
+    local v
+    for v in "$@"; do
+        _has_ctrl_chars "$v" && return 1
+    done
+    return 0
+}
+
+# 校验端口号为 1..65535 纯整数
+_valid_sub_port() {
+    local p="${1:-}"
+    [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 ))
+}
+
+# 校验网络传输类型枚举白名单
+_valid_sub_network() {
+    case "${1:-tcp}" in
+        tcp|ws|grpc|http|h2|xhttp|kcp|quic|splithttp) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 归一化外部节点的 TLS 跳过校验标志：仅显式 true/1 时返回 true，其余默认 false（安全默认）
+_parse_insecure_flag() {
+    local v="${1:-}"
+    v=$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')
+    case "$v" in
+        1|true|yes) printf 'true' ;;
+        *) printf 'false' ;;
+    esac
+}
+
+# 将任意字符串编码为严格合法的 YAML 1.2 双引号标量（JSON 字符串编码完全兼容 YAML）
+_yaml_quote() {
+    jq -Rn --arg v "$1" '$v'
+}
+
+# 脱敏 URL 用于终端提示与日志输出：保留 scheme + host[:port]，隐藏 userinfo/路径令牌/查询参数
+_redact_url() {
+    local url="${1:-}"
+    if [[ "$url" =~ ^(https?)://([^/@?#]+@)?(\[[0-9A-Fa-f:]+\]|[^/:?#]+)(:[0-9]+)? ]]; then
+        printf '%s://%s%s/***' "${BASH_REMATCH[1]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"
+    else
+        printf '<redacted-url>'
+    fi
+}
+
 # 解析 vless:// 链接
 parse_vless_link() {
     local link="$1"
     # vless://uuid@server:port?params#name
     local content="${link#vless://}"
-    local name="${content##*#}"
-    name=$(printf '%b' "${name//%/\\x}")  # URL 解码
-    # 转义 JSON 特殊字符
-    name="${name//\\/\\\\}"
-    name="${name//\"/\\\"}"
-    content="${content%%#*}"
-    
+    local raw_name="" name="VLESS"
+    if [[ "$content" == *"#"* ]]; then
+        raw_name="${content##*#}"
+        content="${content%%#*}"
+        name=$(_urldecode "$raw_name") || return 1
+    fi
+    [[ "$content" == *"@"* ]] || return 1
+
     local uuid="${content%%@*}"
+    uuid=$(_urldecode "$uuid") || return 1
     content="${content#*@}"
-    
-    local server_port="${content%%\?*}"
+
+    local server_port="$content" params=""
+    if [[ "$content" == *"?"* ]]; then
+        server_port="${content%%\?*}"
+        params="${content#*\?}"
+    fi
     # 解析 host:port（支持 IPv6）
-    local parsed=$(_parse_hostport "$server_port")
+    local parsed
+    parsed=$(_parse_hostport "$server_port")
     local server="${parsed%%|*}"
     local port="${parsed##*|}"
-    
-    local params="${content#*\?}"
-    
+
     # 解析参数
-    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption=""
-    IFS='&' read -ra PARAMS <<< "$params"
-    for param in "${PARAMS[@]}"; do
-        local key="${param%%=*}"
-        local value="${param#*=}"
-        value=$(printf '%b' "${value//%/\\x}")  # URL 解码
-        case "$key" in
-            security) security="$value" ;;
-            type) type="$value" ;;
-            sni) sni="$value" ;;
-            pbk) pbk="$value" ;;
-            sid) sid="$value" ;;
-            flow) flow="$value" ;;
-            path) path="$value" ;;
-            host) host="$value" ;;
-            fp) fp="$value" ;;
-            encryption) encryption="$value" ;;
-            headerType) ;; # 忽略
-        esac
-    done
-    
-    # 确保 port 是纯数字，无效则报错
-    port=$(echo "$port" | tr -d '"' | tr -d ' ')
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption="" insecure="false"
+    if [[ -n "$params" ]]; then
+        local -a PARAMS=()
+        local param key value
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            [[ -z "$param" ]] && continue
+            key="${param%%=*}"
+            value=""
+            [[ "$param" == *"="* ]] && value="${param#*=}"
+            value=$(_urldecode "$value") || return 1
+            case "$key" in
+                security) security="$value" ;;
+                type) type="$value" ;;
+                sni) sni="$value" ;;
+                pbk) pbk="$value" ;;
+                sid) sid="$value" ;;
+                flow) flow="$value" ;;
+                path) path="$value" ;;
+                host) host="$value" ;;
+                fp) fp="$value" ;;
+                encryption) encryption="$value" ;;
+                allowInsecure|allow_insecure|insecure) insecure=$(_parse_insecure_flag "$value") ;;
+                headerType) ;; # 忽略
+            esac
+        done
+    fi
+
+    # 确保 port 是有效数字
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    
-    # 输出 JSON 格式 (使用 jq 确保正确转义，port 使用 argjson 存储为数字)
+    [[ -n "$server" && -n "$uuid" ]] || return 1
+    _reject_ctrl_fields "$server" "$uuid" "$security" "${type:-tcp}" "$sni" "$pbk" "$sid" "$flow" "$path" "$host" "${fp:-chrome}" "$encryption" || return 1
+    _valid_sub_network "${type:-tcp}" || return 1
+
+    # 输出 JSON 格式 (使用 jq 确保正确转义，port/insecure 使用 argjson)
     # 注意：字段名使用完整名称以便 gen_xray_chain_outbound 正确读取
     jq -nc \
         --arg type "vless" \
         --arg name "$name" \
         --arg server "$server" \
-        --argjson port "$port" \
+        --argjson port "$((10#$port))" \
         --arg uuid "$uuid" \
         --arg security "$security" \
         --arg transport "${type:-tcp}" \
@@ -21028,7 +21347,8 @@ parse_vless_link() {
         --arg host "$host" \
         --arg fingerprint "${fp:-chrome}" \
         --arg encryption "$encryption" \
-        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption}'
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption,insecure:$insecure}'
 }
 
 # 解析 vmess:// 链接
@@ -21036,44 +21356,52 @@ parse_vmess_link() {
     local link="$1"
     # vmess://base64(json)
     local content="${link#vmess://}"
-    local json=$(echo "$content" | base64 -d 2>/dev/null)
+    local json
+    json=$(printf '%s' "$content" | base64 -d 2>/dev/null)
     [[ -z "$json" ]] && return 1
-    
-    local name=$(echo "$json" | jq -r '.ps // .name // "VMess"')
-    local server=$(echo "$json" | jq -r '.add // .server')
-    local port=$(echo "$json" | jq -r '.port')
-    local uuid=$(echo "$json" | jq -r '.id // .uuid')
-    local aid=$(echo "$json" | jq -r '.aid // "0"')
-    local net=$(echo "$json" | jq -r '.net // "tcp"')
-    local type=$(echo "$json" | jq -r '.type // "none"')
-    local host=$(echo "$json" | jq -r '.host // ""')
-    local path=$(echo "$json" | jq -r '.path // ""')
-    local tls=$(echo "$json" | jq -r '.tls // ""')
-    local sni=$(echo "$json" | jq -r '.sni // ""')
-    
+    jq -e 'type == "object"' <<< "$json" >/dev/null 2>&1 || return 1
+
+    local name server port uuid aid net host path tls sni raw_insecure insecure
+    name=$(jq -r '.ps // .name // "VMess"' <<< "$json")
+    server=$(jq -r '.add // .server // empty' <<< "$json")
+    port=$(jq -r '.port // empty' <<< "$json")
+    uuid=$(jq -r '.id // .uuid // empty' <<< "$json")
+    aid=$(jq -r '.aid // "0"' <<< "$json")
+    net=$(jq -r '.net // "tcp"' <<< "$json")
+    host=$(jq -r '.host // ""' <<< "$json")
+    path=$(jq -r '.path // ""' <<< "$json")
+    tls=$(jq -r '.tls // ""' <<< "$json")
+    sni=$(jq -r '.sni // ""' <<< "$json")
+    raw_insecure=$(jq -r '.allowInsecure // .allow_insecure // .insecure // .["skip-cert-verify"] // false' <<< "$json")
+    insecure=$(_parse_insecure_flag "$raw_insecure")
+
     # 确保 port 和 aid 是数字
-    port=$(echo "$port" | tr -d '"' | tr -d ' ')
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    aid=$(echo "$aid" | tr -d '"' | tr -d ' ')
+    aid=$(printf '%s' "$aid" | tr -d '" ')
     [[ ! "$aid" =~ ^[0-9]+$ ]] && aid="0"
-    
-    # 使用 jq 生成 JSON，确保 port 和 aid 是数字
+    [[ -n "$server" && -n "$uuid" ]] || return 1
+    _reject_ctrl_fields "$server" "$uuid" "$net" "$host" "$path" "$tls" "$sni" || return 1
+    _valid_sub_network "${net:-tcp}" || return 1
+
+    # 使用 jq 生成 JSON，确保 port/aid/insecure 是严格类型
     jq -nc \
         --arg type "vmess" \
         --arg name "$name" \
         --arg server "$server" \
-        --argjson port "$port" \
+        --argjson port "$((10#$port))" \
         --arg uuid "$uuid" \
-        --argjson aid "$aid" \
-        --arg network "$net" \
+        --argjson aid "$((10#$aid))" \
+        --arg network "${net:-tcp}" \
         --arg host "$host" \
         --arg path "$path" \
         --arg tls "$tls" \
         --arg sni "$sni" \
-        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,aid:$aid,network:$network,host:$host,path:$path,tls:$tls,sni:$sni}'
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,aid:$aid,network:$network,host:$host,path:$path,tls:$tls,sni:$sni,insecure:$insecure}'
 }
 
 # 解析 trojan:// 链接
@@ -21081,48 +21409,70 @@ parse_trojan_link() {
     local link="$1"
     # trojan://password@server:port?params#name
     local content="${link#trojan://}"
-    local name="${content##*#}"
-    name=$(printf '%b' "${name//%/\\x}")  # URL 解码
-    content="${content%%#*}"
-    
+    local name="Trojan"
+    if [[ "$content" == *"#"* ]]; then
+        name=$(_urldecode "${content##*#}") || return 1
+        content="${content%%#*}"
+    fi
+    [[ "$content" == *"@"* ]] || return 1
+
     local password="${content%%@*}"
+    password=$(_urldecode "$password") || return 1
     content="${content#*@}"
-    
-    local server_port="${content%%\?*}"
+
+    local server_port="$content" params=""
+    if [[ "$content" == *"?"* ]]; then
+        server_port="${content%%\?*}"
+        params="${content#*\?}"
+    fi
     # 解析 host:port（支持 IPv6）
-    local parsed=$(_parse_hostport "$server_port")
+    local parsed
+    parsed=$(_parse_hostport "$server_port")
     local server="${parsed%%|*}"
     local port="${parsed##*|}"
-    
-    local params="${content#*\?}"
-    local sni="" type="tcp"
-    IFS='&' read -ra PARAMS <<< "$params"
-    for param in "${PARAMS[@]}"; do
-        local key="${param%%=*}"
-        local value="${param#*=}"
-        case "$key" in
-            sni) sni="$value" ;;
-            type) type="$value" ;;
-        esac
-    done
-    
-    # 确保 port 是数字
-    port=$(echo "$port" | tr -d '"' | tr -d ' ')
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+
+    local sni="" type="tcp" path="" host="" insecure="false"
+    if [[ -n "$params" ]]; then
+        local -a PARAMS=()
+        local param key value
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            [[ -z "$param" ]] && continue
+            key="${param%%=*}"
+            value=""
+            [[ "$param" == *"="* ]] && value="${param#*=}"
+            value=$(_urldecode "$value") || return 1
+            case "$key" in
+                sni) sni="$value" ;;
+                type) type="$value" ;;
+                path) path="$value" ;;
+                host) host="$value" ;;
+                allowInsecure|allow_insecure|insecure) insecure=$(_parse_insecure_flag "$value") ;;
+            esac
+        done
+    fi
+
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    
-    # 使用 jq 生成 JSON
+    [[ -n "$server" && -n "$password" ]] || return 1
+    _reject_ctrl_fields "$server" "$password" "$sni" "${type:-tcp}" "$path" "$host" || return 1
+    _valid_sub_network "${type:-tcp}" || return 1
+
     jq -nc \
         --arg type "trojan" \
         --arg name "$name" \
         --arg server "$server" \
-        --argjson port "$port" \
+        --argjson port "$((10#$port))" \
         --arg password "$password" \
         --arg sni "$sni" \
-        --arg transport "$type" \
-        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,transport:$transport}'
+        --arg transport "${type:-tcp}" \
+        --arg path "$path" \
+        --arg host "$host" \
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,transport:$transport,path:$path,host:$host,insecure:$insecure}'
 }
 
 # 解析 ss:// 链接
@@ -21131,53 +21481,62 @@ parse_ss_link() {
     # ss://base64(method:password)@server:port#name
     # 或 ss://base64(method:password@server:port)#name
     local content="${link#ss://}"
-    local name="${content##*#}"
-    name=$(printf '%b' "${name//%/\\x}")
-    content="${content%%#*}"
-    
+    local name="SS"
+    if [[ "$content" == *"#"* ]]; then
+        name=$(_urldecode "${content##*#}") || return 1
+        content="${content%%#*}"
+    fi
+    # 去掉可选 ?plugin=... 查询串以免污染 port
+    content="${content%%\?*}"
+
     local server="" port="" method="" password=""
-    
+
     if [[ "$content" == *"@"* ]]; then
-        # 格式: base64@server:port
+        # 格式: base64@server:port 或 method:password@server:port
         local encoded="${content%%@*}"
-        local decoded=$(echo "$encoded" | base64 -d 2>/dev/null)
+        local decoded
+        decoded=$(printf '%s' "$encoded" | base64 -d 2>/dev/null)
         if [[ "$decoded" == *":"* ]]; then
             method="${decoded%%:*}"
             password="${decoded#*:}"
+        elif [[ "$encoded" == *":"* ]]; then
+            method=$(_urldecode "${encoded%%:*}") || return 1
+            password=$(_urldecode "${encoded#*:}") || return 1
         fi
         local server_port="${content#*@}"
-        # 解析 host:port（支持 IPv6）
-        local parsed=$(_parse_hostport "$server_port")
+        local parsed
+        parsed=$(_parse_hostport "$server_port")
         server="${parsed%%|*}"
         port="${parsed##*|}"
     else
         # 格式: base64(全部)
-        local decoded=$(echo "$content" | base64 -d 2>/dev/null)
+        local decoded
+        decoded=$(printf '%s' "$content" | base64 -d 2>/dev/null)
         if [[ "$decoded" == *"@"* ]]; then
             local method_pass="${decoded%%@*}"
             method="${method_pass%%:*}"
             password="${method_pass#*:}"
             local server_port="${decoded#*@}"
-            # 解析 host:port（支持 IPv6）
-            local parsed=$(_parse_hostport "$server_port")
+            local parsed
+            parsed=$(_parse_hostport "$server_port")
             server="${parsed%%|*}"
             port="${parsed##*|}"
         fi
     fi
-    
-    # 确保 port 是数字
-    port=$(echo "$port" | tr -d '"' | tr -d ' ')
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    
-    # 使用 jq 生成 JSON
+    [[ -n "$server" && -n "$method" && -n "$password" ]] || return 1
+    _reject_ctrl_fields "$server" "$method" "$password" || return 1
+
     jq -nc \
         --arg type "ss" \
         --arg name "$name" \
         --arg server "$server" \
-        --argjson port "$port" \
+        --argjson port "$((10#$port))" \
         --arg method "$method" \
         --arg password "$password" \
         '{type:$type,name:$name,server:$server,port:$port,method:$method,password:$password}'
@@ -21189,47 +21548,138 @@ parse_hy2_link() {
     # hysteria2://password@server:port?params#name
     local content="${link#hysteria2://}"
     content="${content#hy2://}"
-    local name="${content##*#}"
-    name=$(printf '%b' "${name//%/\\x}")  # URL 解码
-    content="${content%%#*}"
-    
+    local name="Hysteria2"
+    if [[ "$content" == *"#"* ]]; then
+        name=$(_urldecode "${content##*#}") || return 1
+        content="${content%%#*}"
+    fi
+    [[ "$content" == *"@"* ]] || return 1
+
     local password="${content%%@*}"
+    password=$(_urldecode "$password") || return 1
     content="${content#*@}"
-    
-    local server_port="${content%%\?*}"
-    # 解析 host:port（支持 IPv6）
-    local parsed=$(_parse_hostport "$server_port")
+
+    local server_port="$content" params=""
+    if [[ "$content" == *"?"* ]]; then
+        server_port="${content%%\?*}"
+        params="${content#*\?}"
+    fi
+    local parsed
+    parsed=$(_parse_hostport "$server_port")
     local server="${parsed%%|*}"
     local port="${parsed##*|}"
-    
-    local params="${content#*\?}"
-    local sni="" insecure="1"
-    IFS='&' read -ra PARAMS <<< "$params"
-    for param in "${PARAMS[@]}"; do
-        local key="${param%%=*}"
-        local value="${param#*=}"
-        case "$key" in
-            sni) sni="$value" ;;
-            insecure) insecure="$value" ;;
-        esac
-    done
-    
-    # 确保 port 是数字
-    port=$(echo "$port" | tr -d '"' | tr -d ' ')
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+
+    local sni="" insecure="false"
+    if [[ -n "$params" ]]; then
+        local -a PARAMS=()
+        local param key value
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            [[ -z "$param" ]] && continue
+            key="${param%%=*}"
+            value=""
+            [[ "$param" == *"="* ]] && value="${param#*=}"
+            value=$(_urldecode "$value") || return 1
+            case "$key" in
+                sni) sni="$value" ;;
+                insecure|allowInsecure|allow_insecure) insecure=$(_parse_insecure_flag "$value") ;;
+            esac
+        done
+    fi
+
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    
-    # 使用 jq 生成 JSON
+    [[ -n "$server" && -n "$password" ]] || return 1
+    _reject_ctrl_fields "$server" "$password" "$sni" || return 1
+
     jq -nc \
         --arg type "hysteria2" \
         --arg name "$name" \
         --arg server "$server" \
-        --argjson port "$port" \
+        --argjson port "$((10#$port))" \
         --arg password "$password" \
         --arg sni "$sni" \
-        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,insecure:$insecure}'
+}
+
+# 解析 tuic:// 链接
+parse_tuic_link() {
+    local link="$1"
+    # tuic://uuid:password@server:port?params#name
+    local content="${link#tuic://}"
+    local name="TUIC"
+    if [[ "$content" == *"#"* ]]; then
+        name=$(_urldecode "${content##*#}") || return 1
+        content="${content%%#*}"
+    fi
+    [[ "$content" == *"@"* ]] || return 1
+
+    local userinfo="${content%%@*}"
+    content="${content#*@}"
+    local uuid="$userinfo" password=""
+    if [[ "$userinfo" == *":"* ]]; then
+        uuid="${userinfo%%:*}"
+        password="${userinfo#*:}"
+    fi
+    uuid=$(_urldecode "$uuid") || return 1
+    password=$(_urldecode "$password") || return 1
+
+    local server_port="$content" params=""
+    if [[ "$content" == *"?"* ]]; then
+        server_port="${content%%\?*}"
+        params="${content#*\?}"
+    fi
+    local parsed
+    parsed=$(_parse_hostport "$server_port")
+    local server="${parsed%%|*}"
+    local port="${parsed##*|}"
+
+    local sni="" alpn="h3" cc="bbr" udp_mode="native" insecure="false"
+    if [[ -n "$params" ]]; then
+        local -a PARAMS=()
+        local param key value
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            [[ -z "$param" ]] && continue
+            key="${param%%=*}"
+            value=""
+            [[ "$param" == *"="* ]] && value="${param#*=}"
+            value=$(_urldecode "$value") || return 1
+            case "$key" in
+                sni) sni="$value" ;;
+                alpn) alpn="$value" ;;
+                congestion_control) cc="$value" ;;
+                udp_relay_mode) udp_mode="$value" ;;
+                allow_insecure|allowInsecure|insecure) insecure=$(_parse_insecure_flag "$value") ;;
+            esac
+        done
+    fi
+
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
+        echo "错误: 无法解析端口号 '$port'" >&2
+        return 1
+    fi
+    [[ -n "$server" && -n "$uuid" ]] || return 1
+    _reject_ctrl_fields "$server" "$uuid" "$password" "$sni" "$alpn" "$cc" "$udp_mode" || return 1
+
+    jq -nc \
+        --arg type "tuic" \
+        --arg name "$name" \
+        --arg server "$server" \
+        --argjson port "$((10#$port))" \
+        --arg uuid "$uuid" \
+        --arg password "$password" \
+        --arg sni "$sni" \
+        --arg alpn "$alpn" \
+        --arg congestion_control "$cc" \
+        --arg udp_relay_mode "$udp_mode" \
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,password:$password,sni:$sni,alpn:$alpn,congestion_control:$congestion_control,udp_relay_mode:$udp_relay_mode,insecure:$insecure}'
 }
 
 # 解析 anytls:// 链接
@@ -21237,46 +21687,62 @@ parse_anytls_link() {
     local link="$1"
     # anytls://password@server:port?sni=xxx#name
     local content="${link#anytls://}"
-    local name="${content##*#}"
-    name=$(printf '%b' "${name//%/\\x}")
-    content="${content%%#*}"
-    
+    local name="AnyTLS"
+    if [[ "$content" == *"#"* ]]; then
+        name=$(_urldecode "${content##*#}") || return 1
+        content="${content%%#*}"
+    fi
+    [[ "$content" == *"@"* ]] || return 1
+
     local password="${content%%@*}"
+    password=$(_urldecode "$password") || return 1
     content="${content#*@}"
-    
-    local server_port="${content%%\?*}"
-    # 解析 host:port（支持 IPv6）
-    local parsed=$(_parse_hostport "$server_port")
+
+    local server_port="$content" params=""
+    if [[ "$content" == *"?"* ]]; then
+        server_port="${content%%\?*}"
+        params="${content#*\?}"
+    fi
+    local parsed
+    parsed=$(_parse_hostport "$server_port")
     local server="${parsed%%|*}"
     local port="${parsed##*|}"
-    
-    local params="${content#*\?}"
-    local sni=""
-    IFS='&' read -ra PARAMS <<< "$params"
-    for param in "${PARAMS[@]}"; do
-        local key="${param%%=*}"
-        local value="${param#*=}"
-        case "$key" in
-            sni) sni="$value" ;;
-        esac
-    done
-    
-    # 确保 port 是数字
-    port=$(echo "$port" | tr -d '"' | tr -d ' ')
-    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+
+    local sni="" insecure="false"
+    if [[ -n "$params" ]]; then
+        local -a PARAMS=()
+        local param key value
+        IFS='&' read -ra PARAMS <<< "$params"
+        for param in "${PARAMS[@]}"; do
+            [[ -z "$param" ]] && continue
+            key="${param%%=*}"
+            value=""
+            [[ "$param" == *"="* ]] && value="${param#*=}"
+            value=$(_urldecode "$value") || return 1
+            case "$key" in
+                sni) sni="$value" ;;
+                allowInsecure|allow_insecure|insecure) insecure=$(_parse_insecure_flag "$value") ;;
+            esac
+        done
+    fi
+
+    port=$(printf '%s' "$port" | tr -d '" ')
+    if ! _valid_sub_port "$port"; then
         echo "错误: 无法解析端口号 '$port'" >&2
         return 1
     fi
-    
-    # 使用 jq 生成 JSON
+    [[ -n "$server" && -n "$password" ]] || return 1
+    _reject_ctrl_fields "$server" "$password" "$sni" || return 1
+
     jq -nc \
         --arg type "anytls" \
         --arg name "$name" \
         --arg server "$server" \
-        --argjson port "$port" \
+        --argjson port "$((10#$port))" \
         --arg password "$password" \
         --arg sni "$sni" \
-        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni}'
+        --argjson insecure "$insecure" \
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,insecure:$insecure}'
 }
 
 # 解析任意分享链接
@@ -21288,6 +21754,7 @@ parse_share_link() {
         trojan://*) parse_trojan_link "$link" ;;
         ss://*) parse_ss_link "$link" ;;
         hysteria2://*|hy2://*) parse_hy2_link "$link" ;;
+        tuic://*) parse_tuic_link "$link" ;;
         anytls://*) parse_anytls_link "$link" ;;
         *) echo "" ;;
     esac
@@ -21296,146 +21763,487 @@ parse_share_link() {
 # 从分享链接提取节点名称
 get_link_name() {
     local link="$1"
-    local name="${link##*#}"
-    name=$(printf '%b' "${name//%/\\x}")
-    [[ -z "$name" || "$name" == "$link" ]] && name="未命名节点"
-    echo "$name"
+    local name="未命名节点"
+    if [[ "$link" == *"#"* ]]; then
+        local raw="${link##*#}"
+        name=$(_urldecode "$raw" 2>/dev/null) || name="$raw"
+        name="${name//$'\r'/}"
+        name="${name//$'\n'/}"
+    fi
+    [[ -z "$name" ]] && name="未命名节点"
+    printf '%s\n' "$name"
 }
 
-# 拉取订阅内容
-fetch_subscription() {
-    local url="$1"
-    local content=$(curl -sL --connect-timeout 10 --max-time 30 "$url" 2>/dev/null)
-    [[ -z "$content" ]] && return 1
-    
-    # 尝试 Base64 解码
-    local decoded=$(echo "$content" | base64 -d 2>/dev/null)
-    if [[ -n "$decoded" && "$decoded" == *"://"* ]]; then
-        echo "$decoded"
-        return 0
-    fi
-    
-    # 检查是否是 Clash YAML
-    if [[ "$content" == *"proxies:"* ]]; then
-        # 解析 Clash YAML 节点，转换为分享链接
-        local links=""
-        local in_proxies=false
-        local current_proxy=""
-        local name="" type="" server="" port="" uuid="" password="" method=""
-        local network="" tls="" sni="" path="" host="" flow="" pbk="" sid=""
-        
-        while IFS= read -r line || [[ -n "$line" ]]; do
-            # 检测 proxies 段
-            if [[ "$line" =~ ^proxies: ]]; then
-                in_proxies=true
-                continue
+# 单一规范化 Clash 节点导出器（消除循环中间节点与末节点两套逻辑分叉）：
+#   - 精确区分 VLESS Reality（pbk 非空）与普通 VLESS TLS（tls=true 但无 pbk）与无 TLS；
+#   - 保留 skip-cert-verify 策略（默认不跳过校验）；
+#   - VMess 使用 jq -nc 严格序列化 JSON（禁止手工字符串拼 JSON）；
+#   - 支持 vless/vmess/trojan/ss/hysteria2/tuic/anytls，未支持类型告警而非静默改协议。
+_clash_emit_proxy_link() {
+    local name="$1" type="$2" server="$3" port="$4" uuid="$5" password="$6" method="$7"
+    local network="$8" tls="$9" sni="${10}" path="${11}" host="${12}" flow="${13}" pbk="${14}" sid="${15}"
+    local scv="${16}" fp="${17}" alpn="${18}" cc="${19}" udp_mode="${20}"
+
+    [[ -n "$name" && -n "$type" && -n "$server" && -n "$port" ]] || return 1
+    _valid_sub_port "$port" || return 1
+    _reject_ctrl_fields "$server" "$uuid" "$password" "$method" "${network:-tcp}" "$sni" "$path" "$host" "$flow" "$pbk" "$sid" "$fp" "$alpn" "$cc" "$udp_mode" || return 1
+    name="${name//$'\r'/}"
+    name="${name//$'\n'/}"
+
+    local hp
+    hp=$(_fmt_hostport "$server" "$((10#$port))")
+    local net="${network:-tcp}"
+    local insecure
+    insecure=$(_parse_insecure_flag "$scv")
+    local t_low
+    t_low=$(printf '%s' "$type" | tr '[:upper:]' '[:lower:]')
+    local tls_low
+    tls_low=$(printf '%s' "$tls" | tr '[:upper:]' '[:lower:]')
+
+    case "$t_low" in
+        vless)
+            [[ -n "$uuid" ]] || return 1
+            _valid_sub_network "$net" || return 1
+            local link="vless://$(urlencode "$uuid")@${hp}?encryption=none&type=$(urlencode "$net")"
+            [[ -n "$flow" ]] && link+="&flow=$(urlencode "$flow")"
+            if [[ -n "$pbk" ]]; then
+                link+="&security=reality&sni=$(urlencode "$sni")&fp=$(urlencode "${fp:-chrome}")&pbk=$(urlencode "$pbk")&sid=$(urlencode "$sid")"
+            elif [[ "$tls_low" == "true" || "$tls_low" == "1" ]]; then
+                link+="&security=tls&sni=$(urlencode "$sni")"
+                [[ "$insecure" == "true" ]] && link+="&allowInsecure=1"
+            else
+                link+="&security=none"
             fi
-            
-            # 检测离开 proxies 段
-            if [[ "$in_proxies" == "true" && "$line" =~ ^[a-z-]+: && ! "$line" =~ ^[[:space:]] ]]; then
-                in_proxies=false
+            if [[ "$net" == "ws" ]]; then
+                [[ -n "$path" ]] && link+="&path=$(urlencode "$path")"
+                [[ -n "$host" ]] && link+="&host=$(urlencode "$host")"
             fi
-            
-            [[ "$in_proxies" != "true" ]] && continue
-            
-            # 新节点开始
-            if [[ "$line" =~ ^[[:space:]]*-[[:space:]]*name: ]]; then
-                # 保存上一个节点
-                if [[ -n "$name" && -n "$type" && -n "$server" && -n "$port" ]]; then
-                    case "$type" in
-                        vless)
-                            local link="vless://${uuid}@${server}:${port}?encryption=none"
-                            [[ -n "$flow" ]] && link+="&flow=$flow"
-                            [[ "$tls" == "true" ]] && link+="&security=reality&type=${network:-tcp}&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid" || link+="&security=none&type=${network:-tcp}"
-                            [[ "$network" == "ws" ]] && link+="&type=ws&path=$(urlencode "$path")&host=$host"
-                            link+="#$(urlencode "$name")"
-                            links+="$link"$'\n'
-                            ;;
-                        vmess)
-                            local vmess_json="{\"v\":\"2\",\"ps\":\"$name\",\"add\":\"$server\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"${network:-tcp}\",\"type\":\"none\",\"host\":\"$host\",\"path\":\"$path\",\"tls\":\"$([[ "$tls" == "true" ]] && echo "tls" || echo "")\",\"sni\":\"$sni\"}"
-                            links+="vmess://$(echo -n "$vmess_json" | base64 -w 0)"$'\n'
-                            ;;
-                        trojan)
-                            links+="trojan://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
-                            ;;
-                        ss)
-                            local ss_encoded=$(echo -n "${method}:${password}" | base64 -w 0)
-                            links+="ss://${ss_encoded}@${server}:${port}#$(urlencode "$name")"$'\n'
-                            ;;
-                        hysteria2)
-                            links+="hysteria2://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
-                            ;;
-                        tuic)
-                            links+="tuic://${uuid}:${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
-                            ;;
-                    esac
-                fi
-                # 重置变量
-                name="" type="" server="" port="" uuid="" password="" method=""
-                network="" tls="" sni="" path="" host="" flow="" pbk="" sid=""
-                name=$(echo "$line" | sed 's/.*name:[[:space:]]*"\?\([^"]*\)"\?.*/\1/')
-                continue
+            link+="#$(urlencode "$name")"
+            printf '%s\n' "$link"
+            ;;
+        vmess)
+            [[ -n "$uuid" ]] || return 1
+            _valid_sub_network "$net" || return 1
+            local v_tls=""
+            [[ "$tls_low" == "true" || "$tls_low" == "1" || "$tls_low" == "tls" ]] && v_tls="tls"
+            local vmess_json
+            vmess_json=$(jq -nc \
+                --arg ps "$name" \
+                --arg add "$server" \
+                --arg port "$((10#$port))" \
+                --arg id "$uuid" \
+                --arg net "$net" \
+                --arg host "$host" \
+                --arg path "$path" \
+                --arg tls "$v_tls" \
+                --arg sni "$sni" \
+                --argjson allowInsecure "$insecure" \
+                '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:$net,type:"none",host:$host,path:$path,tls:$tls,sni:$sni,allowInsecure:$allowInsecure}') || return 1
+            printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 -w 0 2>/dev/null || printf '%s' "$vmess_json" | base64 | tr -d '\n')"
+            ;;
+        trojan)
+            [[ -n "$password" ]] || return 1
+            local link="trojan://$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")&type=$(urlencode "$net")"
+            if [[ "$net" == "ws" ]]; then
+                [[ -n "$path" ]] && link+="&path=$(urlencode "$path")"
+                [[ -n "$host" ]] && link+="&host=$(urlencode "$host")"
             fi
-            
-            # 解析属性 (去掉引号)
-            _strip_quotes() { local v="$1"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"; echo "$v"; }
-            [[ "$line" =~ ^[[:space:]]*type:[[:space:]]*(.*) ]] && type=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*server:[[:space:]]*(.*) ]] && server=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*port:[[:space:]]*(.*) ]] && port=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*uuid:[[:space:]]*(.*) ]] && uuid=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*password:[[:space:]]*(.*) ]] && password=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*cipher:[[:space:]]*(.*) ]] && method=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*network:[[:space:]]*(.*) ]] && network=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*tls:[[:space:]]*(.*) ]] && tls=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*sni:[[:space:]]*(.*) ]] && sni=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*servername:[[:space:]]*(.*) ]] && sni=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*flow:[[:space:]]*(.*) ]] && flow=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*path:[[:space:]]*(.*) ]] && path=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*Host:[[:space:]]*(.*) ]] && host=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*public-key:[[:space:]]*(.*) ]] && pbk=$(_strip_quotes "${BASH_REMATCH[1]}")
-            [[ "$line" =~ ^[[:space:]]*short-id:[[:space:]]*(.*) ]] && sid=$(_strip_quotes "${BASH_REMATCH[1]}")
-        done <<< "$content"
-        
-        # 处理最后一个节点
-        if [[ -n "$name" && -n "$type" && -n "$server" && -n "$port" ]]; then
-            case "$type" in
-                vless)
-                    local link="vless://${uuid}@${server}:${port}?encryption=none"
-                    [[ -n "$flow" ]] && link+="&flow=$flow"
-                    [[ "$tls" == "true" ]] && link+="&security=reality&type=${network:-tcp}&sni=$sni&fp=chrome&pbk=$pbk&sid=$sid" || link+="&security=none&type=${network:-tcp}"
-                    link+="#$(urlencode "$name")"
-                    links+="$link"$'\n'
-                    ;;
-                vmess)
-                    local vmess_json="{\"v\":\"2\",\"ps\":\"$name\",\"add\":\"$server\",\"port\":\"$port\",\"id\":\"$uuid\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"${network:-tcp}\",\"type\":\"none\",\"host\":\"$host\",\"path\":\"$path\",\"tls\":\"$([[ "$tls" == "true" ]] && echo "tls" || echo "")\",\"sni\":\"$sni\"}"
-                    links+="vmess://$(echo -n "$vmess_json" | base64 -w 0)"$'\n'
-                    ;;
-                trojan)
-                    links+="trojan://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
-                    ;;
-                ss)
-                    local ss_encoded=$(echo -n "${method}:${password}" | base64 -w 0)
-                    links+="ss://${ss_encoded}@${server}:${port}#$(urlencode "$name")"$'\n'
-                    ;;
-                hysteria2)
-                    links+="hysteria2://${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
-                    ;;
-                tuic)
-                    links+="tuic://${uuid}:${password}@${server}:${port}?sni=$sni#$(urlencode "$name")"$'\n'
-                    ;;
-            esac
-        fi
-        
-        [[ -n "$links" ]] && echo "$links" && return 0
+            [[ "$insecure" == "true" ]] && link+="&allowInsecure=1"
+            link+="#$(urlencode "$name")"
+            printf '%s\n' "$link"
+            ;;
+        ss)
+            [[ -n "$method" && -n "$password" ]] || return 1
+            local ss_encoded
+            ss_encoded=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64 | tr -d '\n')
+            printf 'ss://%s@%s#%s\n' "$ss_encoded" "$hp" "$(urlencode "$name")"
+            ;;
+        hysteria2)
+            [[ -n "$password" ]] || return 1
+            local link="hysteria2://$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")"
+            [[ "$insecure" == "true" ]] && link+="&insecure=1"
+            link+="#$(urlencode "$name")"
+            printf '%s\n' "$link"
+            ;;
+        tuic)
+            [[ -n "$uuid" ]] || return 1
+            local link="tuic://$(urlencode "$uuid"):$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")&alpn=$(urlencode "${alpn:-h3}")&congestion_control=$(urlencode "${cc:-bbr}")&udp_relay_mode=$(urlencode "${udp_mode:-native}")"
+            [[ "$insecure" == "true" ]] && link+="&allow_insecure=1"
+            link+="#$(urlencode "$name")"
+            printf '%s\n' "$link"
+            ;;
+        anytls)
+            [[ -n "$password" ]] || return 1
+            local link="anytls://$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")"
+            [[ "$insecure" == "true" ]] && link+="&allowInsecure=1"
+            link+="#$(urlencode "$name")"
+            printf '%s\n' "$link"
+            ;;
+        *)
+            _warn "跳过不支持的 Clash 节点类型: $type ($name)" >&2
+            return 1
+            ;;
+    esac
+}
+
+# 将 Clash YAML 的 proxies 段扁平化为标准记录（支持任意键顺序的块映射、嵌套 ws-opts/reality-opts/headers、
+# 以及单行/多行 flow mapping `- { ... }`；内置别名与节点数量上限以防 YAML 炸弹）。
+_flatten_clash_yaml_proxies() {
+    awk '
+    function trim(s) {
+        sub(/^[ \t\r\n]+/, "", s)
+        sub(/[ \t\r\n]+$/, "", s)
+        return s
+    }
+    function strip_comment(s,    i, n, ch, in_sq, in_dq, esc, prev) {
+        n = length(s); in_sq = 0; in_dq = 0; esc = 0
+        for (i = 1; i <= n; i++) {
+            ch = substr(s, i, 1)
+            if (in_dq) {
+                if (esc) { esc = 0; continue }
+                if (ch == "\\") { esc = 1; continue }
+                if (ch == "\"") in_dq = 0
+            } else if (in_sq) {
+                if (ch == "\x27") {
+                    if (substr(s, i + 1, 1) == "\x27") { i++; continue }
+                    in_sq = 0
+                }
+            } else {
+                if (ch == "\"") in_dq = 1
+                else if (ch == "\x27") in_sq = 1
+                else if (ch == "#") {
+                    prev = (i > 1) ? substr(s, i - 1, 1) : " "
+                    if (i == 1 || prev == " " || prev == "\t") {
+                        return trim(substr(s, 1, i - 1))
+                    }
+                }
+            }
+        }
+        return trim(s)
+    }
+    function unquote(s,    n, i, ch, out, nx) {
+        s = trim(s)
+        n = length(s)
+        if (n >= 2 && substr(s, 1, 1) == "\"" && substr(s, n, 1) == "\"") {
+            out = ""
+            for (i = 2; i < n; i++) {
+                ch = substr(s, i, 1)
+                if (ch == "\\" && i + 1 < n) {
+                    i++
+                    nx = substr(s, i, 1)
+                    if (nx == "n") out = out "\n"
+                    else if (nx == "r") out = out "\r"
+                    else if (nx == "t") out = out "\t"
+                    else if (nx == "\"" || nx == "\\" || nx == "/") out = out nx
+                    else out = out "\\" nx
+                } else {
+                    out = out ch
+                }
+            }
+            return out
+        }
+        if (n >= 2 && substr(s, 1, 1) == "\x27" && substr(s, n, 1) == "\x27") {
+            s = substr(s, 2, n - 2)
+            gsub(/\x27\x27/, "\x27", s)
+            return s
+        }
+        return s
+    }
+    function emit_kv(k, v) {
+        k = unquote(trim(k))
+        if (k == "") return
+        # 剔除数组括号（如 alpn: [h3] -> h3）
+        v = trim(v)
+        if (substr(v, 1, 1) == "[" && substr(v, length(v), 1) == "]") {
+            v = trim(substr(v, 2, length(v) - 2))
+            sub(/,.*$/, "", v)
+        }
+        v = unquote(v)
+        printf "%s\t%s\n", k, v
+    }
+    function parse_flow_map(body,    i, n, ch, in_sq, in_dq, esc, depth, bdepth, start, seg, ci, k, v, c_in_sq, c_in_dq, c_esc, c_ch, j, m) {
+        body = trim(body)
+        if (substr(body, 1, 1) == "{") body = substr(body, 2)
+        if (substr(body, length(body), 1) == "}") body = substr(body, 1, length(body) - 1)
+        n = length(body)
+        in_sq = 0; in_dq = 0; esc = 0; depth = 0; bdepth = 0; start = 1
+        for (i = 1; i <= n + 1; i++) {
+            ch = (i <= n) ? substr(body, i, 1) : ","
+            if (i <= n) {
+                if (in_dq) {
+                    if (esc) { esc = 0; continue }
+                    if (ch == "\\") { esc = 1; continue }
+                    if (ch == "\"") in_dq = 0
+                    continue
+                }
+                if (in_sq) {
+                    if (ch == "\x27") {
+                        if (substr(body, i + 1, 1) == "\x27") { i++; continue }
+                        in_sq = 0
+                    }
+                    continue
+                }
+                if (ch == "\"") { in_dq = 1; continue }
+                if (ch == "\x27") { in_sq = 1; continue }
+                if (ch == "{") { depth++; continue }
+                if (ch == "}") { if (depth > 0) depth--; continue }
+                if (ch == "[") { bdepth++; continue }
+                if (ch == "]") { if (bdepth > 0) bdepth--; continue }
+            }
+            if (ch == "," && depth == 0 && bdepth == 0) {
+                seg = trim(substr(body, start, i - start))
+                start = i + 1
+                if (seg == "") continue
+                # 在未加引号处找第一个冒号
+                ci = 0; c_in_sq = 0; c_in_dq = 0; c_esc = 0; m = length(seg)
+                for (j = 1; j <= m; j++) {
+                    c_ch = substr(seg, j, 1)
+                    if (c_in_dq) {
+                        if (c_esc) { c_esc = 0; continue }
+                        if (c_ch == "\\") { c_esc = 1; continue }
+                        if (c_ch == "\"") c_in_dq = 0
+                    } else if (c_in_sq) {
+                        if (c_ch == "\x27") {
+                            if (substr(seg, j + 1, 1) == "\x27") { j++; continue }
+                            c_in_sq = 0
+                        }
+                    } else {
+                        if (c_ch == "\"") c_in_dq = 1
+                        else if (c_ch == "\x27") c_in_sq = 1
+                        else if (c_ch == ":") { ci = j; break }
+                    }
+                }
+                if (ci > 1) {
+                    k = trim(substr(seg, 1, ci - 1))
+                    v = trim(substr(seg, ci + 1))
+                    if (substr(v, 1, 1) == "{" && substr(v, length(v), 1) == "}") {
+                        parse_flow_map(v)
+                    } else {
+                        emit_kv(k, v)
+                    }
+                }
+            }
+        }
+    }
+    function split_block_kv(s,    j, m, ch, in_sq, in_dq, esc, ci, k, v) {
+        s = strip_comment(s)
+        if (s == "") return
+        ci = 0; in_sq = 0; in_dq = 0; esc = 0; m = length(s)
+        for (j = 1; j <= m; j++) {
+            ch = substr(s, j, 1)
+            if (in_dq) {
+                if (esc) { esc = 0; continue }
+                if (ch == "\\") { esc = 1; continue }
+                if (ch == "\"") in_dq = 0
+            } else if (in_sq) {
+                if (ch == "\x27") {
+                    if (substr(s, j + 1, 1) == "\x27") { j++; continue }
+                    in_sq = 0
+                }
+            } else {
+                if (ch == "\"") in_dq = 1
+                else if (ch == "\x27") in_sq = 1
+                else if (ch == ":" && (j == m || substr(s, j + 1, 1) == " " || substr(s, j + 1, 1) == "\t")) {
+                    ci = j; break
+                }
+            }
+        }
+        if (ci > 1) {
+            k = trim(substr(s, 1, ci - 1))
+            v = trim(substr(s, ci + 1))
+            if (substr(v, 1, 1) == "{" && substr(v, length(v), 1) == "}") {
+                parse_flow_map(v)
+            } else if (v != "") {
+                emit_kv(k, v)
+            }
+        }
+    }
+    BEGIN { in_proxies = 0; items = 0; aliases = 0; in_flow = 0; flow_buf = ""; flow_depth = 0 }
+    {
+        sub(/\r$/, "", $0)
+        # 统计 YAML 别名引用防止别名炸弹
+        tmp = $0
+        while (match(tmp, /(^|[ \t,\[{])\*[A-Za-z0-9_-]+/)) {
+            aliases++
+            if (aliases > 50) exit 2
+            tmp = substr(tmp, RSTART + RLENGTH)
+        }
+        if ($0 ~ /^proxies:[ \t]*(#.*)?$/) {
+            in_proxies = 1
+            next
+        }
+        if (in_proxies && $0 ~ /^[A-Za-z0-9_-]+:/ && $0 !~ /^[ \t]/) {
+            in_proxies = 0
+            in_flow = 0
+            next
+        }
+        if (!in_proxies) next
+        if ($0 ~ /^[ \t]*(#.*)?$/) next
+
+        if (in_flow) {
+            flow_buf = flow_buf " " strip_comment($0)
+            if (index($0, "}") > 0) {
+                # 检查花括号是否配平
+                n = length(flow_buf); fd = 0; isq = 0; idq = 0; iesc = 0
+                for (i = 1; i <= n; i++) {
+                    c = substr(flow_buf, i, 1)
+                    if (idq) { if (iesc) iesc=0; else if (c=="\\") iesc=1; else if (c=="\"") idq=0 }
+                    else if (isq) { if (c=="\x27") isq=0 }
+                    else { if (c=="\"") idq=1; else if (c=="\x27") isq=1; else if (c=="{") fd++; else if (c=="}") fd-- }
+                }
+                if (fd <= 0) {
+                    parse_flow_map(flow_buf)
+                    in_flow = 0; flow_buf = ""
+                }
+            }
+            next
+        }
+
+        if ($0 ~ /^[ \t]*-[ \t]+/) {
+            items++
+            if (items > 2000) exit 3
+            print "---ITEM---"
+            rest = $0
+            sub(/^[ \t]*-[ \t]+/, "", rest)
+            rest = strip_comment(rest)
+            if (substr(rest, 1, 1) == "{") {
+                # 判断单行还是多行 flow mapping
+                n = length(rest); fd = 0; isq = 0; idq = 0; iesc = 0
+                for (i = 1; i <= n; i++) {
+                    c = substr(rest, i, 1)
+                    if (idq) { if (iesc) iesc=0; else if (c=="\\") iesc=1; else if (c=="\"") idq=0 }
+                    else if (isq) { if (c=="\x27") isq=0 }
+                    else { if (c=="\"") idq=1; else if (c=="\x27") isq=1; else if (c=="{") fd++; else if (c=="}") fd-- }
+                }
+                if (fd <= 0) {
+                    parse_flow_map(rest)
+                } else {
+                    in_flow = 1; flow_buf = rest
+                }
+            } else {
+                split_block_kv(rest)
+            }
+            next
+        }
+        split_block_kv($0)
+    }
+    '
+}
+
+# 解析 Clash YAML 文本并输出标准化分享链接列表
+_parse_clash_yaml_proxies() {
+    local content="$1"
+    local flat_rc=0 flat=""
+    flat=$(printf '%s\n' "$content" | _flatten_clash_yaml_proxies) || flat_rc=$?
+    if [[ $flat_rc -eq 2 ]]; then
+        _err "Clash 订阅包含过多 YAML 别名引用，已拒绝解析" >&2
+        return 1
+    elif [[ $flat_rc -eq 3 ]]; then
+        _err "Clash 订阅节点数超过安全上限 (2000)，已拒绝解析" >&2
+        return 1
+    elif [[ $flat_rc -ne 0 ]]; then
         return 1
     fi
-    
-    # 原样返回（可能已经是链接列表）
-    if [[ "$content" == *"://"* ]]; then
-        echo "$content"
+
+    local links="" has_item=0
+    local name="" type="" server="" port="" uuid="" password="" method=""
+    local network="" tls="" sni="" path="" host="" flow="" pbk="" sid=""
+    local scv="" fp="" alpn="" cc="" udp_mode=""
+    local line k v emitted
+
+    _flush_clash_item() {
+        [[ $has_item -eq 1 ]] || return 0
+        if emitted=$(_clash_emit_proxy_link "$name" "$type" "$server" "$port" "$uuid" "$password" "$method" \
+            "$network" "$tls" "$sni" "$path" "$host" "$flow" "$pbk" "$sid" "$scv" "$fp" "$alpn" "$cc" "$udp_mode"); then
+            [[ -n "$emitted" ]] && links+="$emitted"$'\n'
+        fi
+        name=""; type=""; server=""; port=""; uuid=""; password=""; method=""
+        network=""; tls=""; sni=""; path=""; host=""; flow=""; pbk=""; sid=""
+        scv=""; fp=""; alpn=""; cc=""; udp_mode=""
+        has_item=0
+    }
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "---ITEM---" ]]; then
+            _flush_clash_item
+            has_item=1
+            continue
+        fi
+        [[ $has_item -eq 1 && "$line" == *$'\t'* ]] || continue
+        k="${line%%$'\t'*}"
+        v="${line#*$'\t'}"
+        case "$k" in
+            name) name="$v" ;;
+            type) type="$v" ;;
+            server) server="$v" ;;
+            port) port="$v" ;;
+            uuid) uuid="$v" ;;
+            password) password="$v" ;;
+            cipher) method="$v" ;;
+            network) network="$v" ;;
+            tls) tls="$v" ;;
+            sni|servername) sni="$v" ;;
+            flow) flow="$v" ;;
+            path) path="$v" ;;
+            Host|host) host="$v" ;;
+            public-key) pbk="$v" ;;
+            short-id) sid="$v" ;;
+            skip-cert-verify) scv="$v" ;;
+            client-fingerprint) fp="$v" ;;
+            alpn) alpn="$v" ;;
+            congestion-controller) cc="$v" ;;
+            udp-relay-mode) udp_mode="$v" ;;
+        esac
+    done <<< "$flat"
+    _flush_clash_item
+
+    [[ -n "$links" ]] || return 1
+    printf '%s' "$links"
+    return 0
+}
+
+# 拉取订阅内容（通过 stdin config 传递 URL，禁止 URL/token 进入进程参数；限制协议/重定向/响应体大小）
+fetch_subscription() {
+    local url="$1"
+    # 仅允许 http/https 且不含空白与控制字符，避免参数/协议注入
+    if [[ ! "$url" =~ ^https?:// ]] || _has_ctrl_chars "$url" || [[ "$url" =~ [[:space:]] ]]; then
+        _err "无效或不安全的订阅 URL" >&2
+        return 1
+    fi
+
+    local quoted_url content
+    quoted_url=$(jq -Rn --arg u "$url" '$u') || return 1
+    content=$(printf 'url = %s\n' "$quoted_url" | curl -sSL \
+        --proto '=http,https' --proto-redir '=http,https' \
+        --max-redirs 5 --max-filesize 2097152 \
+        --connect-timeout 10 --max-time 30 \
+        -K - 2>/dev/null) || return 1
+    [[ -z "$content" ]] && return 1
+    if (( ${#content} > 2097152 )); then
+        _err "订阅内容超过大小上限 (2 MiB)，已拒绝解析" >&2
+        return 1
+    fi
+
+    # 尝试 Base64 解码
+    local decoded
+    decoded=$(printf '%s' "$content" | base64 -d 2>/dev/null)
+    if [[ -n "$decoded" && "$decoded" == *"://"* ]]; then
+        printf '%s\n' "$decoded"
         return 0
     fi
-    
+
+    # 检查是否是 Clash YAML
+    if [[ "$content" == *"proxies:"* ]]; then
+        _parse_clash_yaml_proxies "$content" && return 0
+        return 1
+    fi
+
+    # 原样返回（可能已经是链接列表）
+    if [[ "$content" == *"://"* ]]; then
+        printf '%s\n' "$content"
+        return 0
+    fi
+
     return 1
 }
 
@@ -21443,24 +22251,28 @@ fetch_subscription() {
 refresh_external_subs() {
     [[ ! -f "$EXTERNAL_SUBS_FILE" ]] && return 0
     
-    mkdir -p "$EXTERNAL_CACHE_DIR"
+    mkdir -p -m 700 "$EXTERNAL_CACHE_DIR"
     local count=0
     local idx=0
     
     while IFS= read -r url || [[ -n "$url" ]]; do
         [[ -z "$url" || "$url" == \#* ]] && continue
         ((idx++))
+        local masked_url
+        masked_url=$(_redact_url "$url")
         
-        _info "拉取订阅 $idx: $url"
-        local content=$(fetch_subscription "$url")
+        _info "拉取订阅 #$idx ($masked_url)"
+        local content
+        content=$(fetch_subscription "$url")
         
         if [[ -n "$content" ]]; then
-            echo "$content" > "$EXTERNAL_CACHE_DIR/sub_$idx.txt"
-            local node_count=$(echo "$content" | grep -c '://' || echo 0)
-            _ok "获取 $node_count 个节点"
+            ( umask 077; printf '%s\n' "$content" > "$EXTERNAL_CACHE_DIR/sub_$idx.txt" )
+            local node_count
+            node_count=$(printf '%s\n' "$content" | grep -c '://' || echo 0)
+            _ok "订阅 #$idx 获取 $node_count 个节点"
             ((count+=node_count))
         else
-            _warn "拉取失败: $url"
+            _warn "拉取失败: 订阅 #$idx ($masked_url)"
         fi
     done < "$EXTERNAL_SUBS_FILE"
     
@@ -21508,224 +22320,389 @@ _sanitize_sub_scalar() {
 
 external_link_to_clash() {
     local link="$1"
-    local json=$(parse_share_link "$link")
-    [[ -z "$json" ]] && return
-    
-    local type=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.type')")
-    local name=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.name')")
-    local server=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.server')")
-    local port=$(echo "$json" | jq -r '.port')
-    [[ "$port" =~ ^[0-9]+$ ]] || return
-    
+    local json
+    json=$(parse_share_link "$link")
+    [[ -z "$json" ]] && return 1
+
+    local type name server port insecure
+    type=$(jq -r '.type // empty' <<< "$json")
+    name=$(jq -r '.name // empty' <<< "$json")
+    server=$(jq -r '.server // empty' <<< "$json")
+    port=$(jq -r '.port // empty' <<< "$json")
+    insecure=$(_parse_insecure_flag "$(jq -r '.insecure // false' <<< "$json")")
+    _valid_sub_port "$port" || return 1
+    [[ -n "$type" && -n "$server" ]] || return 1
+    _reject_ctrl_fields "$type" "$server" || return 1
+
+    # 节点名称清理控制字符（不静默篡改凭据字段，凭据字段若含控制字符由下方 _reject_ctrl_fields 拒绝）
+    name="${name//$'\r'/}"
+    name="${name//$'\n'/}"
+    name="${name//$'\t'/ }"
+    [[ -z "$name" ]] && name="$type"
+
     # 给外部节点名称加上服务器标识，避免与本地节点重复
-    local server_suffix=$(get_ip_suffix "$server")
+    local server_suffix
+    server_suffix=$(get_ip_suffix "$server")
     [[ -n "$server_suffix" && "$name" != *"-${server_suffix}"* && "$name" != *"-${server_suffix}" ]] && name="${name}-${server_suffix}"
-    
+
+    local q_name q_server
+    q_name=$(_yaml_quote "$name") || return 1
+    q_server=$(_yaml_quote "$server") || return 1
+
     case "$type" in
         vless)
-            local uuid=$(echo "$json" | jq -r '.uuid')
-            local security=$(echo "$json" | jq -r '.security')
-            local transport=$(echo "$json" | jq -r '.transport')
-            local sni=$(echo "$json" | jq -r '.sni')
-            local pbk=$(echo "$json" | jq -r '.pbk')
-            local sid=$(echo "$json" | jq -r '.sid')
-            local flow=$(echo "$json" | jq -r '.flow')
-            local path=$(echo "$json" | jq -r '.path')
-            
+            local uuid security transport sni pbk sid flow path host fp
+            uuid=$(jq -r '.uuid // empty' <<< "$json")
+            security=$(jq -r '.security // empty' <<< "$json")
+            transport=$(jq -r '.transport // "tcp"' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            pbk=$(jq -r '.publicKey // .pbk // empty' <<< "$json")
+            sid=$(jq -r '.shortId // .sid // empty' <<< "$json")
+            flow=$(jq -r '.flow // empty' <<< "$json")
+            path=$(jq -r '.path // empty' <<< "$json")
+            host=$(jq -r '.host // empty' <<< "$json")
+            fp=$(jq -r '.fingerprint // "chrome"' <<< "$json")
+            [[ -n "$uuid" ]] || return 1
+            _reject_ctrl_fields "$uuid" "$security" "$transport" "$sni" "$pbk" "$sid" "$flow" "$path" "$host" "$fp" || return 1
+            _valid_sub_network "$transport" || return 1
+
+            local q_uuid q_sni q_pbk q_sid q_flow q_path q_host q_fp
+            q_uuid=$(_yaml_quote "$uuid")
+            q_sni=$(_yaml_quote "$sni")
+            q_pbk=$(_yaml_quote "$pbk")
+            q_sid=$(_yaml_quote "$sid")
+            q_flow=$(_yaml_quote "$flow")
+            q_path=$(_yaml_quote "${path:-/}")
+            q_host=$(_yaml_quote "${host:-$sni}")
+            q_fp=$(_yaml_quote "${fp:-chrome}")
+
             if [[ "$security" == "reality" ]]; then
                 cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: vless
-    server: "$server"
-    port: $port
-    uuid: $uuid
-    network: ${transport:-tcp}
+    server: $q_server
+    port: $((10#$port))
+    uuid: $q_uuid
+    network: $transport
     tls: true
     udp: true
-    flow: $flow
-    servername: $sni
+    flow: $q_flow
+    servername: $q_sni
     reality-opts:
-      public-key: $pbk
-      short-id: $sid
-    client-fingerprint: chrome
+      public-key: $q_pbk
+      short-id: $q_sid
+    client-fingerprint: $q_fp
 EOF
             elif [[ "$transport" == "ws" ]]; then
+                local v_tls="true"
+                [[ "$security" == "none" ]] && v_tls="false"
                 cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: vless
-    server: "$server"
-    port: $port
-    uuid: $uuid
+    server: $q_server
+    port: $((10#$port))
+    uuid: $q_uuid
     network: ws
-    tls: true
+    tls: $v_tls
     udp: true
-    skip-cert-verify: true
-    servername: $sni
+    skip-cert-verify: $insecure
+    servername: $q_sni
     ws-opts:
-      path: $path
+      path: $q_path
       headers:
-        Host: $sni
+        Host: $q_host
 EOF
             else
+                local v_tls="true"
+                [[ "$security" == "none" ]] && v_tls="false"
                 cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: vless
-    server: "$server"
-    port: $port
-    uuid: $uuid
-    network: tcp
-    tls: true
+    server: $q_server
+    port: $((10#$port))
+    uuid: $q_uuid
+    network: $transport
+    tls: $v_tls
     udp: true
-    skip-cert-verify: true
-    servername: $sni
+    skip-cert-verify: $insecure
+    servername: $q_sni
 EOF
             fi
             ;;
         vmess)
-            local uuid=$(echo "$json" | jq -r '.uuid')
-            local network=$(echo "$json" | jq -r '.network')
-            local tls=$(echo "$json" | jq -r '.tls')
-            local sni=$(echo "$json" | jq -r '.sni')
-            local path=$(echo "$json" | jq -r '.path')
-            local host=$(echo "$json" | jq -r '.host')
-            
+            local uuid network tls sni path host aid
+            uuid=$(jq -r '.uuid // empty' <<< "$json")
+            network=$(jq -r '.network // "tcp"' <<< "$json")
+            tls=$(jq -r '.tls // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            path=$(jq -r '.path // empty' <<< "$json")
+            host=$(jq -r '.host // empty' <<< "$json")
+            aid=$(jq -r '.aid // 0' <<< "$json")
+            [[ -n "$uuid" ]] || return 1
+            [[ "$aid" =~ ^[0-9]+$ ]] || aid=0
+            _reject_ctrl_fields "$uuid" "$network" "$tls" "$sni" "$path" "$host" || return 1
+            _valid_sub_network "$network" || return 1
+
+            local q_uuid q_sni q_path q_host v_tls="false"
+            [[ "$tls" == "tls" || "$tls" == "true" ]] && v_tls="true"
+            q_uuid=$(_yaml_quote "$uuid")
+            q_sni=$(_yaml_quote "${sni:-$host}")
+            q_path=$(_yaml_quote "${path:-/}")
+            q_host=$(_yaml_quote "${host:-$sni}")
+
             cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: vmess
-    server: "$server"
-    port: $port
-    uuid: $uuid
-    alterId: 0
+    server: $q_server
+    port: $((10#$port))
+    uuid: $q_uuid
+    alterId: $((10#$aid))
     cipher: auto
-    network: ${network:-tcp}
-    tls: $([[ "$tls" == "tls" ]] && echo "true" || echo "false")
-    skip-cert-verify: true
-    servername: ${sni:-$host}
+    network: $network
+    tls: $v_tls
+    skip-cert-verify: $insecure
+    servername: $q_sni
 EOF
             if [[ "$network" == "ws" ]]; then
                 cat << EOF
     ws-opts:
-      path: ${path:-/}
+      path: $q_path
       headers:
-        Host: ${host:-$sni}
+        Host: $q_host
 EOF
             fi
             ;;
         trojan)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password sni transport path host
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            transport=$(jq -r '.transport // "tcp"' <<< "$json")
+            path=$(jq -r '.path // empty' <<< "$json")
+            host=$(jq -r '.host // empty' <<< "$json")
+            [[ -n "$password" ]] || return 1
+            _reject_ctrl_fields "$password" "$sni" "$transport" "$path" "$host" || return 1
+            _valid_sub_network "$transport" || return 1
+            local q_pw q_sni
+            q_pw=$(_yaml_quote "$password")
+            q_sni=$(_yaml_quote "$sni")
             cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: trojan
-    server: "$server"
-    port: $port
-    password: $password
-    sni: $sni
-    skip-cert-verify: true
+    server: $q_server
+    port: $((10#$port))
+    password: $q_pw
+    sni: $q_sni
+    skip-cert-verify: $insecure
     udp: true
 EOF
+            if [[ "$transport" == "ws" ]]; then
+                local q_path q_host
+                q_path=$(_yaml_quote "${path:-/}")
+                q_host=$(_yaml_quote "${host:-$sni}")
+                cat << EOF
+    network: ws
+    ws-opts:
+      path: $q_path
+      headers:
+        Host: $q_host
+EOF
+            fi
             ;;
         ss)
-            local method=$(echo "$json" | jq -r '.method')
-            local password=$(echo "$json" | jq -r '.password')
+            local method password
+            method=$(jq -r '.method // empty' <<< "$json")
+            password=$(jq -r '.password // empty' <<< "$json")
+            [[ -n "$method" && -n "$password" ]] || return 1
+            _reject_ctrl_fields "$method" "$password" || return 1
+            local q_method q_pw
+            q_method=$(_yaml_quote "$method")
+            q_pw=$(_yaml_quote "$password")
             cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: ss
-    server: "$server"
-    port: $port
-    cipher: $method
-    password: $password
+    server: $q_server
+    port: $((10#$port))
+    cipher: $q_method
+    password: $q_pw
     udp: true
 EOF
             ;;
         hysteria2)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password sni
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            [[ -n "$password" ]] || return 1
+            _reject_ctrl_fields "$password" "$sni" || return 1
+            local q_pw q_sni
+            q_pw=$(_yaml_quote "$password")
+            q_sni=$(_yaml_quote "$sni")
             cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: hysteria2
-    server: "$server"
-    port: $port
-    password: $password
-    sni: $sni
-    skip-cert-verify: true
+    server: $q_server
+    port: $((10#$port))
+    password: $q_pw
+    sni: $q_sni
+    skip-cert-verify: $insecure
+EOF
+            ;;
+        tuic)
+            local uuid password sni alpn cc udp_mode
+            uuid=$(jq -r '.uuid // empty' <<< "$json")
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            alpn=$(jq -r '.alpn // "h3"' <<< "$json")
+            cc=$(jq -r '.congestion_control // "bbr"' <<< "$json")
+            udp_mode=$(jq -r '.udp_relay_mode // "native"' <<< "$json")
+            [[ -n "$uuid" ]] || return 1
+            _reject_ctrl_fields "$uuid" "$password" "$sni" "$alpn" "$cc" "$udp_mode" || return 1
+            local q_uuid q_pw q_sni q_alpn q_cc q_udp
+            q_uuid=$(_yaml_quote "$uuid")
+            q_pw=$(_yaml_quote "$password")
+            q_sni=$(_yaml_quote "$sni")
+            q_alpn=$(_yaml_quote "$alpn")
+            q_cc=$(_yaml_quote "$cc")
+            q_udp=$(_yaml_quote "$udp_mode")
+            cat << EOF
+  - name: $q_name
+    type: tuic
+    server: $q_server
+    port: $((10#$port))
+    uuid: $q_uuid
+    password: $q_pw
+    sni: $q_sni
+    alpn: [$q_alpn]
+    congestion-controller: $q_cc
+    udp-relay-mode: $q_udp
+    skip-cert-verify: $insecure
 EOF
             ;;
         anytls)
-            local password=$(echo "$json" | jq -r '.password')
-            local sni=$(echo "$json" | jq -r '.sni')
+            local password sni
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            [[ -n "$password" ]] || return 1
+            _reject_ctrl_fields "$password" "$sni" || return 1
+            local q_pw q_sni
+            q_pw=$(_yaml_quote "$password")
+            q_sni=$(_yaml_quote "$sni")
             cat << EOF
-  - name: "$name"
+  - name: $q_name
     type: anytls
-    server: "$server"
-    port: $port
-    password: $password
-    sni: $sni
-    skip-cert-verify: true
+    server: $q_server
+    port: $((10#$port))
+    password: $q_pw
+    sni: $q_sni
+    skip-cert-verify: $insecure
 EOF
+            ;;
+        *)
+            return 1
             ;;
     esac
 }
 
-# 将外部节点转换为 Surge 格式
+# 将外部节点转换为 Surge 格式（保留外部节点自身 TLS 策略，绝不用本机证书推断外部节点信任）
 external_link_to_surge() {
     local link="$1"
-    local json=$(parse_share_link "$link")
-    [[ -z "$json" ]] && return
-    
-    local type=$(echo "$json" | jq -r '.type // empty')
-    local name=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.name // empty')")
-    local server=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.server // empty')")
-    local port=$(echo "$json" | jq -r '.port // empty')
-    [[ -z "$name" || -z "$server" || ! "$port" =~ ^[0-9]+$ ]] && return
-    # Surge 语法逗号/等号敏感，替换节点名中的逗号/等号避免配置注入
+    local json
+    json=$(parse_share_link "$link")
+    [[ -z "$json" ]] && return 1
+
+    local type name server port insecure
+    type=$(jq -r '.type // empty' <<< "$json")
+    name=$(jq -r '.name // empty' <<< "$json")
+    server=$(jq -r '.server // empty' <<< "$json")
+    port=$(jq -r '.port // empty' <<< "$json")
+    insecure=$(_parse_insecure_flag "$(jq -r '.insecure // false' <<< "$json")")
+    [[ -n "$type" && -n "$server" ]] || return 1
+    _valid_sub_port "$port" || return 1
+    _reject_ctrl_fields "$type" "$server" || return 1
+    [[ "$server" == *","* || "$server" == *"="* ]] && return 1
+
+    name="${name//$'\r'/}"
+    name="${name//$'\n'/}"
+    name="${name//$'\t'/ }"
     name="${name//,/-}"
     name="${name//=/_}"
-    server="${server//,/}"
-    
+    [[ -z "$name" ]] && name="$type"
+
     # 给外部节点名称加上服务器标识，避免与本地节点重复
-    local server_suffix=$(get_ip_suffix "$server")
+    local server_suffix
+    server_suffix=$(get_ip_suffix "$server")
     [[ -n "$server_suffix" && "$name" != *"-${server_suffix}"* && "$name" != *"-${server_suffix}" ]] && name="${name}-${server_suffix}"
-    
+
+    _surge_safe_val() {
+        local v
+        for v in "$@"; do
+            _has_ctrl_chars "$v" && return 1
+            [[ "$v" == *","* ]] && return 1
+        done
+        return 0
+    }
+
     case "$type" in
         vmess)
-            local uuid=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.uuid // empty')")
-            local network=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.network // empty')")
-            local tls=$(echo "$json" | jq -r '.tls // empty')
-            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
-            local path=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.path // empty')")
-            uuid="${uuid//,/}"; sni="${sni//,/}"; path="${path//,/}"
+            local uuid network tls sni path
+            uuid=$(jq -r '.uuid // empty' <<< "$json")
+            network=$(jq -r '.network // "tcp"' <<< "$json")
+            tls=$(jq -r '.tls // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            path=$(jq -r '.path // empty' <<< "$json")
+            [[ -n "$uuid" ]] || return 1
+            _surge_safe_val "$uuid" "$network" "$sni" "$path" || return 1
+            local v_tls="false"
+            [[ "$tls" == "tls" || "$tls" == "true" ]] && v_tls="true"
             if [[ "$network" == "ws" ]]; then
-                echo "$name = vmess, $server, $port, $uuid, tls=$([[ "$tls" == "tls" ]] && echo "true" || echo "false"), ws=true, ws-path=${path:-/}, sni=$sni, skip-cert-verify=true"
+                printf '%s\n' "$name = vmess, $server, $((10#$port)), $uuid, tls=$v_tls, ws=true, ws-path=${path:-/}, sni=$sni, skip-cert-verify=$insecure"
             else
-                echo "$name = vmess, $server, $port, $uuid, tls=$([[ "$tls" == "tls" ]] && echo "true" || echo "false"), skip-cert-verify=true"
+                printf '%s\n' "$name = vmess, $server, $((10#$port)), $uuid, tls=$v_tls, skip-cert-verify=$insecure"
             fi
             ;;
         trojan)
-            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
-            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
-            password="${password//,/}"; sni="${sni//,/}"
-            echo "$name = trojan, $server, $port, password=$password, sni=$sni, skip-cert-verify=true"
+            local password sni
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            [[ -n "$password" ]] || return 1
+            _surge_safe_val "$password" "$sni" || return 1
+            printf '%s\n' "$name = trojan, $server, $((10#$port)), password=$password, sni=$sni, skip-cert-verify=$insecure"
             ;;
         ss)
-            local method=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.method // empty')")
-            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
-            method="${method//,/}"; password="${password//,/}"
-            echo "$name = ss, $server, $port, encrypt-method=$method, password=$password"
+            local method password
+            method=$(jq -r '.method // empty' <<< "$json")
+            password=$(jq -r '.password // empty' <<< "$json")
+            [[ -n "$method" && -n "$password" ]] || return 1
+            _surge_safe_val "$method" "$password" || return 1
+            printf '%s\n' "$name = ss, $server, $((10#$port)), encrypt-method=$method, password=$password"
             ;;
         hysteria2)
-            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
-            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
-            password="${password//,/}"; sni="${sni//,/}"
-            echo "$name = hysteria2, $server, $port, password=$password, sni=$sni, skip-cert-verify=true"
+            local password sni
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            [[ -n "$password" ]] || return 1
+            _surge_safe_val "$password" "$sni" || return 1
+            printf '%s\n' "$name = hysteria2, $server, $((10#$port)), password=$password, sni=$sni, skip-cert-verify=$insecure"
+            ;;
+        tuic)
+            local uuid password sni alpn
+            uuid=$(jq -r '.uuid // empty' <<< "$json")
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            alpn=$(jq -r '.alpn // "h3"' <<< "$json")
+            [[ -n "$uuid" ]] || return 1
+            _surge_safe_val "$uuid" "$password" "$sni" "$alpn" || return 1
+            printf '%s\n' "$name = tuic, $server, $((10#$port)), uuid=$uuid, password=$password, sni=$sni, skip-cert-verify=$insecure, alpn=$alpn"
             ;;
         anytls)
-            local password=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.password // empty')")
-            local sni=$(_sanitize_sub_scalar "$(echo "$json" | jq -r '.sni // empty')")
-            password="${password//,/}"; sni="${sni//,/}"
-            local anytls_scv=true
-            _anytls_secure "$sni" && anytls_scv=false
-            echo "$name = anytls, $server, $port, password=$password, sni=$sni, skip-cert-verify=$anytls_scv"
+            local password sni
+            password=$(jq -r '.password // empty' <<< "$json")
+            sni=$(jq -r '.sni // empty' <<< "$json")
+            [[ -n "$password" ]] || return 1
+            _surge_safe_val "$password" "$sni" || return 1
+            printf '%s\n' "$name = anytls, $server, $((10#$port)), password=$password, sni=$sni, skip-cert-verify=$insecure"
+            ;;
+        *)
+            return 1
             ;;
     esac
 }
@@ -21759,7 +22736,8 @@ add_external_link() {
     
     # 保存
     mkdir -p "$(dirname "$EXTERNAL_LINKS_FILE")"
-    echo "$link" >> "$EXTERNAL_LINKS_FILE"
+    ( umask 077; printf '%s\n' "$link" >> "$EXTERNAL_LINKS_FILE" )
+    chmod 600 "$EXTERNAL_LINKS_FILE" 2>/dev/null || true
     
     _ok "已添加节点: $name"
     
@@ -21806,12 +22784,13 @@ add_external_sub() {
     
     # 保存
     mkdir -p "$(dirname "$EXTERNAL_SUBS_FILE")"
-    echo "$url" >> "$EXTERNAL_SUBS_FILE"
+    ( umask 077; printf '%s\n' "$url" >> "$EXTERNAL_SUBS_FILE" )
+    chmod 600 "$EXTERNAL_SUBS_FILE" 2>/dev/null || true
     
     # 缓存节点
-    mkdir -p "$EXTERNAL_CACHE_DIR"
+    mkdir -p -m 700 "$EXTERNAL_CACHE_DIR"
     local idx=$(wc -l < "$EXTERNAL_SUBS_FILE" 2>/dev/null || echo 1)
-    echo "$content" > "$EXTERNAL_CACHE_DIR/sub_$idx.txt"
+    ( umask 077; printf '%s\n' "$content" > "$EXTERNAL_CACHE_DIR/sub_$idx.txt" )
     
     _ok "已添加订阅，包含 $node_count 个节点"
     
@@ -21856,7 +22835,7 @@ show_external_nodes() {
             local node_count=0
             [[ -f "$cache_file" ]] && node_count=$(grep -c '://' "$cache_file" 2>/dev/null || echo 0)
             ((count+=node_count))
-            echo -e "  ${G}$idx)${NC} $url ${D}($node_count 个节点)${NC}"
+            echo -e "  ${G}$idx)${NC} $(_redact_url "$url") ${D}($node_count 个节点)${NC}"
         done < "$EXTERNAL_SUBS_FILE"
         [[ $idx -eq 0 ]] && echo -e "  ${D}(无)${NC}"
     fi
@@ -21907,7 +22886,7 @@ delete_external_node() {
             while IFS= read -r url || [[ -n "$url" ]]; do
                 [[ -z "$url" || "$url" == \#* ]] && continue
                 ((idx++))
-                echo -e "  ${G}$idx)${NC} $url"
+                echo -e "  ${G}$idx)${NC} $(_redact_url "$url")"
             done < "$EXTERNAL_SUBS_FILE"
             echo ""
             read -rp "  输入序号删除 (0 取消): " del_idx
@@ -22366,12 +23345,14 @@ gen_clash_sub() {
     local external_links=$(get_all_external_links)
     while IFS= read -r link || [[ -n "$link" ]]; do
         [[ -z "$link" || "$link" != *"://"* ]] && continue
-        local ext_proxy=$(external_link_to_clash "$link")
+        local ext_proxy
+        ext_proxy=$(external_link_to_clash "$link") || continue
         if [[ -n "$ext_proxy" ]]; then
             proxies+="$ext_proxy"$'\n'
-            # 从生成的 proxy 中提取名称
-            local ext_name=$(echo "$ext_proxy" | grep -m1 'name:' | sed 's/.*name:[[:space:]]*"\([^"]*\)".*/\1/')
-            proxy_names+="      - \"$ext_name\""$'\n'
+            # 从生成的 proxy 中提取已安全 YAML 引用的名称（保留转义引号与 Unicode）
+            local ext_name
+            ext_name=$(printf '%s\n' "$ext_proxy" | sed -n 's/^[[:space:]]*-[[:space:]]*name:[[:space:]]*//p' | head -1)
+            [[ -n "$ext_name" ]] && proxy_names+="      - $ext_name"$'\n'
         fi
     done <<< "$external_links"
     

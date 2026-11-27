@@ -1,5 +1,28 @@
 # Changelog
 
+## H18 — 静态审计全量安全与恢复整改版（2026-11-27；基于 H17 `0d3cb73` 审计 F01–F08 与 R01/R03）
+
+兼容握手：`3.4.10-h18`。产品 SHA-256：`08001f1e9fc911ea2792df7ee0e4341ebb6645efa0192ce26e3f6e78983aefdb`。详见 [RELEASE-H18.md](./RELEASE-H18.md)。
+
+**安全与 TLS 信任合同（F01–F03、F08）**
+- F01 外部订阅 YAML 序列化与注入防护：所有外部节点解析器与 `external_link_to_clash` / `external_link_to_surge` 统一拒绝凭据/主机/路径/SNI 等字段中的 ASCII 控制字符（含 CR/LF/TAB/`%00`），不再以删字符方式静默篡改凭据；`external_link_to_clash` 将全部字符串标量通过 `_yaml_quote`（`jq -Rn`）编码为合法 YAML 1.2 双引号标量，并校验端口范围（1–65535）与传输层枚举白名单；修复 `external_link_to_clash` 读取 VLESS Reality `.pbk`/`.sid` 为 `null`（实际字段 `.publicKey`/`.shortId`）与 `parse_vless_link` 双重转义节点名问题；`gen_clash_sub` 安全提取带转义引号的外部节点名写入 `proxy-groups`。
+- F02 统一 TLS 验证策略：新增 `_local_tls_skip_verify` 统一 `show_single_protocol_info` 全部协议（`vless-vision`、`vless-ws`、`vmess-ws`、`hy2`、`trojan`、`trojan-ws`、`anytls`、`tuic`、`socks` TLS）的 Surge/Loon/Clash 输出，真实证书匹配 SNI 时关闭 `skip-cert-verify`；外部节点解析与导出严格保留自身显式 `insecure`/`allowInsecure`/`allow_insecure`/`skip-cert-verify` 标志（默认严格校验 `false`），不再无条件输出 `skip-cert-verify: true`，也不再用本机 `_anytls_secure` 推断外部节点信任。
+- F03 严格密码学证书校验：重写 `_is_real_cert`，拆离 `fullchain` 的叶证书与中间链并执行 `openssl verify -purpose sslserver`（传入 `-untrusted` 中间链与 `-verify_hostname` 主机名校验）、`-checkend 0` 有效期校验以及公私钥配对校验，**彻底移除所有基于 issuer 子串（`R3`/`E1`/`Let's Encrypt` 等）的信任回退**；统一 `_anytls_secure`、HY2 入站与证书复用向导复用同一判据。
+- F08 外部订阅 URL 去敏与安全拉取：`fetch_subscription` 严格校验 `http(s)://` 且通过 `curl -K -` 经 stdin 传递 URL（URL 与 bearer token 永不进入进程 argv），限制 `--proto =http,https`、`--proto-redir =http,https`、`--max-redirs 5`、`--max-filesize 2097152`；`refresh_external_subs`、`show_external_nodes`、`delete_external_node` 通过 `_redact_url` 仅展示 `scheme://host/***`，并收紧订阅/链接缓存文件为 `0600`/`0700`。
+
+**服务恢复、配置事务与订阅语义（F04–F07）**
+- F04 sing-box 全禁用自动停服后的自动恢复：当 `generate_singbox_config` 因无启用用户返回 `2` 并在运行态自动停服时，落盘 `$CFG/.singbox-stopped-empty`；后续重新启用用户且未被管理员手动暂停（无 `$CFG/paused`、未执行 `stop_services`）时，`rebuild_and_reload_singbox` 自动执行 `svc start vless-singbox` 并在启动失败时保留 `.singbox-stopped-empty` 与 `.reload-pending.singbox` 供重试；管理员主动停服场景保持停止不误启。
+- F05 `_nginx_install_conf` 备份前置闸门与防删原配置：目标已存在时必须在同目录完成备份与 `cmp -s` 字节核对，备份失败在任何覆盖前立即中止返回非 0；新配置同目录暂存原子替换；回滚严格按“原文件是否存在”分枝，禁止无备份删除原文件，保留原 symlink 目标，若回滚恢复失败则保留备份文件并在 stderr 报告路径。
+- F06 Clash YAML 外部订阅解析重构：提取唯一 `_clash_emit_proxy_link` 消除循环内节点与末节点两套逻辑分叉（修复末节点 VLESS-WS 丢失 `path`/`host` 与重复 `type=ws`）；区分 VLESS Reality（有 `public-key`）与普通 VLESS+TLS（不再误转为 `security=reality`）；VMess 改用 `jq -nc` 序列化；新增 `parse_tuic_link` 与 `external_link_to_clash`/`external_link_to_surge` 的 `tuic` 闭环支持；`_flatten_clash_yaml_proxies` 支持任意键顺序块映射、嵌套 `ws-opts`/`reality-opts`/`headers` 与单行/多行 flow mapping，并限制 YAML 别名数（≤50）与节点数（≤2000）。
+- F07 Debian/Ubuntu `install_deps` 严格依赖校验：通过 `awk` 与 `PIPESTATUS[0]` 分离包管理器真实退出码与进度展示，`apt-get update` 失败明确告警；改用 `dpkg-query -W -f='${Status}\n'` 逐项验证 `install ok installed`（拒绝 `deinstall ok config-files` 残留配置与 `install ok unpacked` 未配置态）并校验关键运行时命令可执行性。
+
+**计量透明化与控制面优化（R01、R03）**
+- R01 `_traffic_collect_to_journal` 拆分 `statsquery -reset` 原始响应落盘与 `jq`/`awk` 解析追加，明确标注 best-effort 计量语义；若在 reset 之后解析或写日志失败，显式告警采样缺口并返回非 0；Xray 重启前 flush 失败亦记录告警。
+- R03 `_sync_all_user_traffic_locked` 改为单遍 `awk | jq` 聚合 `traffic.pending` 与单次 `jq` 读取用户配额/告警状态，消除逐用户重复扫描日志与多次整库解析，同时保持逐用户失败重试与幂等去重合同不变。
+
+**测试与验证**
+- 新增 `tests/test-h18-audit-fixes.sh`（113 条断言，覆盖 F01–F08、R01/R03 及 4 组防假绿变异自检，双 AWK `mawk` + `gawk` 100% 通过）；更新 `tests/test-stateful-upgrade.sh` 接受 `3.4.10-h14+` 候选版本号。
+
 ## H17 — 第二轮外部审计及复审整改版（2026-11-26；基于内部 H16 基线）
 
 兼容握手：`3.4.10-h17`。产品 SHA-256：`f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`。详见 [RELEASE-H17.md](./RELEASE-H17.md)。
