@@ -1,5 +1,32 @@
 # Changelog
 
+## H19 — H18 审计回归闭环与全仓类级自审加固版（2026-11-27；修复 D2–D5、D7–D12、Alpine 实机缺陷及全仓自审 SA-01–SA-07）
+
+兼容握手：`3.4.10-h19`。产品 SHA-256：`07dae560f3fd73cfdbe82a72687fd50617a20e0cd771130f8b3f6c9f4bf0b912`。详见 [RELEASE-H19.md](./RELEASE-H19.md)。
+
+**数据完整性与控制面性能（D4、D5 / R03）**
+- D4 聚合失败保留日志防丢账：`_sync_all_user_traffic_locked` 在 `awk | jq` 单遍聚合失败时输出明确告警并立即返回 `1`，跳过截断步骤完整保留 `traffic.pending` 待下轮重试，消除整批未入账流量被 `: > "$pending"` 清空的丢账窗口；保留纯整数精确文本避免大整数浮点精度损失。
+- D5 真正的单遍整库配额状态读取（`O(D)`）：将配额/已用/启用/告警状态读取移出逐用户循环，在入账阶段结束后仅执行一次整库 `jq` 扫描（保持多端口数组首匹配语义），并移除 `|| true` 静默吞错——读取失败时显式告警并传播非 0 退出码。
+
+**服务生命周期与证书安全闭环（D8、D12 / F04；D2、D3 / F03）**
+- D8/D12 F04 全入口守卫闭环：`_regenerate_proxy_configs`（覆盖路由规则、WARP、菜单 14 等 15+ 入口）与 `uninstall_specific_protocol` 剩余协议重载路径统一接入 `is_paused`、`svc status` 与 `.singbox-stopped-empty` 守卫——管理员主动停服或存在 `$CFG/paused` 时仅更新配置不越权拉起 Xray/sing-box；仅在未暂停且存在自动停服标记时自动恢复 `vless-singbox`；`_rebuild_and_reload_singbox_impl` 运行态分支仅在 `svc restart` 成功后清除 `.singbox-stopped-empty`。
+- D2/D3 证书防误删与残余 issuer 清理：新增 `_cert_is_non_self_signed` 专用于破坏性覆盖前防误删保护（绝不授予 TLS 信任），`_handle_standalone_cert`（`force_new=true`）与 `gen_self_cert` 改用带域名/私钥的 `_is_real_cert` 并在检测到未过期非自签证书时拒绝删毁；`create_fake_website` 改用 `_is_real_cert "$domain" "$CFG/certs/server.key"` 并在校验失败回退 HTTP 时输出明确告警；同步清理 `gen_self_cert`、`gen_hy2_server_config`、`show_single_protocol_info` 及 4 处安装向导中残余的 7 处 issuer 子串（`R3`/`ZeroSSL`/`Buypass` 等）判定。
+
+**外部订阅协议完整度、输入校验与卫生清理（D1、D7、D9–D11 / F02、F06）**
+- D9 gRPC `serviceName` 全链路往返：`_parse_clash_yaml_proxies`、`_clash_emit_proxy_link`、`parse_vless_link`、`parse_vmess_link`、`parse_trojan_link` 与 `external_link_to_clash` 完整支持 `grpc-opts.grpc-service-name` / `service-name` / `serviceName` 往返保留与 YAML 导出（覆盖 VLESS TLS、VLESS Reality、VMess、Trojan）。
+- D10/D11 外部节点 `server` 校验与诊断告警：新增 `_valid_sub_server` 拒绝 `@ ? / #` 及空白等 URI 结构污染字符（兼容 IPv4/域名/IPv6 及方括号 IPv6）；`_clash_emit_proxy_link` 对缺字段/非法端口/非法主机/控制字符/不支持传输层等丢弃场景统一输出 stderr `_warn` 诊断。
+- D1 行为变化显式文档化：保持 F02 默认严格校验证书安全基线，在 [RELEASE-H19.md](./RELEASE-H19.md) 明确点名外部自签 `hysteria2`/`hy2`/`anytls` 节点迁移路径（显式添加 `insecure=1`/`allowInsecure=1` 或 `skip-cert-verify: true`）。
+- D7 死代码清理：移除无生产引用的 `_sanitize_sub_scalar`，同步更新 `tests/test-h15-security-hardening.sh` 验证现行 `_yaml_quote`。
+
+**测试、静态不变量门禁与全仓类级自审（SA-01–SA-07）**
+- 修复 L5 Alpine 3.23 真实 OpenRC 捕获的两处真机缺陷：`_pgrep` 在 Alpine 下补充匹配 `gcompat` 加载器命令行（`ld-linux-*.so* ... -- /usr/local/bin/<proc>`），解决 `start_services` 误报 glibc `sing-box` 未运行；`create_singbox_service` 的 OpenRC `start_pre()` 改用 POSIX `[ -x ... ]` 替换 Bash `[[`。
+- SA-01 `watchdog.sh` 守卫与 `_pgrep` 对齐：`watchdog.sh` 抽离 `_watchdog_cycle`（支持 `VLESS_WATCHDOG_ONCE=1` 实测），补齐 `$CFG/paused` 与 F04 `$CFG/.singbox-stopped-empty` 守卫防止无用户停服后 60s 触发崩溃循环，并同步对齐 Alpine `gcompat` 精确 `_pgrep`。
+- SA-02/SA-06 手写双核重载收敛与隧道守卫：`configure_direct_outbound`（修复原停服后漏启 `vless-singbox`）与 `setup_warp_ipv6_chain` 收敛调用 `_regenerate_proxy_configs`；`_sync_tunnel_config` 与 `add_protocol_to_tunnel` 补齐 `! is_paused && svc status vless-reality` 守卫及 `jq` 失败清理临时文件。
+- SA-03 纯 AWK 公历日期可移植性：新增 `_ymd_to_days` / `_days_to_ymd` / `_date_add_days_ymd` 替代 GNU `date -d` / BSD `date -v/-j`，修复 Alpine BusyBox 下按天数设置到期静默变“永不过期”与剩余天数倒计时失效。
+- SA-04/SA-05 链式订阅与 OpenRC ShadowTLS 凭据安全：`parse_subscription` 改用 `curl -K -` 隐藏订阅 URL/Token；`parse_proxy_link` 全协议补齐 `_valid_sub_port`（1–65535）与 `_valid_sub_server`、修复旧 `ss://` 冒号密码截断与 `hy2://` `allowInsecure`；`_write_openrc()` 将 `STLS_PASSWORD` 非执行 `sed` 解析前置到 `command_args` 之前，修复 Alpine ShadowTLS 密码为空并消除 `. "${env_file}"` 注入面。
+- SA-07 状态函数退出码修复：修复 `db_set_user_expire_date ""`、`db_migrate_to_multiuser`、`db_del_chain_node`、`refresh_external_subs` 末行 `[[ ... ]] && ...` 在合法假分支返回 `1` 的问题。
+- 新增静态结构不变量门禁 `scripts/check-static-invariants.py`（接入 L1a 本机预检与 `tests/run-ci.sh static`），新增 `tests/test-h19-audit-regression.sh`（D2–D12 + M5–M10）与 `tests/test-h19-self-audit.sh`（SA-01–SA-07 + 变异与 BusyBox 日期模拟测试）。
+
 ## H18 — 静态审计全量安全与恢复整改版（2026-11-27；基于 H17 `0d3cb73` 审计 F01–F08 与 R01/R03）
 
 兼容握手：`3.4.10-h18`。产品 SHA-256：`08001f1e9fc911ea2792df7ee0e4341ebb6645efa0192ce26e3f6e78983aefdb`。详见 [RELEASE-H18.md](./RELEASE-H18.md)。

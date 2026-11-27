@@ -79,6 +79,9 @@ run_static() {
     done
     ((count > 0)) || fail "no shell sources discovered"
     printf 'PASS: ShellCheck error gate (%d files)\n' "$count"
+    if [[ -f scripts/check-static-invariants.py ]]; then
+        python3 scripts/check-static-invariants.py
+    fi
 }
 
 run_unit() (

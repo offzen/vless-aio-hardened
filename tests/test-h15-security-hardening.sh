@@ -192,10 +192,10 @@ check 'H-9 _is_real_cert rejects self-signed certificate spoofed with CN=R3' bas
     ! _is_real_cert
 '
 
-# H-10 YAML injection sanitizer
-clean_scalar=$(_sanitize_sub_scalar $'evil\n  external-controller: 0.0.0.0:9090"')
-check 'H-10 _sanitize_sub_scalar strips newlines' test "${clean_scalar#*$'\n'}" = "$clean_scalar"
-check 'H-10 _sanitize_sub_scalar escapes quotes' grep -Fq '\"' <<< "$clean_scalar"
+# H-10 YAML injection sanitizer (superseded by _yaml_quote strict YAML 1.2 JSON encoding)
+clean_scalar=$(_yaml_quote $'evil\n  external-controller: 0.0.0.0:9090"')
+check 'H-10 _yaml_quote encodes newlines without raw line break' test "${clean_scalar#*$'\n'}" = "$clean_scalar"
+check 'H-10 _yaml_quote escapes quotes' grep -Fq '\"' <<< "$clean_scalar"
 
 # M-5 IPv6-only share link generation
 cat > "$DB_FILE" <<'JSON'

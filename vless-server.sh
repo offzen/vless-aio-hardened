@@ -30,7 +30,7 @@ readonly RELEASE_CHANNEL="master"
 #   1) 3.4.10-h5 及更早的存量客户端只认语义化版本号，靠它识别本制品并放行下载；
 #   2) 本版更新器用它做"防降级"方向判断（远端更旧一律拒绝）。
 # 格式受老客户端硬约束：^[0-9]+(\.[0-9]+)*(-h[0-9]+)?$，且必须单调递增。
-readonly VERSION="3.4.10-h18"
+readonly VERSION="3.4.10-h19"
 readonly AUTHOR="Chil30"
 readonly REPO_URL="https://github.com/offzen/vless-aio-hardened"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/offzen/vless-aio-hardened/master/vless-server.sh"
@@ -55,13 +55,14 @@ readonly LATENCY_MAX_ATTEMPTS="${LATENCY_MAX_ATTEMPTS:-0}"
 _CACHED_IPV4=""
 _CACHED_IPV6=""
 
-# Alpine busybox pgrep 不支持 -x，使用兼容方式检测进程（绝不用裸 pgrep -f，避免误命中 timeout/bash 等含子串的辅助进程）
+# Alpine busybox pgrep 不支持 -x，使用兼容方式检测进程（绝不用裸 pgrep -f，避免误命中 timeout/bash 等含子串的辅助进程；
+# 同时兼容 Alpine gcompat 运行 glibc 二进制时的 `ld-linux*.so* ... -- /usr/local/bin/<proc>` 进程命令行形态）
 _pgrep() {
     local proc="$1"
     if [[ "$DISTRO" == "alpine" ]]; then
         pgrep "$proc" >/dev/null 2>&1 && return 0
-        # 仅按 argv[0] 精确匹配（排除 `timeout 30 sing-box check` 等非主进程）
-        pgrep -f "^(/usr/local/s?bin/|/usr/s?bin/)?${proc}([[:space:]]|$)" >/dev/null 2>&1
+        # 仅按 argv[0] 或 gcompat 加载器目标路径精确匹配（排除 `timeout 30 sing-box check` 等非主进程）
+        pgrep -f "^((/usr/local/s?bin/|/usr/s?bin/)?${proc}|(/lib(64)?/)?ld-(linux|musl)[^[:space:]]*[[:space:]].*--[[:space:]]+(/usr/local/s?bin/|/usr/s?bin/)?${proc})([[:space:]]|$)" >/dev/null 2>&1
     else
         pgrep -x "$proc" >/dev/null 2>&1
     fi
@@ -1807,11 +1808,71 @@ _format_user_routing() {
 #  用户到期日期管理函数
 #═══════════════════════════════════════════════════════════════════════════════
 
+# 纯 AWK 公历日期 ↔ Unix 天数互转（Howard Hinnant 算法），零 GNU/BSD date -d 依赖，
+# 在 Debian/Ubuntu、Alpine BusyBox、macOS 与 mawk/gawk/BusyBox awk 下行为完全一致且不受 DST 影响。
+_ymd_to_days() {
+    local d="$1"
+    [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    awk -F- '
+        function floor_div(a, b) {
+            return (a >= 0) ? int(a / b) : int((a - b + 1) / b)
+        }
+        {
+            y = $1 + 0; m = $2 + 0; day = $3 + 0
+            if (m < 1 || m > 12 || day < 1 || day > 31) exit 1
+            if (m <= 2) y -= 1
+            era = floor_div(y, 400)
+            yoe = y - era * 400
+            doy = int((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + day - 1
+            doe = yoe * 365 + int(yoe / 4) - int(yoe / 100) + doy
+            printf "%.0f\n", era * 146097 + doe - 719468
+        }
+    ' <<< "$d"
+}
+
+_days_to_ymd() {
+    local z="$1"
+    [[ "$z" =~ ^-?[0-9]+$ ]] || return 1
+    awk -v z="$z" '
+        function floor_div(a, b) {
+            return (a >= 0) ? int(a / b) : int((a - b + 1) / b)
+        }
+        BEGIN {
+            z += 719468
+            era = floor_div(z, 146097)
+            doe = z - era * 146097
+            yoe = int((doe - int(doe / 1460) + int(doe / 36524) - int(doe / 146096)) / 365)
+            y = yoe + era * 400
+            doy = doe - (365 * yoe + int(yoe / 4) - int(yoe / 100))
+            mp = int((5 * doy + 2) / 153)
+            day = doy - int((153 * mp + 2) / 5) + 1
+            m = mp + (mp < 10 ? 3 : -9)
+            if (m <= 2) y += 1
+            printf "%04d-%02d-%02d\n", y, m, day
+        }
+    '
+}
+
+# 基于基准日期（默认今天）偏移 N 天返回 YYYY-MM-DD（兼容 Alpine BusyBox / GNU / BSD，支持正负偏移）
+_date_add_days_ymd() {
+    local offset="$1" base="${2:-$(date '+%Y-%m-%d')}"
+    [[ "$offset" =~ ^-?[0-9]+$ ]] || return 1
+    local sign="" mag="$offset"
+    if [[ "$mag" == -* ]]; then
+        sign="-"
+        mag="${mag#-}"
+    fi
+    local base_days
+    base_days=$(_ymd_to_days "$base") || return 1
+    _days_to_ymd "$((base_days + ${sign}10#$mag))"
+}
+
 # 校验并规范化 YYYY-MM-DD：必须是真实存在的日历日期（拒绝 2026-02-30、2026-13-45）
 _valid_ymd() {
-    local d="$1" norm
+    local d="$1" days norm
     [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
-    norm=$(date -d "$d" '+%Y-%m-%d' 2>/dev/null) || return 1
+    days=$(_ymd_to_days "$d") || return 1
+    norm=$(_days_to_ymd "$days") || return 1
     [[ "$norm" == "$d" ]]
 }
 
@@ -1843,8 +1904,11 @@ db_set_user_expire_date() {
         end
     ' || return 1
     
-    # 如果设置了到期日期，自动安装过期检查 cron
-    [[ -n "$expire_date" ]] && ensure_expire_check_cron 2>/dev/null
+    # 如果设置了到期日期，自动安装过期检查 cron（清空到期日期时必须返回 0）
+    if [[ -n "$expire_date" ]]; then
+        ensure_expire_check_cron 2>/dev/null || true
+    fi
+    return 0
 }
 
 # 获取用户到期日期
@@ -1889,15 +1953,14 @@ db_get_user_days_left() {
     
     [[ -z "$expire_date" ]] && echo "" && return
     
-    local today_sec=$(date -d "$(date '+%Y-%m-%d')" '+%s' 2>/dev/null || date -j -f '%Y-%m-%d' "$(date '+%Y-%m-%d')" '+%s' 2>/dev/null)
-    local expire_sec=$(date -d "$expire_date" '+%s' 2>/dev/null || date -j -f '%Y-%m-%d' "$expire_date" '+%s' 2>/dev/null)
-    
-    if [[ -n "$today_sec" && -n "$expire_sec" ]]; then
-        echo $(( (expire_sec - today_sec) / 86400 ))
+    local today today_days expire_days
+    today=$(date '+%Y-%m-%d')
+    if _valid_ymd "$expire_date" && today_days=$(_ymd_to_days "$today") && expire_days=$(_ymd_to_days "$expire_date"); then
+        echo $(( expire_days - today_days ))
     elif [[ "$expire_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
         # 旧版本允许写入的非法日历日期（如 2026-02-30）：与配置渲染的字典序过滤保持一致，
         # 已越过则按已过期处理，保证 --check-expire 与渲染结论相同；未到期不告警。
-        if [[ "$expire_date" < "$(date '+%Y-%m-%d')" ]]; then echo -1; else echo ""; fi
+        if [[ "$expire_date" < "$today" ]]; then echo -1; else echo ""; fi
     else
         echo ""
     fi
@@ -2310,7 +2373,10 @@ db_migrate_to_multiuser() {
         done
     done
     
-    [[ "$migrated" == "true" ]] && _ok "数据库已迁移到多用户格式"
+    if [[ "$migrated" == "true" ]]; then
+        _ok "数据库已迁移到多用户格式"
+    fi
+    return 0
 }
 
 # 用户变更后重建配置并重载服务
@@ -2482,9 +2548,9 @@ _rebuild_and_reload_singbox_impl() {
     if [[ $gen_rc -eq 0 ]]; then
         # 检查 Sing-box 服务是否在运行
         if svc status vless-singbox 2>/dev/null; then
-            rm -f "$auto_stop_marker" 2>/dev/null || true
-            # 重载服务
+            # 重载服务（仅在重启成功后清除自动停服标记，保持与自动恢复分支一致）
             if svc restart vless-singbox 2>/dev/null; then
+                rm -f "$auto_stop_marker" 2>/dev/null || true
                 [[ -z "$silent" ]] && _ok "Sing-box 配置已更新并重载"
                 return 0
             else
@@ -2899,18 +2965,19 @@ _sync_all_user_traffic_locked() {
 
     [[ -s "$pending" ]] || return "$sync_failed"
 
-    local keep_list idx_tsv
+    local keep_list idx_tsv state_tsv
     keep_list=$(mktemp "$CFG/cache/traffic.keep.XXXXXX") || return 1
     idx_tsv=$(mktemp "$CFG/cache/traffic.idx.XXXXXX") || { rm -f "$keep_list"; return 1; }
     chmod 600 "$keep_list" "$idx_tsv" 2>/dev/null || true
 
-    # 一次性扫描 pending 日志，按 email 聚合总流量与全部幂等条目 JSON，消除逐用户 O(U*L) 重复扫描
+    # 一次性扫描 pending 日志，按 email 聚合总流量与全部幂等条目 JSON，消除逐用户 O(U*L) 重复扫描；
+    # 若聚合管道任一环节失败，保留原 pending 日志不截断，直接返回非 0 待下轮重试（防整批丢账）。
     local -A _t_totals=()
     local -A _t_entries=()
     if awk '
         NF < 2 { next }
         {
-            k = $1; v = $2 + 0; id = $3
+            k = $1; id = $3
             if (index(k, "user>>>") != 1) next
             rest = substr(k, 8)
             p = index(rest, ">>>traffic>>>")
@@ -2920,7 +2987,8 @@ _sync_all_user_traffic_locked() {
             email = substr(rest, 1, p - 1)
             c[$0]++
             if (id == "") id = "L-" k "-" $2 "-" c[$0]
-            printf "%s\t%s\t%.0f\n", email, id, v
+            vstr = ($2 ~ /^[0-9]+$/) ? $2 : sprintf("%.0f", $2 + 0)
+            printf "%s\t%s\t%s\n", email, id, vstr
         }
     ' "$pending" | jq -Rrn '
         [inputs | split("\t") | select(length == 3) | {e: .[0], id: .[1], v: (.[2] | tonumber)}]
@@ -2935,10 +3003,12 @@ _sync_all_user_traffic_locked() {
             _t_totals["$_e"]="$_tot"
             _t_entries["$_e"]="$_ents"
         done < "$idx_tsv"
+        rm -f "$idx_tsv"
     else
-        sync_failed=1
+        rm -f "$idx_tsv" "$keep_list"
+        _warn "流量暂存日志聚合失败，已保留原日志待下轮重试"
+        return 1
     fi
-    rm -f "$idx_tsv"
 
     local notify_percent
     notify_percent=$(tg_get_config "notify_quota_percent")
@@ -2946,8 +3016,9 @@ _sync_all_user_traffic_locked() {
     local -a alert_thresholds=(80 90 95)
     local need_reload=false
     local proto users user email traffic
+    local -A _updated_emails=()
 
-    # 遍历所有 Xray 协议
+    # 阶段 1：按用户将已聚合流量幂等入账到数据库
     for proto in $(db_list_protocols "xray"); do
         users=$(db_list_users "xray" "$proto")
         [[ -z "$users" ]] && continue
@@ -2966,57 +3037,73 @@ _sync_all_user_traffic_locked() {
                 sync_failed=1
                 continue
             fi
-
-            # 单次 jq 读取配额/已用/启用/告警状态，避免每用户多次整库解析
-            local quota=0 used=0 enabled="true" exceeded_notified="false" last_alert=0 percent
-            IFS=$'\t' read -r quota used enabled exceeded_notified last_alert < <(
-                jq -r --arg p "$proto" --arg n "$user" '
-                    .xray[$p] as $cfg |
-                    (if $cfg == null then null
-                     elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[] | select(.name == $n)][0]
-                     else
-                        ($cfg.users // [] | map(select(.name == $n)) | .[0])
-                     end) as $u |
-                    if $u == null then "0\t0\ttrue\tfalse\t0"
-                    else "\($u.quota // 0)\t\($u.used // 0)\t\(if $u.enabled == false then "false" else "true" end)\t\(if $u.quota_exceeded_notified == true then "true" else "false" end)\t\($u.last_alert_percent // 0)"
-                    end
-                ' "$DB_FILE" 2>/dev/null
-            ) || true
-            quota=${quota:-0}; used=${used:-0}; last_alert=${last_alert:-0}
-            if [[ "$quota" -gt 0 ]]; then
-                percent=$((used * 100 / quota))
-
-                if [[ "$used" -ge "$quota" ]]; then
-                    # 超限：仍处于启用状态就禁用（不依赖一次性通知标记，重置/重新启用后可再次触发）
-                    if [[ "$enabled" != "false" ]]; then
-                        if _db_set_user_enabled_nowrite "xray" "$proto" "$user" "false" 2>/dev/null; then
-                            need_reload=true
-                            if [[ "$exceeded_notified" != "true" ]]; then
-                                db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
-                                tg_send_over_quota "$user" "$proto" "$used" "$quota"
-                            fi
-                        else
-                            sync_failed=1
-                        fi
-                    fi
-                elif [[ "$percent" -ge "$notify_percent" ]]; then
-                    # 告警检查：只在跨越新的阈值档位时发送
-                    local should_alert=false current_threshold=0 threshold
-                    for threshold in "${alert_thresholds[@]}"; do
-                        if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
-                            should_alert=true
-                            current_threshold=$threshold
-                        fi
-                    done
-                    if [[ "$should_alert" == "true" ]]; then
-                        tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
-                        db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
-                    fi
-                fi
-            fi
+            _updated_emails["$email"]=1
         done <<< "$users"
     done
+
+    # 阶段 2：单次整库 jq 预读所有 Xray 用户配额/已用/启用/告警状态（O(D)，不再逐用户重复扫库）
+    if [[ ${#_updated_emails[@]} -gt 0 ]]; then
+        state_tsv=$(mktemp "$CFG/cache/traffic.state.XXXXXX") || { sync_failed=1; state_tsv=""; }
+        if [[ -n "$state_tsv" ]]; then
+            chmod 600 "$state_tsv" 2>/dev/null || true
+            if jq -r '
+                .xray // {} | to_entries[] | .key as $p | .value as $cfg |
+                (if ($cfg | type) == "array" then
+                    [$cfg[].users // [] | .[]]
+                 elif ($cfg | type) == "object" then
+                    ($cfg.users // [])
+                 else [] end)
+                | reduce .[] as $u ({seen:{}, out:[]};
+                    if ($u.name // "") == "" or .seen[$u.name] then .
+                    else .seen[$u.name] = true | .out += [$u] end)
+                | .out[]
+                | "\($p)\t\(.name)\t\(.quota // 0)\t\(.used // 0)\t\(if .enabled == false then "false" else "true" end)\t\(if .quota_exceeded_notified == true then "true" else "false" end)\t\(.last_alert_percent // 0)"
+            ' "$DB_FILE" > "$state_tsv" 2>/dev/null; then
+                local quota used enabled exceeded_notified last_alert percent
+                while IFS=$'\t' read -r proto user quota used enabled exceeded_notified last_alert; do
+                    [[ -n "$proto" && -n "$user" ]] || continue
+                    email="${user}@${proto}"
+                    [[ -n "${_updated_emails[$email]:-}" ]] || continue
+                    quota=${quota:-0}; used=${used:-0}; last_alert=${last_alert:-0}
+                    if [[ "$quota" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ && "$quota" -gt 0 ]]; then
+                        percent=$((used * 100 / quota))
+
+                        if [[ "$used" -ge "$quota" ]]; then
+                            # 超限：仍处于启用状态就禁用（不依赖一次性通知标记，重置/重新启用后可再次触发）
+                            if [[ "$enabled" != "false" ]]; then
+                                if _db_set_user_enabled_nowrite "xray" "$proto" "$user" "false" 2>/dev/null; then
+                                    need_reload=true
+                                    if [[ "$exceeded_notified" != "true" ]]; then
+                                        db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
+                                        tg_send_over_quota "$user" "$proto" "$used" "$quota"
+                                    fi
+                                else
+                                    sync_failed=1
+                                fi
+                            fi
+                        elif [[ "$percent" -ge "$notify_percent" ]]; then
+                            # 告警检查：只在跨越新的阈值档位时发送
+                            local should_alert=false current_threshold=0 threshold
+                            for threshold in "${alert_thresholds[@]}"; do
+                                if [[ "$percent" -ge "$threshold" && "$last_alert" -lt "$threshold" ]]; then
+                                    should_alert=true
+                                    current_threshold=$threshold
+                                fi
+                            done
+                            if [[ "$should_alert" == "true" ]]; then
+                                tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
+                                db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
+                            fi
+                        fi
+                    fi
+                done < "$state_tsv"
+            else
+                _warn "读取用户配额状态失败，本轮超限检查未完成"
+                sync_failed=1
+            fi
+            rm -f "$state_tsv"
+        fi
+    fi
 
     # 2) 日志只保留写库失败的条目（已成功写入的、以及已不存在用户的条目都丢弃）
     if [[ -s "$keep_list" ]]; then
@@ -3343,6 +3430,19 @@ _is_real_cert() {
     return 0
 }
 
+# 判断证书是否为非自签有效证书（subject != issuer 且未过期），仅用于破坏性覆盖/删除前的防误删保护；
+# 绝不作为 TLS 信任判据（信任判据严格以 _is_real_cert 为准）。
+_cert_is_non_self_signed() {
+    local cert_file="${1:-$CFG/certs/server.crt}"
+    [[ -f "$cert_file" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    openssl x509 -in "$cert_file" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    local subj iss
+    subj=$(openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed 's/^subject= *//')
+    iss=$(openssl x509 -in "$cert_file" -noout -issuer 2>/dev/null | sed 's/^issuer= *//')
+    [[ -n "$subj" && -n "$iss" && "$subj" != "$iss" ]]
+}
+
 # 把渲染好的 nginx 配置装入 <dest>（可选 <enabled_link> 软链接）；nginx -t 失败则回滚：
 #   - 原 dest 存在时必须先在同目录完成完整备份与字节核对，备份失败立即中止（绝不覆盖/删原配置）；
 #   - 新配置在目标同目录暂存并原子替换，回滚保留原 symlink 目标并在恢复失败时保留备份路径。
@@ -3578,8 +3678,14 @@ _handle_standalone_cert() {
     local sni="$1" force_new="${2:-false}"
     
     if [[ "$force_new" == "true" ]]; then
-        if _is_real_cert; then
+        local existing_domain=""
+        [[ -f "$CFG/cert_domain" ]] && existing_domain=$(cat "$CFG/cert_domain" 2>/dev/null || true)
+        if _is_real_cert "${existing_domain:-}" "$CFG/certs/server.key" 2>/dev/null; then
             _warn "检测到 CA 签发的真实证书，不会覆盖"
+            return 1
+        fi
+        if _cert_is_non_self_signed "$CFG/certs/server.crt"; then
+            _warn "检测到非自签证书（可能缺少完整中间链或系统 CA 库未更新），为避免损毁有效证书，不会覆盖"
             return 1
         fi
         rm -f "$CFG/certs/server.crt" "$CFG/certs/server.key"
@@ -6300,11 +6406,15 @@ create_fake_website() {
             
             # 检测是否使用真实证书 (真实域名模式)
             local is_real_domain=false
-            if [[ "$domain" == "$(cat "$CFG/cert_domain" 2>/dev/null)" ]] && _is_real_cert; then
-                is_real_domain=true
-                # 真实域名模式：回落和外部访问用同一个 HTTPS 端口
-                nginx_port="${custom_nginx_port:-8443}"
-                nginx_ssl="ssl"
+            if [[ "$domain" == "$(cat "$CFG/cert_domain" 2>/dev/null)" ]]; then
+                if _is_real_cert "$domain" "$CFG/certs/server.key"; then
+                    is_real_domain=true
+                    # 真实域名模式：回落和外部访问用同一个 HTTPS 端口
+                    nginx_port="${custom_nginx_port:-8443}"
+                    nginx_ssl="ssl"
+                else
+                    _warn "证书校验未通过（可能缺少完整中间链、SAN 不匹配或私钥不一致），Nginx 订阅回退 HTTP 端口 ${nginx_port}；请确认 $CFG/certs/server.crt 为完整证书链"
+                fi
             fi
         elif [[ "$protocol" == "vless-vision" || "$protocol" == "vless-ws" || "$protocol" == "vmess-ws" || "$protocol" == "trojan" ]]; then
             # 证书协议：Nginx 同时监听 80 (fallback) 和自定义端口 (HTTPS订阅)
@@ -10717,8 +10827,8 @@ command_background="yes"
 pidfile="/run/${service_name}.pid"
 depend() { need net; }
 start_pre() {
-    [[ -x "$CFG/hy2-nat.sh" ]] && "$CFG/hy2-nat.sh" || true
-    [[ -x "$CFG/tuic-nat.sh" ]] && "$CFG/tuic-nat.sh" || true
+    [ -x "$CFG/hy2-nat.sh" ] && "$CFG/hy2-nat.sh" || true
+    [ -x "$CFG/tuic-nat.sh" ] && "$CFG/tuic-nat.sh" || true
 }
 EOF
         chmod +x /etc/init.d/$service_name
@@ -11009,9 +11119,10 @@ gen_self_cert() {
     
     # 检查是否应该保护现有证书
     if [[ -f "$CFG/certs/server.crt" ]]; then
-        # 检查是否为 CA 签发的证书（真实证书不覆盖）
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" =~ (Let\'s\ Encrypt|R3|R10|R11|E1|E5|ZeroSSL|Buypass|DigiCert|Comodo|GlobalSign) ]]; then
+        # 检查是否为 CA 签发的真实证书或非自签证书（绝不误覆盖）
+        local existing_domain=""
+        [[ -f "$CFG/cert_domain" ]] && existing_domain=$(cat "$CFG/cert_domain" 2>/dev/null || true)
+        if _is_real_cert "${existing_domain:-}" "$CFG/certs/server.key" 2>/dev/null || _cert_is_non_self_signed "$CFG/certs/server.crt"; then
             _ok "检测到 CA 证书，跳过"
             return 0
         fi
@@ -11080,11 +11191,8 @@ gen_hy2_server_config() {
     # 检查是否有真实域名的 ACME 证书可复用
     if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
         local cert_domain=$(cat "$CFG/cert_domain")
-        local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-        if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]]; then
-            if [[ "$sni" == "$cert_domain" ]]; then
-                _ok "复用现有 ACME 证书 (域名: $sni)"
-            fi
+        if [[ "$sni" == "$cert_domain" ]] && _is_real_cert "$cert_domain" "$CFG/certs/server.key" 2>/dev/null; then
+            _ok "复用现有 ACME 证书 (域名: $sni)"
         fi
     fi
     
@@ -11629,8 +11737,8 @@ create_server_scripts() {
     # Watchdog 脚本 - 服务端监控进程（带重启次数限制）
     cat > "$CFG/watchdog.sh" << 'EOFSCRIPT'
 #!/bin/bash
-CFG="/etc/vless-reality"
-LOG_FILE="/var/log/vless-watchdog.log"
+CFG="${CFG:-/etc/vless-reality}"
+LOG_FILE="${LOG_FILE:-/var/log/vless-watchdog.log}"
 MAX_RESTARTS=5           # 冷却期内最大重启次数
 COOLDOWN_PERIOD=300      # 冷却期（秒）
 declare -A restart_counts
@@ -11691,13 +11799,15 @@ restart_service() {
     fi
 }
 
-# 兼容 systemd 与 Alpine BusyBox 的精确进程检测。
+# 与主脚本 _pgrep 对齐：兼容 systemd 与 Alpine BusyBox/gcompat 的精确进程检测（不误命中 timeout 等包装进程）
 _pgrep() {
     local proc="$1"
-    if pgrep -x "$proc" >/dev/null 2>&1; then
-        return 0
+    if [[ -f /etc/alpine-release ]]; then
+        pgrep "$proc" >/dev/null 2>&1 && return 0
+        pgrep -f "^((/usr/local/s?bin/|/usr/s?bin/)?${proc}|(/lib(64)?/)?ld-(linux|musl)[^[:space:]]*[[:space:]].*--[[:space:]]+(/usr/local/s?bin/|/usr/s?bin/)?${proc})([[:space:]]|$)" >/dev/null 2>&1
+    else
+        pgrep -x "$proc" >/dev/null 2>&1
     fi
-    pgrep -f "(^|/)$proc([[:space:]]|$)" >/dev/null 2>&1
 }
 
 # 获取所有需要监控的服务 (支持多协议) - 从数据库读取
@@ -11742,18 +11852,33 @@ get_all_services() {
     echo "$services"
 }
 
-log "INFO: Watchdog 启动"
-
-while true; do
+_watchdog_cycle() {
+    # 尊重管理员暂停态，禁止在 paused 下复活服务
+    [[ -f "$CFG/paused" ]] && return 0
     for svc_info in $(get_all_services); do
         IFS=':' read -r svc_name proc_name <<< "$svc_info"
+        # 尊重 F04：sing-box 因无有效用户自动停服时不得拉起崩溃循环
+        if [[ "$svc_name" == "vless-singbox" && -f "$CFG/.singbox-stopped-empty" ]]; then
+            continue
+        fi
         # 使用脚本内自包含的兼容函数，避免依赖主脚本作用域。
         if ! _pgrep "$proc_name"; then
             log "CRITICAL: $proc_name 进程不存在，尝试重启 $svc_name..."
             restart_service "$svc_name"
-            sleep 5
+            sleep "${WATCHDOG_POST_RESTART_SLEEP:-5}"
         fi
     done
+}
+
+if [[ "${VLESS_WATCHDOG_ONCE:-0}" == "1" ]]; then
+    _watchdog_cycle
+    exit 0
+fi
+
+log "INFO: Watchdog 启动"
+
+while true; do
+    _watchdog_cycle
     sleep 60
 done
 EOFSCRIPT
@@ -11918,12 +12043,12 @@ create_service() {
         cat >"/etc/init.d/${name}" <<EOF
 #!/sbin/openrc-run
 name="${desc}"
+${env:+export ${env}}
+${env_file:+[ -f "${env_file}" ] && STLS_PASSWORD=\$(sed -n '1s/^STLS_PASSWORD=//p' "${env_file}")}
 command="${cmd}"
 command_args="${args}"
 command_background="yes"
 pidfile="/run/${name}.pid"
-${env:+export ${env}}
-${env_file:+[ -f "${env_file}" ] && . "${env_file}"}
 depend() { need net; }
 EOF
         chmod +x "/etc/init.d/${name}"
@@ -14898,12 +15023,22 @@ _del_routing_rule() {
 _regenerate_proxy_configs() {
     # 返回 0 仅当所有已安装核心的“预检 + 重载”都成功；任一核心预检失败则保留原配置、
     # 不重启该核心（避免用失败/过期的配置重启并误报成功），并返回非 0。
+    # 遵循 F04 合同：管理员主动停服或存在 $CFG/paused 时仅更新配置不越权拉起服务；
+    # 若 sing-box 因无启用用户自动停服且未被暂停，则在新配置有效时自动恢复启动。
     local rc=0
     local xray_protocols=$(get_xray_protocols)
     if [[ -n "$xray_protocols" ]]; then
         if generate_xray_config; then
-            _traffic_collect_to_journal 2>/dev/null || true
-            svc restart vless-reality 2>/dev/null || { _err "Xray 服务重启失败"; rc=1; }
+            if is_paused; then
+                _info "Xray 配置已更新（服务处于暂停状态，保持停止）"
+            elif svc status vless-reality 2>/dev/null; then
+                if ! _traffic_collect_to_journal 2>/dev/null; then
+                    _warn "重启前流量计数器落盘失败，本次重启前增量可能存在采样缺口"
+                fi
+                svc restart vless-reality 2>/dev/null || { _err "Xray 服务重启失败"; rc=1; }
+            else
+                _info "Xray 配置已更新（服务未运行，保持停止）"
+            fi
         else
             _err "Xray 配置重建失败，已保留原配置，未重启 Xray"
             rc=1
@@ -14915,10 +15050,23 @@ _regenerate_proxy_configs() {
         local sb_gen_rc=0
         generate_singbox_config || sb_gen_rc=$?
         if [[ $sb_gen_rc -eq 0 ]]; then
-            if svc restart vless-singbox 2>/dev/null; then
-                rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+            if is_paused; then
+                _info "Sing-box 配置已更新（服务处于暂停状态，保持停止）"
+            elif svc status vless-singbox 2>/dev/null; then
+                if svc restart vless-singbox 2>/dev/null; then
+                    rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+                else
+                    _err "Sing-box 服务重启失败"; rc=1
+                fi
+            elif [[ -e "$CFG/.singbox-stopped-empty" ]]; then
+                if svc start vless-singbox 2>/dev/null; then
+                    rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+                    _ok "Sing-box 配置已更新并自动恢复启动"
+                else
+                    _err "Sing-box 自动恢复启动失败"; rc=1
+                fi
             else
-                _err "Sing-box 服务重启失败"; rc=1
+                _info "Sing-box 配置已更新（服务未运行，保持停止）"
             fi
         elif [[ $sb_gen_rc -eq 2 ]]; then
             if svc status vless-singbox 2>/dev/null; then
@@ -15138,21 +15286,8 @@ configure_direct_outbound() {
     echo "$new_setting" > "$CFG/direct_ip_version"
     _ok "直连出口已设置为: $new_setting"
     
-    # 重新生成配置
-    local xray_protocols=$(get_xray_protocols)
-    if [[ -n "$xray_protocols" ]]; then
-        _info "重新生成 Xray 配置..."
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
-    fi
-    
-    local singbox_protocols=$(get_singbox_protocols)
-    if [[ -n "$singbox_protocols" ]]; then
-        _info "重新生成 Sing-box 配置..."
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
-    fi
+    # 重新生成配置（复用 _regenerate_proxy_configs，统一遵守 paused/运行态/F04 守卫并正确重载双核心）
+    _regenerate_proxy_configs
 }
 
 # WARP → 落地 双层链式代理一键配置
@@ -15383,27 +15518,10 @@ setup_warp_ipv6_chain() {
             ;;
     esac
     
-    # 5. 重新生成配置
+    # 5. 重新生成配置（复用 _regenerate_proxy_configs，统一遵守 paused/运行态/F04 守卫）
     echo ""
     _info "正在生成双层链式代理配置..."
-    
-    # 重新生成 Xray 配置
-    local xray_protocols=$(get_xray_protocols)
-    if [[ -n "$xray_protocols" ]]; then
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
-        _ok "Xray 配置已更新"
-    fi
-    
-    # 重新生成 Sing-box 配置
-    local singbox_protocols=$(get_singbox_protocols)
-    if [[ -n "$singbox_protocols" ]]; then
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
-        svc start vless-singbox 2>/dev/null
-        _ok "Sing-box 配置已更新"
-    fi
+    _regenerate_proxy_configs
     
     _ok "配置完成!"
     echo ""
@@ -15751,9 +15869,12 @@ db_add_chain_node() {
     _db_apply --argjson node "$node_json" '.chain_proxy.nodes = ((.chain_proxy.nodes // []) + [$node])'
 }
 db_del_chain_node() {
-    _db_apply --arg name "$1" '.chain_proxy.nodes = [.chain_proxy.nodes[] | select(.name != $name)]'
+    _db_apply --arg name "$1" '.chain_proxy.nodes = [.chain_proxy.nodes[] | select(.name != $name)]' || return 1
     # 如果删除的是当前激活节点，清空激活状态
-    [[ "$(db_get_chain_active)" == "$1" ]] && _db_apply 'del(.chain_proxy.active)'
+    if [[ "$(db_get_chain_active)" == "$1" ]]; then
+        _db_apply 'del(.chain_proxy.active)' || return 1
+    fi
+    return 0
 }
 
 # 检查链式代理节点是否存在 (返回 0=存在, 1=不存在)
@@ -15834,20 +15955,21 @@ parse_proxy_link() {
             host="${parsed%%|*}"
             port="${parsed##*|}"
             
-            # 确保 port 是纯数字
+            # 确保 host 与 port 合法（拒绝越界端口与 URI 结构注入字符）
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             
             [[ -z "$name" ]] && name="SOCKS5-${host}:${port}"
             if [[ -n "$host" && -n "$port" ]]; then
                 if [[ -n "$username" ]]; then
                     result=$(jq -nc \
-                        --arg name "$name" --arg host "$host" --argjson port "$port" \
+                        --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
                         --arg username "$username" --arg password "$password" \
                         '{name:$name,type:"socks",server:$host,port:$port,username:$username,password:$password}')
                 else
                     result=$(jq -nc \
-                        --arg name "$name" --arg host "$host" --argjson port "$port" \
+                        --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
                         '{name:$name,type:"socks",server:$host,port:$port}')
                 fi
             fi
@@ -15882,13 +16004,14 @@ parse_proxy_link() {
             host="${parsed%%|*}"
             port="${parsed##*|}"
             
-            # 确保 port 是纯数字
+            # 确保 host 与 port 合法
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             
             [[ -z "$name" ]] && name="Naive-${host}:${port}"
             [[ -n "$host" && -n "$port" && -n "$username" && -n "$password" ]] && result=$(jq -nc \
-                --arg name "$name" --arg host "$host" --argjson port "$port" \
+                --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
                 --arg username "$username" --arg password "$password" \
                 '{name:$name,type:"naive",server:$host,port:$port,username:$username,password:$password}')
             ;;
@@ -15927,31 +16050,28 @@ parse_proxy_link() {
                 host="${parsed%%|*}"
                 port="${parsed##*|}"
             else
-                # 旧格式: 整体 base64 编码 (method:password@host:port)
+                # 旧格式: 整体 base64 编码 (method:password@host:port)，兼容密码含 ':' 或 '@'
                 local decoded=$(echo "$encoded" | base64 -d 2>/dev/null)
                 if [[ -n "$decoded" && "$decoded" == *"@"* ]]; then
-                    method=$(echo "$decoded" | cut -d: -f1)
-                    password=$(echo "$decoded" | cut -d: -f2 | cut -d@ -f1)
-                    local hostport_part="${decoded#*@}"
-                    # 支持 IPv6: [::1]:port 或 host:port
-                    if [[ "$hostport_part" == "["* ]]; then
-                        host=$(echo "$hostport_part" | sed 's/^\[\([^]]*\)\].*/\1/')
-                        port=$(echo "$hostport_part" | sed 's/.*\]://')
-                    else
-                        host=$(echo "$hostport_part" | cut -d: -f1)
-                        port=$(echo "$hostport_part" | rev | cut -d: -f1 | rev)
-                    fi
+                    local userinfo_part="${decoded%@*}"
+                    local hostport_part="${decoded##*@}"
+                    method="${userinfo_part%%:*}"
+                    password="${userinfo_part#*:}"
+                    local parsed=$(_parse_hostport "$hostport_part")
+                    host="${parsed%%|*}"
+                    port="${parsed##*|}"
                 fi
             fi
             
-            # 确保 port 是纯数字
+            # 确保 host 与 port 合法
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             
             [[ -z "$name" ]] && name="SS-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$method" && -n "$password" ]] && result=$(jq -nc \
                 --arg name "$name" --arg type "shadowsocks" --arg host "$host" \
-                --argjson port "$port" --arg method "$method" --arg password "$password" \
+                --argjson port "$((10#$port))" --arg method "$method" --arg password "$password" \
                 '{name:$name,type:$type,server:$host,port:$port,method:$method,password:$password}')
             ;;
         vmess://*)
@@ -15969,15 +16089,16 @@ parse_proxy_link() {
             local ws_path=$(echo "$decoded" | jq -r '.path // "/"')
             local ws_host=$(echo "$decoded" | jq -r '.host // ""')
             
-            # 确保 port 和 aid 是纯数字
+            # 确保 host、port 和 aid 合法
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             aid=$(echo "$aid" | tr -d '"' | tr -d ' ')
             [[ ! "$aid" =~ ^[0-9]+$ ]] && aid=0
             
             [[ -n "$host" && -n "$port" && -n "$uuid" ]] && result=$(jq -nc \
-                --arg name "$name" --arg host "$host" --argjson port "$port" \
-                --arg uuid "$uuid" --argjson aid "$aid" --arg net "$net" \
+                --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
+                --arg uuid "$uuid" --argjson aid "$((10#$aid))" --arg net "$net" \
                 --arg tls "$tls" --arg path "$ws_path" --arg wshost "$ws_host" \
                 '{name:$name,type:"vmess",server:$host,port:$port,uuid:$uuid,alterId:$aid,network:$net,tls:$tls,wsPath:$path,wsHost:$wshost}')
             ;;
@@ -15996,9 +16117,10 @@ parse_proxy_link() {
             host="${parsed%%|*}"
             port="${parsed##*|}"
             
-            # 确保 port 是纯数字
+            # 确保 host 与 port 合法
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             
             # 解析参数
             local params=""
@@ -16023,7 +16145,7 @@ parse_proxy_link() {
             
             [[ -z "$name" ]] && name="VLESS-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$uuid" ]] && result=$(jq -nc \
-                --arg name "$name" --arg host "$host" --argjson port "$port" \
+                --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
                 --arg uuid "$uuid" --arg security "$security" --arg sni "$sni" \
                 --arg fp "$fp" --arg net "$net" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" --arg enc "$encryption" \
                 --arg wsPath "$ws_path" --arg wsHost "$ws_host" \
@@ -16044,9 +16166,10 @@ parse_proxy_link() {
             host="${parsed%%|*}"
             port="${parsed##*|}"
             
-            # 确保 port 是纯数字
+            # 确保 host 与 port 合法
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             
             local params=""
             [[ "$content" == *"?"* ]] && params="${content#*\?}"
@@ -16055,7 +16178,7 @@ parse_proxy_link() {
             
             [[ -z "$name" ]] && name="Trojan-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$password" ]] && result=$(jq -nc \
-                --arg name "$name" --arg host "$host" --argjson port "$port" \
+                --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
                 --arg password "$password" --arg sni "$sni" \
                 '{name:$name,type:"trojan",server:$host,port:$port,password:$password,sni:$sni}')
             ;;
@@ -16075,20 +16198,22 @@ parse_proxy_link() {
             host="${parsed%%|*}"
             port="${parsed##*|}"
             
-            # 确保 port 是纯数字
+            # 确保 host 与 port 合法
             port=$(echo "$port" | tr -d '"' | tr -d ' ')
-            [[ ! "$port" =~ ^[0-9]+$ ]] && return 1
+            _valid_sub_port "$port" || return 1
+            _valid_sub_server "$host" || return 1
             
             local params=""
             [[ "$content" == *"?"* ]] && params="${content#*\?}"
             local sni=$(_get_query_param "$params" "sni")
             [[ -z "$sni" ]] && sni="$host"
             local insecure=$(_get_query_param "$params" "insecure")
+            [[ -z "$insecure" ]] && insecure=$(_get_query_param "$params" "allowInsecure")
             [[ -z "$insecure" ]] && insecure="0"
             
             [[ -z "$name" ]] && name="HY2-${host##*.}"
             [[ -n "$host" && -n "$port" && -n "$password" ]] && result=$(jq -nc \
-                --arg name "$name" --arg host "$host" --argjson port "$port" \
+                --arg name "$name" --arg host "$host" --argjson port "$((10#$port))" \
                 --arg password "$password" --arg sni "$sni" --arg insecure "$insecure" \
                 '{name:$name,type:"hysteria2",server:$host,port:$port,password:$password,sni:$sni,insecure:$insecure}')
             ;;
@@ -16097,18 +16222,28 @@ parse_proxy_link() {
     [[ -n "$result" ]] && echo "$result" || return 1
 }
 
-# 解析订阅链接
+# 解析订阅链接（与 fetch_subscription 对齐：通过 curl -K - 避免订阅 URL/Token 暴露于 /proc/<pid>/cmdline）
 parse_subscription() {
     local url="$1"
     local content nodes=()
     
+    if [[ ! "$url" =~ ^https?:// ]] || _has_ctrl_chars "$url"; then
+        _err "无效的订阅链接"
+        return 1
+    fi
     _info "获取订阅内容..."
-    content=$(curl -sL --connect-timeout 10 "$url" 2>/dev/null)
+    local curl_url_escaped="${url//\\/\\\\}"
+    curl_url_escaped="${curl_url_escaped//\"/\\\"}"
+    content=$(printf 'url = "%s"\n' "$curl_url_escaped" | curl -fsSL --proto '=http,https' --connect-timeout 10 --max-time 30 -K - 2>/dev/null)
     [[ -z "$content" ]] && { _err "获取订阅失败"; return 1; }
     
-    # 尝试 base64 解码
-    local decoded=$(echo "$content" | base64 -d 2>/dev/null)
-    [[ -n "$decoded" ]] && content="$decoded"
+    # 仅当内容不是明文代理链接时尝试 base64 解码，避免 base64 -d 在明文前几字节输出乱码覆盖原内容
+    if [[ "$content" != *"://"* ]]; then
+        local decoded
+        if decoded=$(printf '%s' "$content" | tr -d '\r\n ' | base64 -d 2>/dev/null) && [[ "$decoded" == *"://"* ]]; then
+            content="$decoded"
+        fi
+    fi
     
     # 按行解析
     local count=0
@@ -18797,14 +18932,10 @@ show_single_protocol_info() {
     if [[ "$protocol" =~ ^(vmess-ws|vless-ws|vless-vision|trojan|trojan-ws|hy2)$ ]]; then
         # 检查是否是自签名证书（没有真实域名）
         local is_self_signed=true
-        if [[ -f "$CFG/cert_domain" ]]; then
+        if [[ -f "$CFG/cert_domain" && -f "$CFG/certs/server.crt" ]]; then
             local cert_domain=$(cat "$CFG/cert_domain")
-            # 检查证书是否由 CA 签发
-            if [[ -f "$CFG/certs/server.crt" ]]; then
-                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"ZeroSSL"* ]]; then
-                    is_self_signed=false
-                fi
+            if [[ -n "$cert_domain" ]] && _is_real_cert "$cert_domain" "$CFG/certs/server.key" 2>/dev/null; then
+                is_self_signed=false
             fi
         fi
         if [[ "$is_self_signed" == "true" ]]; then
@@ -19169,8 +19300,16 @@ uninstall_specific_protocol() {
             # 此时不得停服务/删配置，否则其它仍在服务的端口会被一并拖停。成功后只重启一次。
             if generate_xray_config; then
                 _ok "Xray 配置已更新"
-                _traffic_collect_to_journal 2>/dev/null || true
-                svc restart vless-reality 2>/dev/null || { _err "Xray 服务重启失败"; _uninstall_rc=1; }
+                if is_paused; then
+                    _info "Xray 服务处于暂停状态，保持停止"
+                elif svc status vless-reality 2>/dev/null; then
+                    if ! _traffic_collect_to_journal 2>/dev/null; then
+                        _warn "重启前流量计数器落盘失败，本次重启前增量可能存在采样缺口"
+                    fi
+                    svc restart vless-reality 2>/dev/null || { _err "Xray 服务重启失败"; _uninstall_rc=1; }
+                else
+                    _info "Xray 服务未运行，保持停止"
+                fi
             else
                 _err "Xray 配置生成失败：已保留原配置与运行中的服务，其它端口不受影响"
                 _uninstall_rc=1
@@ -19253,10 +19392,23 @@ uninstall_specific_protocol() {
             generate_singbox_config || sb_gen_rc=$?
             if [[ $sb_gen_rc -eq 0 ]]; then
                 _ok "Sing-box 配置已更新"
-                if svc restart vless-singbox 2>/dev/null; then
-                    rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+                if is_paused; then
+                    _info "Sing-box 服务处于暂停状态，保持停止"
+                elif svc status vless-singbox 2>/dev/null; then
+                    if svc restart vless-singbox 2>/dev/null; then
+                        rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+                    else
+                        _err "Sing-box 服务重启失败"; _uninstall_rc=1
+                    fi
+                elif [[ -e "$CFG/.singbox-stopped-empty" ]]; then
+                    if svc start vless-singbox 2>/dev/null; then
+                        rm -f "$CFG/.singbox-stopped-empty" 2>/dev/null || true
+                        _ok "Sing-box 已自动恢复启动"
+                    else
+                        _err "Sing-box 自动恢复启动失败"; _uninstall_rc=1
+                    fi
                 else
-                    _err "Sing-box 服务重启失败"; _uninstall_rc=1
+                    _info "Sing-box 服务未运行，保持停止"
                 fi
             elif [[ $sb_gen_rc -eq 2 ]]; then
                 if svc status vless-singbox 2>/dev/null; then
@@ -20162,10 +20314,9 @@ do_install_server() {
                 [[ "$path" != /* ]] && path="/$path"
                 
                 # 检测是否为真实证书（用于显示订阅需显式启用的提示）
-                local _is_real_cert=false
-                if [[ -f "$CFG/certs/server.crt" ]]; then
-                    local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                    [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
+                local _has_real_cert=false
+                if [[ -n "$cert_domain" ]] && _is_real_cert "$cert_domain" "$CFG/certs/server.key" 2>/dev/null; then
+                    _has_real_cert=true
                 fi
                 
                 echo ""
@@ -20180,7 +20331,7 @@ do_install_server() {
                 fi
                 echo -e "  UUID: ${G}${uuid:0:8}...${NC}"
                 echo -e "  SNI: ${G}$final_sni${NC}  Path: ${G}$path${NC}"
-                [[ -n "$cert_domain" && "$_is_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
+                [[ -n "$cert_domain" && "$_has_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
                 _line
                 echo ""
                 read -rp "  确认安装? [Y/n]: " confirm
@@ -20234,13 +20385,10 @@ do_install_server() {
                 fi
             else
                 # 独立安装
-                # 检查是否有真实证书（CA 签发的）
+                # 检查是否有真实证书（CA 签发的受信任证书）
                 local is_real_cert=false
-                if [[ -f "$CFG/certs/server.crt" ]]; then
-                    local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                    if [[ "$issuer" == *"Let's Encrypt"* ]] || [[ "$issuer" == *"R3"* ]] || [[ "$issuer" == *"R10"* ]] || [[ "$issuer" == *"R11"* ]] || [[ "$issuer" == *"E1"* ]] || [[ "$issuer" == *"ZeroSSL"* ]] || [[ "$issuer" == *"Buypass"* ]]; then
-                        is_real_cert=true
-                    fi
+                if [[ -n "$cert_domain" ]] && _is_real_cert "$cert_domain" "$CFG/certs/server.key" 2>/dev/null; then
+                    is_real_cert=true
                 fi
                 
                 if [[ "$is_real_cert" == "true" && -n "$cert_domain" ]]; then
@@ -20307,13 +20455,12 @@ do_install_server() {
             _line
             echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
             # 检测是否为真实证书
-            local _is_real_cert=false
-            if [[ -f "$CFG/certs/server.crt" ]]; then
-                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
+            local _has_real_cert=false
+            if [[ -n "$CERT_DOMAIN" ]] && _is_real_cert "$CERT_DOMAIN" "$CFG/certs/server.key" 2>/dev/null; then
+                _has_real_cert=true
             fi
             echo -e "  SNI: ${G}$final_sni${NC}"
-            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
+            [[ -n "$CERT_DOMAIN" && "$_has_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -20645,12 +20792,11 @@ do_install_server() {
             echo -e "  SNI: ${G}$final_sni${NC}"
             [[ "$use_ws" == "true" ]] && echo -e "  Path: ${G}$path${NC}"
             # 检测是否为真实证书
-            local _is_real_cert=false
-            if [[ -f "$CFG/certs/server.crt" ]]; then
-                local issuer=$(openssl x509 -in "$CFG/certs/server.crt" -noout -issuer 2>/dev/null)
-                [[ "$issuer" == *"Let's Encrypt"* || "$issuer" == *"R3"* || "$issuer" == *"R10"* || "$issuer" == *"R11"* || "$issuer" == *"E1"* || "$issuer" == *"ZeroSSL"* || "$issuer" == *"Buypass"* ]] && _is_real_cert=true
+            local _has_real_cert=false
+            if [[ -n "$CERT_DOMAIN" ]] && _is_real_cert "$CERT_DOMAIN" "$CFG/certs/server.key" 2>/dev/null; then
+                _has_real_cert=true
             fi
-            [[ -n "$CERT_DOMAIN" && "$_is_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
+            [[ -n "$CERT_DOMAIN" && "$_has_real_cert" == "true" ]] && echo -e "  ${D}订阅默认关闭；可在主菜单 6 显式启用${NC}"
             _line
             echo ""
             read -rp "  确认安装? [Y/n]: " confirm
@@ -21229,6 +21375,16 @@ _valid_sub_port() {
     [[ "$p" =~ ^[0-9]{1,5}$ ]] && (( 10#$p >= 1 && 10#$p <= 65535 ))
 }
 
+# 校验外部节点 server 字段：非空、不含控制/空白或 URI 结构字符（@ ? / # \ , = 引号 ;），
+# 仅允许域名/IPv4/IPv6 字符集，防止中间分享链接 userinfo/query/fragment 畸形与结构污染。
+_valid_sub_server() {
+    local s="${1:-}"
+    [[ -n "$s" ]] || return 1
+    _has_ctrl_chars "$s" && return 1
+    [[ "$s" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+    [[ "$s" != .* && "$s" != *. && "$s" != -* ]]
+}
+
 # 校验网络传输类型枚举白名单
 _valid_sub_network() {
     case "${1:-tcp}" in
@@ -21291,7 +21447,7 @@ parse_vless_link() {
     local port="${parsed##*|}"
 
     # 解析参数
-    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption="" insecure="false"
+    local security="" type="" sni="" pbk="" sid="" flow="" path="" host="" fp="" encryption="" service_name="" insecure="false"
     if [[ -n "$params" ]]; then
         local -a PARAMS=()
         local param key value
@@ -21313,6 +21469,7 @@ parse_vless_link() {
                 host) host="$value" ;;
                 fp) fp="$value" ;;
                 encryption) encryption="$value" ;;
+                serviceName|service_name) service_name="$value" ;;
                 allowInsecure|allow_insecure|insecure) insecure=$(_parse_insecure_flag "$value") ;;
                 headerType) ;; # 忽略
             esac
@@ -21326,7 +21483,8 @@ parse_vless_link() {
         return 1
     fi
     [[ -n "$server" && -n "$uuid" ]] || return 1
-    _reject_ctrl_fields "$server" "$uuid" "$security" "${type:-tcp}" "$sni" "$pbk" "$sid" "$flow" "$path" "$host" "${fp:-chrome}" "$encryption" || return 1
+    _valid_sub_server "$server" || return 1
+    _reject_ctrl_fields "$server" "$uuid" "$security" "${type:-tcp}" "$sni" "$pbk" "$sid" "$flow" "$path" "$host" "${fp:-chrome}" "$encryption" "$service_name" || return 1
     _valid_sub_network "${type:-tcp}" || return 1
 
     # 输出 JSON 格式 (使用 jq 确保正确转义，port/insecure 使用 argjson)
@@ -21347,8 +21505,9 @@ parse_vless_link() {
         --arg host "$host" \
         --arg fingerprint "${fp:-chrome}" \
         --arg encryption "$encryption" \
+        --arg serviceName "$service_name" \
         --argjson insecure "$insecure" \
-        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption,insecure:$insecure}'
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,security:$security,transport:$transport,sni:$sni,publicKey:$publicKey,shortId:$shortId,flow:$flow,path:$path,host:$host,fingerprint:$fingerprint,encryption:$encryption,serviceName:$serviceName,insecure:$insecure}'
 }
 
 # 解析 vmess:// 链接
@@ -21361,7 +21520,7 @@ parse_vmess_link() {
     [[ -z "$json" ]] && return 1
     jq -e 'type == "object"' <<< "$json" >/dev/null 2>&1 || return 1
 
-    local name server port uuid aid net host path tls sni raw_insecure insecure
+    local name server port uuid aid net host path tls sni service_name raw_insecure insecure
     name=$(jq -r '.ps // .name // "VMess"' <<< "$json")
     server=$(jq -r '.add // .server // empty' <<< "$json")
     port=$(jq -r '.port // empty' <<< "$json")
@@ -21372,6 +21531,8 @@ parse_vmess_link() {
     path=$(jq -r '.path // ""' <<< "$json")
     tls=$(jq -r '.tls // ""' <<< "$json")
     sni=$(jq -r '.sni // ""' <<< "$json")
+    service_name=$(jq -r '.serviceName // .["service-name"] // empty' <<< "$json")
+    [[ "${net:-tcp}" == "grpc" && -z "$service_name" ]] && service_name="$path"
     raw_insecure=$(jq -r '.allowInsecure // .allow_insecure // .insecure // .["skip-cert-verify"] // false' <<< "$json")
     insecure=$(_parse_insecure_flag "$raw_insecure")
 
@@ -21384,7 +21545,8 @@ parse_vmess_link() {
     aid=$(printf '%s' "$aid" | tr -d '" ')
     [[ ! "$aid" =~ ^[0-9]+$ ]] && aid="0"
     [[ -n "$server" && -n "$uuid" ]] || return 1
-    _reject_ctrl_fields "$server" "$uuid" "$net" "$host" "$path" "$tls" "$sni" || return 1
+    _valid_sub_server "$server" || return 1
+    _reject_ctrl_fields "$server" "$uuid" "$net" "$host" "$path" "$tls" "$sni" "$service_name" || return 1
     _valid_sub_network "${net:-tcp}" || return 1
 
     # 使用 jq 生成 JSON，确保 port/aid/insecure 是严格类型
@@ -21400,8 +21562,9 @@ parse_vmess_link() {
         --arg path "$path" \
         --arg tls "$tls" \
         --arg sni "$sni" \
+        --arg serviceName "$service_name" \
         --argjson insecure "$insecure" \
-        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,aid:$aid,network:$network,host:$host,path:$path,tls:$tls,sni:$sni,insecure:$insecure}'
+        '{type:$type,name:$name,server:$server,port:$port,uuid:$uuid,aid:$aid,network:$network,host:$host,path:$path,tls:$tls,sni:$sni,serviceName:$serviceName,insecure:$insecure}'
 }
 
 # 解析 trojan:// 链接
@@ -21431,7 +21594,7 @@ parse_trojan_link() {
     local server="${parsed%%|*}"
     local port="${parsed##*|}"
 
-    local sni="" type="tcp" path="" host="" insecure="false"
+    local sni="" type="tcp" path="" host="" service_name="" insecure="false"
     if [[ -n "$params" ]]; then
         local -a PARAMS=()
         local param key value
@@ -21447,6 +21610,7 @@ parse_trojan_link() {
                 type) type="$value" ;;
                 path) path="$value" ;;
                 host) host="$value" ;;
+                serviceName|service_name) service_name="$value" ;;
                 allowInsecure|allow_insecure|insecure) insecure=$(_parse_insecure_flag "$value") ;;
             esac
         done
@@ -21458,7 +21622,8 @@ parse_trojan_link() {
         return 1
     fi
     [[ -n "$server" && -n "$password" ]] || return 1
-    _reject_ctrl_fields "$server" "$password" "$sni" "${type:-tcp}" "$path" "$host" || return 1
+    _valid_sub_server "$server" || return 1
+    _reject_ctrl_fields "$server" "$password" "$sni" "${type:-tcp}" "$path" "$host" "$service_name" || return 1
     _valid_sub_network "${type:-tcp}" || return 1
 
     jq -nc \
@@ -21471,8 +21636,9 @@ parse_trojan_link() {
         --arg transport "${type:-tcp}" \
         --arg path "$path" \
         --arg host "$host" \
+        --arg serviceName "$service_name" \
         --argjson insecure "$insecure" \
-        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,transport:$transport,path:$path,host:$host,insecure:$insecure}'
+        '{type:$type,name:$name,server:$server,port:$port,password:$password,sni:$sni,transport:$transport,path:$path,host:$host,serviceName:$serviceName,insecure:$insecure}'
 }
 
 # 解析 ss:// 链接
@@ -21530,6 +21696,7 @@ parse_ss_link() {
         return 1
     fi
     [[ -n "$server" && -n "$method" && -n "$password" ]] || return 1
+    _valid_sub_server "$server" || return 1
     _reject_ctrl_fields "$server" "$method" "$password" || return 1
 
     jq -nc \
@@ -21593,6 +21760,7 @@ parse_hy2_link() {
         return 1
     fi
     [[ -n "$server" && -n "$password" ]] || return 1
+    _valid_sub_server "$server" || return 1
     _reject_ctrl_fields "$server" "$password" "$sni" || return 1
 
     jq -nc \
@@ -21665,6 +21833,7 @@ parse_tuic_link() {
         return 1
     fi
     [[ -n "$server" && -n "$uuid" ]] || return 1
+    _valid_sub_server "$server" || return 1
     _reject_ctrl_fields "$server" "$uuid" "$password" "$sni" "$alpn" "$cc" "$udp_mode" || return 1
 
     jq -nc \
@@ -21732,6 +21901,7 @@ parse_anytls_link() {
         return 1
     fi
     [[ -n "$server" && -n "$password" ]] || return 1
+    _valid_sub_server "$server" || return 1
     _reject_ctrl_fields "$server" "$password" "$sni" || return 1
 
     jq -nc \
@@ -21782,13 +21952,31 @@ get_link_name() {
 _clash_emit_proxy_link() {
     local name="$1" type="$2" server="$3" port="$4" uuid="$5" password="$6" method="$7"
     local network="$8" tls="$9" sni="${10}" path="${11}" host="${12}" flow="${13}" pbk="${14}" sid="${15}"
-    local scv="${16}" fp="${17}" alpn="${18}" cc="${19}" udp_mode="${20}"
+    local scv="${16}" fp="${17}" alpn="${18}" cc="${19}" udp_mode="${20}" service_name="${21:-}"
 
-    [[ -n "$name" && -n "$type" && -n "$server" && -n "$port" ]] || return 1
-    _valid_sub_port "$port" || return 1
-    _reject_ctrl_fields "$server" "$uuid" "$password" "$method" "${network:-tcp}" "$sni" "$path" "$host" "$flow" "$pbk" "$sid" "$fp" "$alpn" "$cc" "$udp_mode" || return 1
     name="${name//$'\r'/}"
     name="${name//$'\n'/}"
+    local label="${name:-unnamed}"
+
+    if [[ -z "$name" || -z "$type" || -z "$server" || -z "$port" ]]; then
+        _warn "跳过缺少必填字段的 Clash 节点: ${type:-unknown} ($label)" >&2
+        return 1
+    fi
+    if [[ "$server" =~ ^\[([0-9A-Fa-f:.]+)\]$ ]]; then
+        server="${BASH_REMATCH[1]}"
+    fi
+    if ! _valid_sub_port "$port"; then
+        _warn "跳过端口非法的 Clash 节点: $type ($label, port=$port)" >&2
+        return 1
+    fi
+    if ! _valid_sub_server "$server"; then
+        _warn "跳过服务器地址非法的 Clash 节点: $type ($label)" >&2
+        return 1
+    fi
+    if ! _reject_ctrl_fields "$server" "$uuid" "$password" "$method" "${network:-tcp}" "$sni" "$path" "$host" "$flow" "$pbk" "$sid" "$fp" "$alpn" "$cc" "$udp_mode" "$service_name"; then
+        _warn "跳过含非法控制字符的 Clash 节点: $type ($label)" >&2
+        return 1
+    fi
 
     local hp
     hp=$(_fmt_hostport "$server" "$((10#$port))")
@@ -21802,8 +21990,14 @@ _clash_emit_proxy_link() {
 
     case "$t_low" in
         vless)
-            [[ -n "$uuid" ]] || return 1
-            _valid_sub_network "$net" || return 1
+            if [[ -z "$uuid" ]]; then
+                _warn "跳过缺少 uuid 的 Clash VLESS 节点: ($label)" >&2
+                return 1
+            fi
+            if ! _valid_sub_network "$net"; then
+                _warn "跳过不支持传输层 ($net) 的 Clash VLESS 节点: ($label)" >&2
+                return 1
+            fi
             local link="vless://$(urlencode "$uuid")@${hp}?encryption=none&type=$(urlencode "$net")"
             [[ -n "$flow" ]] && link+="&flow=$(urlencode "$flow")"
             if [[ -n "$pbk" ]]; then
@@ -21817,15 +22011,24 @@ _clash_emit_proxy_link() {
             if [[ "$net" == "ws" ]]; then
                 [[ -n "$path" ]] && link+="&path=$(urlencode "$path")"
                 [[ -n "$host" ]] && link+="&host=$(urlencode "$host")"
+            elif [[ "$net" == "grpc" && -n "$service_name" ]]; then
+                link+="&serviceName=$(urlencode "$service_name")"
             fi
             link+="#$(urlencode "$name")"
             printf '%s\n' "$link"
             ;;
         vmess)
-            [[ -n "$uuid" ]] || return 1
-            _valid_sub_network "$net" || return 1
-            local v_tls=""
+            if [[ -z "$uuid" ]]; then
+                _warn "跳过缺少 uuid 的 Clash VMess 节点: ($label)" >&2
+                return 1
+            fi
+            if ! _valid_sub_network "$net"; then
+                _warn "跳过不支持传输层 ($net) 的 Clash VMess 节点: ($label)" >&2
+                return 1
+            fi
+            local v_tls="" v_path="$path"
             [[ "$tls_low" == "true" || "$tls_low" == "1" || "$tls_low" == "tls" ]] && v_tls="tls"
+            [[ "$net" == "grpc" && -z "$v_path" && -n "$service_name" ]] && v_path="$service_name"
             local vmess_json
             vmess_json=$(jq -nc \
                 --arg ps "$name" \
@@ -21834,46 +22037,68 @@ _clash_emit_proxy_link() {
                 --arg id "$uuid" \
                 --arg net "$net" \
                 --arg host "$host" \
-                --arg path "$path" \
+                --arg path "$v_path" \
+                --arg serviceName "$service_name" \
                 --arg tls "$v_tls" \
                 --arg sni "$sni" \
                 --argjson allowInsecure "$insecure" \
-                '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:$net,type:"none",host:$host,path:$path,tls:$tls,sni:$sni,allowInsecure:$allowInsecure}') || return 1
+                '{v:"2",ps:$ps,add:$add,port:$port,id:$id,aid:"0",scy:"auto",net:$net,type:"none",host:$host,path:$path,serviceName:$serviceName,tls:$tls,sni:$sni,allowInsecure:$allowInsecure}') || return 1
             printf 'vmess://%s\n' "$(printf '%s' "$vmess_json" | base64 -w 0 2>/dev/null || printf '%s' "$vmess_json" | base64 | tr -d '\n')"
             ;;
         trojan)
-            [[ -n "$password" ]] || return 1
+            if [[ -z "$password" ]]; then
+                _warn "跳过缺少 password 的 Clash Trojan 节点: ($label)" >&2
+                return 1
+            fi
+            if ! _valid_sub_network "$net"; then
+                _warn "跳过不支持传输层 ($net) 的 Clash Trojan 节点: ($label)" >&2
+                return 1
+            fi
             local link="trojan://$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")&type=$(urlencode "$net")"
             if [[ "$net" == "ws" ]]; then
                 [[ -n "$path" ]] && link+="&path=$(urlencode "$path")"
                 [[ -n "$host" ]] && link+="&host=$(urlencode "$host")"
+            elif [[ "$net" == "grpc" && -n "$service_name" ]]; then
+                link+="&serviceName=$(urlencode "$service_name")"
             fi
             [[ "$insecure" == "true" ]] && link+="&allowInsecure=1"
             link+="#$(urlencode "$name")"
             printf '%s\n' "$link"
             ;;
         ss)
-            [[ -n "$method" && -n "$password" ]] || return 1
+            if [[ -z "$method" || -z "$password" ]]; then
+                _warn "跳过缺少 cipher/password 的 Clash SS 节点: ($label)" >&2
+                return 1
+            fi
             local ss_encoded
             ss_encoded=$(printf '%s:%s' "$method" "$password" | base64 -w 0 2>/dev/null || printf '%s:%s' "$method" "$password" | base64 | tr -d '\n')
             printf 'ss://%s@%s#%s\n' "$ss_encoded" "$hp" "$(urlencode "$name")"
             ;;
         hysteria2)
-            [[ -n "$password" ]] || return 1
+            if [[ -z "$password" ]]; then
+                _warn "跳过缺少 password 的 Clash Hysteria2 节点: ($label)" >&2
+                return 1
+            fi
             local link="hysteria2://$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")"
             [[ "$insecure" == "true" ]] && link+="&insecure=1"
             link+="#$(urlencode "$name")"
             printf '%s\n' "$link"
             ;;
         tuic)
-            [[ -n "$uuid" ]] || return 1
+            if [[ -z "$uuid" ]]; then
+                _warn "跳过缺少 uuid 的 Clash TUIC 节点: ($label)" >&2
+                return 1
+            fi
             local link="tuic://$(urlencode "$uuid"):$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")&alpn=$(urlencode "${alpn:-h3}")&congestion_control=$(urlencode "${cc:-bbr}")&udp_relay_mode=$(urlencode "${udp_mode:-native}")"
             [[ "$insecure" == "true" ]] && link+="&allow_insecure=1"
             link+="#$(urlencode "$name")"
             printf '%s\n' "$link"
             ;;
         anytls)
-            [[ -n "$password" ]] || return 1
+            if [[ -z "$password" ]]; then
+                _warn "跳过缺少 password 的 Clash AnyTLS 节点: ($label)" >&2
+                return 1
+            fi
             local link="anytls://$(urlencode "$password")@${hp}?sni=$(urlencode "$sni")"
             [[ "$insecure" == "true" ]] && link+="&allowInsecure=1"
             link+="#$(urlencode "$name")"
@@ -22148,18 +22373,18 @@ _parse_clash_yaml_proxies() {
     local links="" has_item=0
     local name="" type="" server="" port="" uuid="" password="" method=""
     local network="" tls="" sni="" path="" host="" flow="" pbk="" sid=""
-    local scv="" fp="" alpn="" cc="" udp_mode=""
+    local scv="" fp="" alpn="" cc="" udp_mode="" service_name=""
     local line k v emitted
 
     _flush_clash_item() {
         [[ $has_item -eq 1 ]] || return 0
         if emitted=$(_clash_emit_proxy_link "$name" "$type" "$server" "$port" "$uuid" "$password" "$method" \
-            "$network" "$tls" "$sni" "$path" "$host" "$flow" "$pbk" "$sid" "$scv" "$fp" "$alpn" "$cc" "$udp_mode"); then
+            "$network" "$tls" "$sni" "$path" "$host" "$flow" "$pbk" "$sid" "$scv" "$fp" "$alpn" "$cc" "$udp_mode" "$service_name"); then
             [[ -n "$emitted" ]] && links+="$emitted"$'\n'
         fi
         name=""; type=""; server=""; port=""; uuid=""; password=""; method=""
         network=""; tls=""; sni=""; path=""; host=""; flow=""; pbk=""; sid=""
-        scv=""; fp=""; alpn=""; cc=""; udp_mode=""
+        scv=""; fp=""; alpn=""; cc=""; udp_mode=""; service_name=""
         has_item=0
     }
 
@@ -22193,6 +22418,7 @@ _parse_clash_yaml_proxies() {
             alpn) alpn="$v" ;;
             congestion-controller) cc="$v" ;;
             udp-relay-mode) udp_mode="$v" ;;
+            grpc-service-name|service-name|serviceName) service_name="$v" ;;
         esac
     done <<< "$flat"
     _flush_clash_item
@@ -22279,7 +22505,10 @@ refresh_external_subs() {
     _ok "共刷新 $count 个外部节点"
     
     # 自动更新订阅文件
-    [[ -f "$CFG/sub.info" ]] && generate_sub_files
+    if [[ -f "$CFG/sub.info" ]]; then
+        generate_sub_files || return 1
+    fi
+    return 0
 }
 
 # 获取所有外部节点链接
@@ -22309,15 +22538,7 @@ get_all_external_links() {
     echo -n "$links"
 }
 
-# 将外部节点转换为 Clash 格式（剥离控制/换行字符防 YAML 注入）
-_sanitize_sub_scalar() {
-    local v="${1//$'\r'/}"
-    v="${v//$'\n'/}"
-    v="${v//\\/\\\\}"
-    v="${v//\"/\\\"}"
-    printf '%s' "$v"
-}
-
+# 将外部节点转换为 Clash 格式（全标量 _yaml_quote 严格编码 + 控制字符/结构字符 fail-closed 拒绝）
 external_link_to_clash() {
     local link="$1"
     local json
@@ -22332,6 +22553,7 @@ external_link_to_clash() {
     insecure=$(_parse_insecure_flag "$(jq -r '.insecure // false' <<< "$json")")
     _valid_sub_port "$port" || return 1
     [[ -n "$type" && -n "$server" ]] || return 1
+    _valid_sub_server "$server" || return 1
     _reject_ctrl_fields "$type" "$server" || return 1
 
     # 节点名称清理控制字符（不静默篡改凭据字段，凭据字段若含控制字符由下方 _reject_ctrl_fields 拒绝）
@@ -22351,7 +22573,7 @@ external_link_to_clash() {
 
     case "$type" in
         vless)
-            local uuid security transport sni pbk sid flow path host fp
+            local uuid security transport sni pbk sid flow path host fp service_name
             uuid=$(jq -r '.uuid // empty' <<< "$json")
             security=$(jq -r '.security // empty' <<< "$json")
             transport=$(jq -r '.transport // "tcp"' <<< "$json")
@@ -22362,11 +22584,12 @@ external_link_to_clash() {
             path=$(jq -r '.path // empty' <<< "$json")
             host=$(jq -r '.host // empty' <<< "$json")
             fp=$(jq -r '.fingerprint // "chrome"' <<< "$json")
+            service_name=$(jq -r '.serviceName // empty' <<< "$json")
             [[ -n "$uuid" ]] || return 1
-            _reject_ctrl_fields "$uuid" "$security" "$transport" "$sni" "$pbk" "$sid" "$flow" "$path" "$host" "$fp" || return 1
+            _reject_ctrl_fields "$uuid" "$security" "$transport" "$sni" "$pbk" "$sid" "$flow" "$path" "$host" "$fp" "$service_name" || return 1
             _valid_sub_network "$transport" || return 1
 
-            local q_uuid q_sni q_pbk q_sid q_flow q_path q_host q_fp
+            local q_uuid q_sni q_pbk q_sid q_flow q_path q_host q_fp q_sn
             q_uuid=$(_yaml_quote "$uuid")
             q_sni=$(_yaml_quote "$sni")
             q_pbk=$(_yaml_quote "$pbk")
@@ -22375,6 +22598,7 @@ external_link_to_clash() {
             q_path=$(_yaml_quote "${path:-/}")
             q_host=$(_yaml_quote "${host:-$sni}")
             q_fp=$(_yaml_quote "${fp:-chrome}")
+            q_sn=$(_yaml_quote "$service_name")
 
             if [[ "$security" == "reality" ]]; then
                 cat << EOF
@@ -22393,6 +22617,12 @@ external_link_to_clash() {
       short-id: $q_sid
     client-fingerprint: $q_fp
 EOF
+                if [[ "$transport" == "grpc" && -n "$service_name" ]]; then
+                    cat << EOF
+    grpc-opts:
+      grpc-service-name: $q_sn
+EOF
+                fi
             elif [[ "$transport" == "ws" ]]; then
                 local v_tls="true"
                 [[ "$security" == "none" ]] && v_tls="false"
@@ -22427,10 +22657,16 @@ EOF
     skip-cert-verify: $insecure
     servername: $q_sni
 EOF
+                if [[ "$transport" == "grpc" && -n "$service_name" ]]; then
+                    cat << EOF
+    grpc-opts:
+      grpc-service-name: $q_sn
+EOF
+                fi
             fi
             ;;
         vmess)
-            local uuid network tls sni path host aid
+            local uuid network tls sni path host aid service_name
             uuid=$(jq -r '.uuid // empty' <<< "$json")
             network=$(jq -r '.network // "tcp"' <<< "$json")
             tls=$(jq -r '.tls // empty' <<< "$json")
@@ -22438,17 +22674,20 @@ EOF
             path=$(jq -r '.path // empty' <<< "$json")
             host=$(jq -r '.host // empty' <<< "$json")
             aid=$(jq -r '.aid // 0' <<< "$json")
+            service_name=$(jq -r '.serviceName // empty' <<< "$json")
+            [[ "$network" == "grpc" && -z "$service_name" ]] && service_name="$path"
             [[ -n "$uuid" ]] || return 1
             [[ "$aid" =~ ^[0-9]+$ ]] || aid=0
-            _reject_ctrl_fields "$uuid" "$network" "$tls" "$sni" "$path" "$host" || return 1
+            _reject_ctrl_fields "$uuid" "$network" "$tls" "$sni" "$path" "$host" "$service_name" || return 1
             _valid_sub_network "$network" || return 1
 
-            local q_uuid q_sni q_path q_host v_tls="false"
+            local q_uuid q_sni q_path q_host q_sn v_tls="false"
             [[ "$tls" == "tls" || "$tls" == "true" ]] && v_tls="true"
             q_uuid=$(_yaml_quote "$uuid")
             q_sni=$(_yaml_quote "${sni:-$host}")
             q_path=$(_yaml_quote "${path:-/}")
             q_host=$(_yaml_quote "${host:-$sni}")
+            q_sn=$(_yaml_quote "$service_name")
 
             cat << EOF
   - name: $q_name
@@ -22470,17 +22709,23 @@ EOF
       headers:
         Host: $q_host
 EOF
+            elif [[ "$network" == "grpc" && -n "$service_name" ]]; then
+                cat << EOF
+    grpc-opts:
+      grpc-service-name: $q_sn
+EOF
             fi
             ;;
         trojan)
-            local password sni transport path host
+            local password sni transport path host service_name
             password=$(jq -r '.password // empty' <<< "$json")
             sni=$(jq -r '.sni // empty' <<< "$json")
             transport=$(jq -r '.transport // "tcp"' <<< "$json")
             path=$(jq -r '.path // empty' <<< "$json")
             host=$(jq -r '.host // empty' <<< "$json")
+            service_name=$(jq -r '.serviceName // empty' <<< "$json")
             [[ -n "$password" ]] || return 1
-            _reject_ctrl_fields "$password" "$sni" "$transport" "$path" "$host" || return 1
+            _reject_ctrl_fields "$password" "$sni" "$transport" "$path" "$host" "$service_name" || return 1
             _valid_sub_network "$transport" || return 1
             local q_pw q_sni
             q_pw=$(_yaml_quote "$password")
@@ -22506,6 +22751,18 @@ EOF
       headers:
         Host: $q_host
 EOF
+            elif [[ "$transport" == "grpc" ]]; then
+                cat << EOF
+    network: grpc
+EOF
+                if [[ -n "$service_name" ]]; then
+                    local q_sn
+                    q_sn=$(_yaml_quote "$service_name")
+                    cat << EOF
+    grpc-opts:
+      grpc-service-name: $q_sn
+EOF
+                fi
             fi
             ;;
         ss)
@@ -22617,8 +22874,8 @@ external_link_to_surge() {
     insecure=$(_parse_insecure_flag "$(jq -r '.insecure // false' <<< "$json")")
     [[ -n "$type" && -n "$server" ]] || return 1
     _valid_sub_port "$port" || return 1
+    _valid_sub_server "$server" || return 1
     _reject_ctrl_fields "$type" "$server" || return 1
-    [[ "$server" == *","* || "$server" == *"="* ]] && return 1
 
     name="${name//$'\r'/}"
     name="${name//$'\n'/}"
@@ -24127,7 +24384,7 @@ EOF
 
 # Cloudflare Tunnel 常量
 readonly CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-readonly CLOUDFLARED_DIR="/etc/cloudflared"
+readonly CLOUDFLARED_DIR="${VLESS_TEST_CLOUDFLARED_DIR:-/etc/cloudflared}"
 readonly CLOUDFLARED_CONFIG="$CLOUDFLARED_DIR/config.yml"
 readonly CLOUDFLARED_SERVICE="cloudflared"
 
@@ -24252,9 +24509,11 @@ _sync_tunnel_config() {
         fi
     fi
     
-    # 3. 如果需要，通过本项目服务边界重启 Xray（禁止使用裸 pkill 误伤共享实例）
+    # 3. 如果需要，通过本项目服务边界重启 Xray（尊重 paused 与当前运行态，禁止误拉起已停服实例）
     if [[ "$need_restart" == "true" ]]; then
-        svc restart vless-reality 2>/dev/null || true
+        if ! is_paused && svc status vless-reality >/dev/null 2>&1; then
+            svc restart vless-reality 2>/dev/null || _warn "Xray 服务重启失败"
+        fi
     fi
     
     return 0
@@ -24860,15 +25119,22 @@ EOF
             # 使用 jq 修改（如果可用）
             if check_cmd jq; then
                 local tmp_config=$(mktemp)
-                jq '(.inbounds[] | select(.streamSettings.wsSettings != null) | .streamSettings.wsSettings.headers.Host) = ""' \
-                    "$CFG/config.json" > "$tmp_config" 2>/dev/null && mv "$tmp_config" "$CFG/config.json"
+                if jq '(.inbounds[] | select(.streamSettings.wsSettings != null) | .streamSettings.wsSettings.headers.Host) = ""' \
+                    "$CFG/config.json" > "$tmp_config" 2>/dev/null; then
+                    chmod 600 "$tmp_config" 2>/dev/null || true
+                    mv -f "$tmp_config" "$CFG/config.json"
+                else
+                    rm -f "$tmp_config"
+                fi
             else
                 # 使用 sed 替换（兼容无 jq 环境）
                 sed -i 's/"Host": *"[^"]*"/"Host": ""/g' "$CFG/config.json"
             fi
             
-            # 通过本项目服务边界重启 xray 使配置生效（禁止裸 pkill 误伤共享实例）
-            svc restart vless-reality 2>/dev/null || true
+            # 通过本项目服务边界重启 xray 使配置生效（尊重 paused 与运行态，禁止误拉起已停服实例）
+            if ! is_paused && svc status vless-reality >/dev/null 2>&1; then
+                svc restart vless-reality 2>/dev/null || _warn "Xray 服务重启失败"
+            fi
             _ok "xray 配置已更新"
         fi
     fi
@@ -26229,13 +26495,13 @@ _add_user() {
     read -rp "  到期 [永不过期]: " expire_input
     if [[ -n "$expire_input" ]]; then
         if [[ "$expire_input" =~ ^[0-9]+$ ]]; then
-            # 输入的是天数
-            expire_date=$(date -d "+${expire_input} days" '+%Y-%m-%d' 2>/dev/null)
-            if [[ -z "$expire_date" ]]; then
-                # macOS 兼容
-                expire_date=$(date -v+${expire_input}d '+%Y-%m-%d' 2>/dev/null)
+            # 输入的是天数（纯 AWK 日期运算，兼容 GNU/BSD/Alpine BusyBox）
+            expire_date=$(_date_add_days_ymd "$expire_input") || expire_date=""
+            if [[ -n "$expire_date" ]]; then
+                expire_display="$expire_date (${expire_input}天后)"
+            else
+                _warn "日期计算失败，将设置为永不过期"
             fi
-            expire_display="$expire_date (${expire_input}天后)"
         elif _valid_ymd "$expire_input"; then
             # 输入的是日期
             expire_date="$expire_input"
@@ -26586,8 +26852,7 @@ _set_user_expire_date() {
             if [[ "$expire_input" == "0" ]]; then
                 new_expire=""
             elif [[ "$expire_input" =~ ^[0-9]+$ ]]; then
-                new_expire=$(date -d "+${expire_input} days" '+%Y-%m-%d' 2>/dev/null)
-                [[ -z "$new_expire" ]] && new_expire=$(date -v+${expire_input}d '+%Y-%m-%d' 2>/dev/null)
+                new_expire=$(_date_add_days_ymd "$expire_input") || { _err "日期计算失败"; return 1; }
             elif _valid_ymd "$expire_input"; then
                 new_expire="$expire_input"
             else
