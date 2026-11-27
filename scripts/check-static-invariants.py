@@ -1,20 +1,29 @@
 #!/usr/bin/env python3
 """Static structural invariant gate for vless-aio-hardened (L1a + L1b).
 
-Enforces class-wide invariants derived from H15-H19 multi-round audits that
+Enforces class-wide invariants derived from H15-H20 multi-round audits that
 ShellCheck on outer Bash files cannot catch on its own:
-  INV-1: Embedded heredoc syntax & POSIX gate (OpenRC/POSIX sh -n, no Bashisms,
-         generated Bash scripts bash -n, OpenRC env_file loaded before command_args
-         without arbitrary `.` execution).
-  INV-2: Zero legacy certificate issuer-substring trust checks (R3/ZeroSSL/Buypass).
-  INV-3: Zero unguarded GNU-only `date -d` calls in vless-server.sh.
-  INV-4: Zero `eval`, zero `dpkg -l`, zero bare `exec ... 2>/dev/null` FD-2 clobber.
-  INV-5: Subscription fetchers (`fetch_subscription`, `parse_subscription`) use
-         `curl -K -` and never pass raw URLs on `curl` argv.
-  INV-6: State-mutating `db_*` / `refresh_*` functions do not end on a bare
-         conditional `[[ ... ]] && ...` returning 1 on the false branch.
-  INV-7: Embedded `watchdog.sh` enforces `paused` + `.singbox-stopped-empty`
+  INV-1: Embedded heredoc syntax & POSIX gate (OpenRC/POSIX sh -n, no Bashisms
+         including `==`/`declare`/`local -a`/`${v//a/b}`, generated Bash scripts
+         bash -n including unquoted heredocs, OpenRC env_file loaded before
+         command_args without arbitrary `.` execution — comments stripped).
+  INV-2: Zero legacy certificate issuer-substring trust checks (R3/E1/R10/ZeroSSL/Buypass/Let's Encrypt).
+  INV-3: Zero unguarded GNU/BSD `date -d` / `date --date` / `date -v` across product scripts.
+  INV-4: Zero `eval` anywhere (including `if ! eval` and `$(eval ...)`), zero legacy
+         `urldecode`, zero untrusted third-party GitHub proxy mirrors (`gh-proxy.com` etc.),
+         zero `dpkg -l`, zero bare `exec ... 2>/dev/null` FD-2 clobber.
+  INV-5: Subscription fetchers (`_http_fetch_sub_raw`, `fetch_subscription`, `parse_subscription`)
+         share `curl -K -` + `--proto '=http,https'` + `--proto-redir '=http,https'` +
+         `--max-redirs` + `--max-filesize 2097152` and never leak `$url`/`${url}` on argv.
+  INV-6: State-mutating & routing/display functions (`db_*`, `refresh_*`, `gen_*_routing_*`,
+         `show_single_protocol_info`) do not end on bare conditional `[[ ... ]] && ...`.
+  INV-7: Embedded `watchdog.sh` (non-comment code) enforces `paused` + `.singbox-stopped-empty`
          and aligns Alpine `gcompat` `_pgrep`.
+  INV-8: Deep-module consolidation invariants: `_regenerate_proxy_configs` delegates to
+         `rebuild_and_reload_{xray,singbox}`, `create_fake_website` uses `_nginx_install_conf`
+         and `$CFG/certs/server.crt` (never hardcoded `/etc/vless-reality/certs/`),
+         `generate_singbox_config` `anytls` branch uses `_anytls_secure`, and
+         `_apply_configs_cli` refreshes `create_server_scripts` and guards `--ensure-singbox`.
 """
 from __future__ import annotations
 
@@ -35,32 +44,38 @@ def err(inv: str, msg: str) -> None:
     errors.append(f"[{inv}] {msg}")
 
 
+def strip_comments(lines: list[str]) -> str:
+    return "\n".join(l for l in lines if not l.lstrip().startswith("#")) + "\n"
+
+
 def extract_heredocs(lines: list[str]) -> list[tuple[int, int, str, bool, list[tuple[int, str]]]]:
     """Return list of (start_ln, end_ln, target, quoted_delim, body_lines)."""
     out = []
     i = 0
     while i < len(lines):
-        m = re.search(r'cat\s*>\s*([^\s<]+)\s*<<\s*([\'"]?)([A-Za-z0-9_]+)\2', lines[i])
-        if m:
-            target = m.group(1)
-            quoted = bool(m.group(2))
-            delim = m.group(3)
-            start = i + 1
-            body: list[tuple[int, str]] = []
-            j = i + 1
-            while j < len(lines) and lines[j].strip() != delim:
-                body.append((j + 1, lines[j]))
-                j += 1
-            out.append((start, j + 1, target, quoted, body))
-            i = j + 1
+        m = re.search(r'cat\s*>\s*([^\s<]+)\s*<<-?\s*([\'"]?)([A-Za-z0-9_]+)\2', lines[i])
+        if not m:
+            m2 = re.search(r'cat\s*<<-?\s*([\'"]?)([A-Za-z0-9_]+)\1\s*>\s*([^\s<]+)', lines[i])
+            if m2:
+                target, quoted, delim = m2.group(3), bool(m2.group(1)), m2.group(2)
+            else:
+                i += 1
+                continue
         else:
-            i += 1
+            target, quoted, delim = m.group(1), bool(m.group(2)), m.group(3)
+        start = i + 1
+        body: list[tuple[int, str]] = []
+        j = i + 1
+        while j < len(lines) and lines[j].strip() != delim:
+            body.append((j + 1, lines[j]))
+            j += 1
+        out.append((start, j + 1, target, quoted, body))
+        i = j + 1
     return out
 
 
-def sanitize_unquoted_heredoc_for_sh_n(text: str) -> str:
-    """Replace outer-Bash parameter expansions in unquoted heredocs with safe POSIX tokens."""
-    # Balanced-brace unwrap of outer `${var:+body}` (handling nested `${...}` inside body)
+def sanitize_unquoted_heredoc(text: str) -> str:
+    """Replace outer-Bash parameter expansions in unquoted heredocs with safe tokens."""
     out: list[str] = []
     i = 0
     n = len(text)
@@ -106,15 +121,24 @@ def check_syntax(shell_bin: str, content: str, label: str) -> None:
 def extract_function(lines: list[str], name: str) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     in_fn = False
+    heredoc_delim: str | None = None
     for idx, l in enumerate(lines, 1):
         if not in_fn:
             if re.match(rf'^{re.escape(name)}\(\)\s*\{{', l):
                 in_fn = True
                 out.append((idx, l))
-        else:
-            out.append((idx, l))
-            if re.match(r'^\}\s*$', l):
-                break
+            continue
+        out.append((idx, l))
+        if heredoc_delim is not None:
+            if l.strip() == heredoc_delim:
+                heredoc_delim = None
+            continue
+        m_hd = re.search(r'<<-?\s*[\'"]?([A-Za-z0-9_]+)[\'"]?(?:\s|$)', l)
+        if m_hd and not l.lstrip().startswith("#"):
+            heredoc_delim = m_hd.group(1)
+            continue
+        if re.match(r'^\}\s*$', l):
+            break
     return out
 
 
@@ -126,42 +150,45 @@ def main() -> int:
     heredocs = extract_heredocs(v_lines)
     openrc_count = 0
     bash_gen_count = 0
-    watchdog_body = ""
+    watchdog_code_lines: list[str] = []
     for start, end, target, quoted, body in heredocs:
         if not body:
             continue
         first = body[0][1].strip()
-        raw_text = "\n".join(bl for _, bl in body) + "\n"
+        raw_lines = [bl for _, bl in body]
+        raw_text = "\n".join(raw_lines) + "\n"
+        code_only = strip_comments(raw_lines)
         if first.startswith("#!/sbin/openrc-run") or first.startswith("#!/bin/sh") or "init.d" in target:
             openrc_count += 1
             for ln, bl in body:
                 if bl.lstrip().startswith("#"):
                     continue
-                if re.search(r'\[\[|\]\]|\(\(|&>|<<<|\bsource\b|\bfunction\b', bl):
+                if re.search(r'\[\[|\]\]|\(\(|&>|<<<|\bsource\b|\bfunction\b|\bdeclare\b|\blocal\s+-[a-zA-Z]|\[\s+[^]]*==|\$\{[^}]*//', bl):
                     err("INV-1", f"POSIX/OpenRC heredoc {target} (L{ln}) contains Bashism: {bl.strip()}")
-            check_text = raw_text if quoted else sanitize_unquoted_heredoc_for_sh_n(raw_text)
+            check_text = raw_text if quoted else sanitize_unquoted_heredoc(raw_text)
             check_syntax("sh", check_text, f"{target} (L{start}-L{end})")
-            if "${name}" in target and "env_file" in raw_text:
-                env_pos = raw_text.find("env_file")
-                args_pos = raw_text.find("command_args=")
+            if "${name}" in target and "env_file" in code_only:
+                env_pos = code_only.find("env_file")
+                args_pos = code_only.find("command_args=")
                 if args_pos != -1 and (env_pos == -1 or env_pos > args_pos):
                     err("INV-1", f"OpenRC {target} (L{start}-L{end}) evaluates command_args before env_file")
-                if re.search(r'&&\s*\.\s+"?\$\{?env_file', raw_text):
+                if re.search(r'(?:^|[;&|]\s*|then\s+)\.\s+"?\$\{?env_file', code_only, re.M):
                     err("INV-1", f"OpenRC {target} (L{start}-L{end}) executes env_file via `.` instead of safe parsing")
         elif first.startswith("#!/bin/bash") or first.startswith("#!/usr/bin/env bash"):
             bash_gen_count += 1
-            if quoted:
-                check_syntax("bash", raw_text, f"{target} (L{start}-L{end})")
+            check_text = raw_text if quoted else sanitize_unquoted_heredoc(raw_text)
+            check_syntax("bash", check_text, f"{target} (L{start}-L{end})")
             if "watchdog.sh" in target:
-                watchdog_body = raw_text
+                watchdog_code_lines = [bl for bl in raw_lines if not bl.lstrip().startswith("#")]
 
     if openrc_count < 3:
         err("INV-1", f"Expected >=3 OpenRC heredocs in vless-server.sh, found {openrc_count}")
     if bash_gen_count < 3:
         err("INV-1", f"Expected >=3 generated bash script heredocs in vless-server.sh, found {bash_gen_count}")
 
-    # ── INV-7: Watchdog F04 / paused / gcompat alignment ──────────────────────
-    if not watchdog_body:
+    # ── INV-7: Watchdog F04 / paused / gcompat alignment (non-comment code) ───
+    watchdog_code = "\n".join(watchdog_code_lines)
+    if not watchdog_code:
         err("INV-7", "Could not locate generated watchdog.sh heredoc")
     else:
         for req, desc in [
@@ -169,49 +196,65 @@ def main() -> int:
             ('.singbox-stopped-empty', 'F04 .singbox-stopped-empty guard'),
             ('ld-(linux|musl)', 'Alpine gcompat _pgrep alignment'),
         ]:
-            if req not in watchdog_body:
-                err("INV-7", f"watchdog.sh missing {desc} ({req!r})")
+            if req not in watchdog_code:
+                err("INV-7", f"watchdog.sh non-comment code missing {desc} ({req!r})")
 
     # ── INV-2: Zero legacy issuer-substring trust checks ──────────────────────
     for idx, l in enumerate(v_lines, 1):
         if l.lstrip().startswith("#"):
             continue
-        if re.search(r'\b(ZeroSSL|Buypass|Let\'s Encrypt)\b', l) and re.search(r'issuer|grep', l, re.I):
+        if re.search(r'\b(ZeroSSL|Buypass|Let\'s Encrypt|R3|E1|R10)\b', l) and re.search(r'issuer|grep', l, re.I):
             err("INV-2", f"Legacy issuer-substring check at L{idx}: {l.strip()}")
 
-    # ── INV-3: Zero unguarded GNU `date -d` in vless-server.sh ────────────────
-    for idx, l in enumerate(v_lines, 1):
-        if l.lstrip().startswith("#"):
-            continue
-        if re.search(r'\bdate\s+-d\b', l):
-            err("INV-3", f"Non-portable `date -d` at L{idx}: {l.strip()}")
-
-    # ── INV-4: Zero eval / dpkg -l / bare exec 2>/dev/null ────────────────────
+    # ── INV-3: Zero unguarded GNU/BSD `date -d/--date/-v` in product scripts ──
     for fname, lines in [("vless-server.sh", v_lines), ("migrate-anytls-singbox.sh", m_lines)]:
         for idx, l in enumerate(lines, 1):
             if l.lstrip().startswith("#"):
                 continue
-            if re.search(r'(^|[;&|]\s*)eval\b', l):
+            if re.search(r'(?:^|[;&|(`]\s*)date\s+[^|;&\n]*(-d\b|--date\b|-v\s*[-+0-9])', l):
+                err("INV-3", f"{fname}:L{idx} uses non-portable date flag: {l.strip()}")
+
+    # ── INV-4: Zero eval / legacy urldecode / untrusted proxies / dpkg -l / bare exec 2>/dev/null
+    for fname, lines in [("vless-server.sh", v_lines), ("migrate-anytls-singbox.sh", m_lines)]:
+        for idx, l in enumerate(lines, 1):
+            if l.lstrip().startswith("#"):
+                continue
+            if re.search(r'(?:^|[^A-Za-z0-9_$-])eval(?:\s|$)', l):
                 err("INV-4", f"{fname}:L{idx} uses forbidden `eval`: {l.strip()}")
+            if re.search(r'(?:^|[^A-Za-z0-9_])urldecode\s*(\(\)|\s)', l):
+                err("INV-4", f"{fname}:L{idx} uses retired legacy `urldecode` (must use `_urldecode`): {l.strip()}")
+            if re.search(r'(gh-proxy\.com|ghps\.cc|gh\.ddlc\.top|ghproxy\.net)', l):
+                err("INV-4", f"{fname}:L{idx} references untrusted third-party GitHub proxy: {l.strip()}")
             if re.search(r'\bdpkg\s+-l\b', l):
                 err("INV-4", f"{fname}:L{idx} uses `dpkg -l` instead of `dpkg-query`: {l.strip()}")
             if re.search(r'^\s*exec\s+.*2>/dev/null', l):
                 err("INV-4", f"{fname}:L{idx} bare `exec ... 2>/dev/null` clobbers process stderr: {l.strip()}")
 
-    # ── INV-5: Subscription fetchers use `curl -K -` ──────────────────────────
+    # ── INV-5: Subscription fetchers share _http_fetch_sub_raw with full SSRF/DoS guards
+    raw_fn = extract_function(v_lines, "_http_fetch_sub_raw")
+    if not raw_fn:
+        err("INV-5", "Missing canonical _http_fetch_sub_raw function")
+    else:
+        raw_code = strip_comments([l for _, l in raw_fn])
+        for tok in ("curl ", "-K -", "--proto '=http,https'", "--proto-redir '=http,https'", "--max-redirs", "--max-filesize 2097152"):
+            if tok not in raw_code:
+                err("INV-5", f"_http_fetch_sub_raw missing required guard {tok!r}")
+        for ln, l in raw_fn:
+            if not l.lstrip().startswith("#") and re.search(r'\bcurl\b.*"\$\{?url\}?"', l):
+                err("INV-5", f"_http_fetch_sub_raw:L{ln} leaks $url on curl argv: {l.strip()}")
     for fn_name in ("fetch_subscription", "parse_subscription"):
         fn_lines = extract_function(v_lines, fn_name)
         if not fn_lines:
             err("INV-5", f"Missing function {fn_name}")
             continue
-        body_txt = "\n".join(l for _, l in fn_lines)
-        if "curl " not in body_txt or "-K -" not in body_txt:
-            err("INV-5", f"{fn_name} does not pass URL via `curl -K -`")
+        code = strip_comments([l for _, l in fn_lines])
+        if "_http_fetch_sub_raw" not in code:
+            err("INV-5", f"{fn_name} must delegate to _http_fetch_sub_raw")
         for ln, l in fn_lines:
-            if not l.lstrip().startswith("#") and re.search(r'\bcurl\b.*"\$url"', l):
-                err("INV-5", f"{fn_name}:L{ln} leaks $url on curl argv: {l.strip()}")
+            if not l.lstrip().startswith("#") and re.search(r'\bcurl\b', l):
+                err("INV-5", f"{fn_name}:L{ln} invokes curl directly instead of _http_fetch_sub_raw: {l.strip()}")
 
-    # ── INV-6: State-mutating functions must not end in bare `[[ ... ]] && ...` ─
+    # ── INV-6: State/routing/display functions must not end in bare `[[ ... ]] && ...`
     func = None
     last_code = None
     last_ln = 0
@@ -222,7 +265,13 @@ def main() -> int:
             last_code = None
             continue
         if func and re.match(r'^\}\s*$', l):
-            if (func.startswith("db_") or func.startswith("refresh_")) and last_code:
+            monitored = (
+                func.startswith("db_")
+                or func.startswith("refresh_")
+                or (func.startswith("gen_") and "_routing_" in func)
+                or func == "show_single_protocol_info"
+            )
+            if monitored and last_code:
                 if (
                     re.search(r'^(\[\[.*\]\]|\[.*\])\s*&&\s*', last_code)
                     and "return" not in last_code
@@ -239,6 +288,31 @@ def main() -> int:
                 last_code = s
                 last_ln = idx
 
+    # ── INV-8: Deep-module consolidation invariants ───────────────────────────
+    regen_code = strip_comments([l for _, l in extract_function(v_lines, "_regenerate_proxy_configs")])
+    if "rebuild_and_reload_xray" not in regen_code or "rebuild_and_reload_singbox" not in regen_code:
+        err("INV-8", "_regenerate_proxy_configs must delegate to rebuild_and_reload_xray & rebuild_and_reload_singbox")
+
+    fake_code = strip_comments([l for _, l in extract_function(v_lines, "create_fake_website")])
+    if "_nginx_install_conf" not in fake_code:
+        err("INV-8", "create_fake_website must install Nginx config via _nginx_install_conf")
+    if "/etc/vless-reality/certs/" in fake_code:
+        err("INV-8", "create_fake_website hardcodes /etc/vless-reality/certs/ instead of $CFG/certs/")
+
+    sb_fn = extract_function(v_lines, "generate_singbox_config")
+    sb_code = strip_comments([l for _, l in sb_fn])
+    m_anytls = re.search(r'(?ms)anytls\)(.*?);;', sb_code)
+    if not m_anytls or "_anytls_secure" not in m_anytls.group(1):
+        err("INV-8", "generate_singbox_config anytls branch must validate global certs via _anytls_secure")
+
+    apply_code = strip_comments([l for _, l in extract_function(v_lines, "_apply_configs_cli")])
+    if "create_server_scripts" not in apply_code:
+        err("INV-8", "_apply_configs_cli must refresh watchdog/NAT scripts via create_server_scripts on upgrade")
+    if ".singbox-stopped-empty" not in apply_code or "is_paused" not in apply_code:
+        err("INV-8", "_apply_configs_cli --ensure-singbox must guard on is_paused and .singbox-stopped-empty")
+    if re.search(r'svc\s+restart\s+vless-watchdog[^\n]*\|\|\s*true', apply_code):
+        err("INV-8", "_apply_configs_cli must not silently swallow vless-watchdog restart failure with `|| true`")
+
     if errors:
         for e in errors:
             print(f"FAIL: {e}", file=sys.stderr)
@@ -246,7 +320,7 @@ def main() -> int:
 
     print(
         f"PASS: static structural invariants verified "
-        f"(7 invariants; {openrc_count} OpenRC/POSIX heredocs sh -n, {bash_gen_count} generated bash heredocs bash -n)"
+        f"(8 invariants; {openrc_count} OpenRC/POSIX heredocs sh -n, {bash_gen_count} generated bash heredocs bash -n)"
     )
     return 0
 

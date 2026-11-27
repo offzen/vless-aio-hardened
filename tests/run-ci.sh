@@ -4,7 +4,7 @@ set -Eeuo pipefail
 readonly ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 readonly PINNED_XRAY_VERSION="26.3.27"
 readonly PINNED_SINGBOX_VERSION="1.14.4"
-readonly MIN_UNIT_TESTS=19
+readonly MIN_UNIT_TESTS=29
 cd "$ROOT"
 
 fail() {
@@ -63,7 +63,13 @@ run_syntax() {
 
 run_static() {
     command -v shellcheck >/dev/null 2>&1 || fail "shellcheck is required"
-    local file count=0
+    local file count=0 mem_kb=0 low_mem_monolith=0
+    if [[ "${GITHUB_SERVER_URL:-}" != "https://github.com" && "${VLESS_CI_FULL_SHELLCHECK:-0}" != "1" && -r /proc/meminfo ]]; then
+        mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || printf '0')
+        if [[ "$mem_kb" =~ ^[0-9]+$ ]] && (( mem_kb > 0 && mem_kb < 6291456 )); then
+            low_mem_monolith=1
+        fi
+    fi
     local -a discovered=()
     mapfile -t discovered < <(shell_files)
     shell_files >/dev/null
@@ -72,6 +78,77 @@ run_static() {
         if [[ "$file" == tests/test-high-risk-repair.sh ]]; then
             # The imported harness intentionally replaces this function with a spy.
             shellcheck -S error -e SC2218 "$file"
+        elif (( low_mem_monolith == 1 )) && [[ "$file" == vless-server.sh ]]; then
+            # GHC ShellCheck without -rtsopts requires ~3.5 GiB RSS on a 28.5k-line monolith;
+            # on <6 GiB non-GitHub runners, check 100% of lines across 10 full-context slices.
+            printf 'INFO: low-RAM runner (%s kB < 6 GiB); checking %s in 10 full-context slices\n' "$mem_kb" "$file"
+            python3 - "$file" <<'PY_SC_SLICE'
+import pathlib, re, subprocess, sys, tempfile
+
+target = pathlib.Path(sys.argv[1])
+lines = target.read_text(encoding="utf-8").splitlines()
+in_hd = None
+hd_tab = False
+fns = []
+cur_fn = None
+cur_start = 0
+
+for idx, line in enumerate(lines):
+    if in_hd is not None:
+        cmp_line = line.lstrip("\t") if hd_tab else line
+        if cmp_line == in_hd:
+            in_hd = None
+            hd_tab = False
+        continue
+    stripped = line.lstrip()
+    if not stripped.startswith("#") and "((" not in line:
+        m_hd = re.search(
+            r"(?<!<)<<(-?)\s*(?:['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]|\\?([A-Za-z_][A-Za-z0-9_]*))",
+            line,
+        )
+        if m_hd:
+            hd_tab = m_hd.group(1) == "-"
+            in_hd = m_hd.group(2) or m_hd.group(3)
+    if cur_fn is None:
+        m_fn = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", line)
+        if m_fn:
+            cur_fn = m_fn.group(1)
+            cur_start = idx
+    elif in_hd is None and re.match(r"^\}\s*$", line):
+        fns.append((cur_fn, cur_start, idx))
+        cur_fn = None
+
+if cur_fn is not None or len(fns) < 100:
+    sys.exit(subprocess.call(["shellcheck", "-S", "error", str(target)]))
+
+num_slices = 10
+chunk_sz = (len(fns) + num_slices - 1) // num_slices
+for s_idx in range(num_slices):
+    lo = s_idx * chunk_sz
+    hi = min(len(fns), lo + chunk_sz)
+    if lo >= hi:
+        continue
+    out = []
+    cursor = 0
+    for f_idx, (fn_name, start, end) in enumerate(fns):
+        out.extend(lines[cursor:start])
+        if lo <= f_idx < hi:
+            out.extend(lines[start : end + 1])
+        else:
+            out.append(f"{fn_name}() {{ :; }}")
+        cursor = end + 1
+    if s_idx == num_slices - 1:
+        out.extend(lines[cursor:])
+    with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8") as tf:
+        tf.write("\n".join(out) + "\n")
+        tmp_name = tf.name
+    try:
+        rc = subprocess.call(["shellcheck", "-S", "error", tmp_name])
+        if rc != 0:
+            sys.exit(rc)
+    finally:
+        pathlib.Path(tmp_name).unlink(missing_ok=True)
+PY_SC_SLICE
         else
             shellcheck -S error "$file"
         fi
@@ -79,9 +156,8 @@ run_static() {
     done
     ((count > 0)) || fail "no shell sources discovered"
     printf 'PASS: ShellCheck error gate (%d files)\n' "$count"
-    if [[ -f scripts/check-static-invariants.py ]]; then
-        python3 scripts/check-static-invariants.py
-    fi
+    [[ -f scripts/check-static-invariants.py ]] || fail "required static invariant gate missing: scripts/check-static-invariants.py"
+    python3 scripts/check-static-invariants.py
 }
 
 run_unit() (

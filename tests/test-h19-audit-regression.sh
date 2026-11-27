@@ -442,12 +442,14 @@ sec_h19_mutations() ( fresh_env h19mut
     check 'Mutation M5 (F02): insecure-default mutant flips hy2 to skip-cert-verify: true while real product outputs false' \
         bash -c 'grep -Fq "skip-cert-verify: true" <<<"$1" && grep -Fq "skip-cert-verify: false" <<<"$2"' _ "$m5_mut" "$m5_real"
 
-    # M6 (F06/D9): 回退丢弃 serviceName → 导出的 Clash YAML 缺失 grpc-service-name
+    # M6 (F06/D9): 真实函数变异——将 parse_vless_link 中 serviceName 提取置空，证明真实导出链路对回归敏感
     m6_mut=$( (
-        external_link_to_clash 'vless://11111111-1111-4111-8111-111111111111@198.51.100.81:443?security=tls&type=grpc&sni=g.example#G'
+        eval_body=$(declare -f parse_vless_link | sed 's/service_name="\$value"/service_name=""/g')
+        source <(printf '%s\n' "$eval_body")
+        external_link_to_clash 'vless://11111111-1111-4111-8111-111111111111@198.51.100.81:443?security=tls&type=grpc&sni=g.example&serviceName=svc1#G'
     ) )
     m6_real=$(external_link_to_clash 'vless://11111111-1111-4111-8111-111111111111@198.51.100.81:443?security=tls&type=grpc&sni=g.example&serviceName=svc1#G')
-    check 'Mutation M6 (F06/D9): missing serviceName drops grpc-opts while real product emits grpc-service-name' \
+    check 'Mutation M6 (F06/D9): mutating parse_vless_link serviceName drops grpc-opts while real product emits grpc-service-name' \
         bash -c '! grep -Fq "grpc-service-name" <<<"$1" && grep -Fq "grpc-service-name: \"svc1\"" <<<"$2"' _ "$m6_mut" "$m6_real"
 
     # M7 (F07): 回退 dpkg -l 判定 → 残留配置态 rc 误判已安装，而真实 _dpkg_pkg_installed 拒绝
@@ -458,42 +460,58 @@ sec_h19_mutations() ( fresh_env h19mut
     check 'Mutation M7 (F07): dpkg -l mutant falsely accepts residual rc pkg while real _dpkg_pkg_installed rejects' \
         bash -c '[[ "$1" -eq 0 ]] && ! _dpkg_pkg_installed socat' _ "$m7_mut_rc"
 
-    # M8 (F08): 回退 curl argv 传 URL → token 泄露到进程参数，而真实 fetch_subscription 仅走 stdin
+    # M8 (F08): 真实函数变异——将 _http_fetch_sub_raw 改为直接传 "$url" 给 curl argv，证明真实 fetch_subscription 零泄漏
     TOK="MUT_SECRET_TOKEN_8899"
     ARGV_F="$SEC/m8.argv"
     curl() { printf '%s\n' "$@" >"$ARGV_F"; printf 'vless://11111111-1111-4111-8111-111111111111@198.51.100.82:443?security=tls&type=tcp&sni=s.example#N\n'; }
-    ( curl -sSL "https://sub.example/x?token=$TOK" >/dev/null )
+    (
+        _http_fetch_sub_raw() { curl -fsSL "$1"; }
+        fetch_subscription "https://sub.example/x?token=$TOK" >/dev/null 2>&1
+    )
     m8_leaked=$(grep -cF "$TOK" "$ARGV_F" || true)
     : >"$ARGV_F"
     fetch_subscription "https://sub.example/x?token=$TOK" >/dev/null 2>&1
     m8_real_leaked=$(grep -cF "$TOK" "$ARGV_F" || true)
-    check 'Mutation M8 (F08): argv-URL mutant leaks token to curl argv while real fetch_subscription keeps argv clean' \
+    check 'Mutation M8 (F08): mutated _http_fetch_sub_raw leaks token to curl argv while real fetch_subscription keeps argv clean' \
         bash -c '[[ "$1" -ge 1 && "$2" -eq 0 ]]' _ "$m8_leaked" "$m8_real_leaked"
 
-    # M9 (R03/D4): 模拟 H18 缺陷（聚合失败后仍截断 pending）必丢账，而真实 H19 保留 pending
+    # M9 (R03/D4): 真实函数变异——移除 _sync_all_user_traffic_locked 聚合失败的 return 1 早退，证明变异体丢账而真实产品保账
     mkdir -p "$CFG/cache"
+    write_db <<<'{"version":"4.0.0","xray":{"vless":{"port":443,"uuid":"u","users":[{"name":"u1","uuid":"u","enabled":true,"quota":0,"used":0}]}},"singbox":{},"meta":{}}'
     printf 'user>>>u1@vless>>>traffic>>>uplink 500 m9-1\n' >"$CFG/cache/traffic.pending"
-    m9_wiped=$( (
-        tmp_p="$SEC/m9.pending"
-        cp "$CFG/cache/traffic.pending" "$tmp_p"
-        # 变异：聚合失败未早退，落到 : > pending
-        if false; then :; else :; fi
-        : >"$tmp_p"
-        [[ ! -s "$tmp_p" ]] && echo "WIPED"
+    m9_real_kept=$( (
+        _traffic_collect_to_journal() { return 0; }
+        awk() { return 1; }
+        _sync_all_user_traffic_locked >/dev/null 2>&1 || true
+        [[ -s "$CFG/cache/traffic.pending" ]] && echo "KEPT" || echo "WIPED"
     ) )
-    check 'Mutation M9 (R03/D4): missing early-return mutant wipes pending on aggregation failure' eq "$m9_wiped" "WIPED"
+    m9_mut_kept=$( (
+        _traffic_collect_to_journal() { return 0; }
+        awk() { return 1; }
+        mut_fn=$(declare -f _sync_all_user_traffic_locked | sed '/流量暂存日志聚合失败/{n;s/return 1/:/;}')
+        source <(printf '%s\n' "$mut_fn")
+        _sync_all_user_traffic_locked >/dev/null 2>&1 || true
+        [[ -s "$CFG/cache/traffic.pending" ]] && echo "KEPT" || echo "WIPED"
+    ) )
+    check 'Mutation M9 (R03/D4): removing early-return in _sync_all_user_traffic_locked wipes pending while real product preserves it' \
+        bash -c '[[ "$1" == "KEPT" && "$2" == "WIPED" ]]' _ "$m9_real_kept" "$m9_mut_kept"
 
-    # M10 (F04/D8): 模拟 H18 缺陷（_regenerate_proxy_configs 无 paused 门直接 restart）必误启，而真实 H19 保持停服
+    # M10 (F04/D8): 真实函数变异——移除 _rebuild_and_reload_singbox_impl 的 is_paused 守卫，证明变异体在 paused 下误启而真实产品保持停服
     write_db <<<'{"version":"4.0.0","xray":{},"singbox":{"hy2":{"port":24443,"password":"p","sni":"h.example","users":[{"name":"u1","uuid":"pw","enabled":true}]}},"meta":{}}'
     SB_M10="$SEC/m10.sb"; rm -f "$SB_M10"
     : >"$CFG/paused"
+    : >"$CFG/.singbox-stopped-empty"
     generate_singbox_config() { echo '{"ok":1}' >"$CFG/singbox.json"; return 0; }
     svc() { case "$1" in status) [[ -e "$SB_M10" ]];; start|restart) : >"$SB_M10"; return 0;; stop) rm -f "$SB_M10"; return 0;; esac; }
     _regenerate_proxy_configs >/dev/null 2>&1
     m10_real_active=0; [[ -e "$SB_M10" ]] && m10_real_active=1
-    ( svc restart vless-singbox >/dev/null 2>&1 )
-    m10_mut_active=0; [[ -e "$SB_M10" ]] && m10_mut_active=1
-    check 'Mutation M10 (F04/D8): unguarded restart starts paused singbox while real _regenerate_proxy_configs keeps it stopped' \
+    m10_mut_active=$( (
+        mut_fn=$(declare -f _rebuild_and_reload_singbox_impl | sed 's/if is_paused; then/if false; then/')
+        source <(printf '%s\n' "$mut_fn")
+        _regenerate_proxy_configs >/dev/null 2>&1 || true
+        [[ -e "$SB_M10" ]] && echo 1 || echo 0
+    ) )
+    check 'Mutation M10 (F04/D8): removing is_paused guard in _rebuild_and_reload_singbox_impl starts paused singbox while real product keeps it stopped' \
         bash -c '[[ "$1" -eq 0 && "$2" -eq 1 ]]' _ "$m10_real_active" "$m10_mut_active"
 )
 

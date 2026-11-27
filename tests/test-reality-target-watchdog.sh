@@ -50,7 +50,7 @@ fi
 watchdog=$(mktemp)
 trap 'rm -f "$watchdog"' EXIT
 awk '
-    /cat > "\$CFG\/watchdog\.sh" << '\''EOFSCRIPT'\''/ {copy=1; next}
+    /cat > "\$CFG\/(\.watchdog\.sh\.tmp\.\$\$|watchdog\.sh)" << '\''EOFSCRIPT'\''/ {copy=1; next}
     copy && /^EOFSCRIPT$/ {exit}
     copy {print}
 ' "$SCRIPT" > "$watchdog"

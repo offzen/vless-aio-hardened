@@ -1,8 +1,8 @@
 # vless-aio-hardened 使用手册
 
-> 当前 H17 产品：`3.4.10-h17`，SHA-256 `f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`（公开仓上一正式版 H15：`f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`；内部审计基线 H16：`7645d99e0b935c31c2462ae3328d0d806c77efe7ee35909f347b9aed97decc16`；源自 H14-rc.1 `6ea18a9e5af7ca2802ee6982d478d042ffcbcd4108b3a978c26e50aaf77eaa34` 安全加固）。
+> 当前 H20 产品：`3.4.10-h20`，SHA-256 `4f781c66b7d40721281db85f3f66471643c6cf690f60e8e43bb8664a60a92be6`（公开仓上一正式版 H17：`f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`；内部审计基线 H18/H19 未单独公开发行，直升 H20 一并包含 H18、H19 与 H20 全部整改；源自 H14-rc.1 `6ea18a9e5af7ca2802ee6982d478d042ffcbcd4108b3a978c26e50aaf77eaa34` 安全加固）。
 >
-> 请使用已核验本地包或本仓 tag 制品；无参启动会初始化/迁移 DB 并同步系统脚本，旧版必须先备份；仅 `--help` 与 `--apply-configs` 按其明确契约执行。新版变更及部署/升级见 [RELEASE-H17.md](./RELEASE-H17.md)、[RELEASE-H16.md](./RELEASE-H16.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
+> 请使用已核验本地包或本仓 tag 制品；无参启动会初始化/迁移 DB 并同步系统脚本，旧版必须先备份；仅 `--help` 与 `--apply-configs` 按其明确契约执行。新版变更及从 H17 升级必读见 [RELEASE-H20.md](./RELEASE-H20.md)、[RELEASE-H19.md](./RELEASE-H19.md)、[RELEASE-H18.md](./RELEASE-H18.md) 与 [CHANGELOG.md](./CHANGELOG.md)。
 
 ## 目录
 
@@ -16,11 +16,11 @@
 8. [命令行与常见操作](#8-命令行与常见操作)
 9. [验证与排障](#9-验证与排障)
 10. [更新与卸载边界](#10-更新与卸载边界)
-11. [H17 验收基线](#11-h17-验收基线)
+11. [H20 验收基线](#11-h20-验收基线)
 
 ## 1. 项目与支持范围
 
-`vless-aio-hardened` 是上游 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。`3.4.10` 仅说明上游基线；本次交付以本手册顶部 H17 SHA 和随包校验清单为准，不将未更新的在线滚动分支当作相同字节。
+`vless-aio-hardened` 是上游 [`vless-all-in-one`](https://gitlab.com/chil30-group/vless-all-in-one)（Chil30，基线 3.4.10）的第三方加固版服务端脚本。`3.4.10` 仅说明上游基线；本次交付以本手册顶部 H20 SHA 和随包校验清单为准，不将未更新的在线滚动分支当作相同字节。
 
 脚本按实际运行核心管理协议：
 
@@ -62,13 +62,13 @@
 ```bash
 sha256sum -c SHA256SUMS
 printf '%s  %s\n' \
-  f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548 \
+  4f781c66b7d40721281db85f3f66471643c6cf690f60e8e43bb8664a60a92be6 \
   vless-server.sh | sha256sum -c -
 chmod +x vless-server.sh
 sudo ./vless-server.sh
 ```
 
-制品必须来自已核验的 H17 代码 commit、`v3.4.10-h17` tag 或本地交付包；使用滚动 `master` 下载时务必按上面命令核对 SHA-256。包文件清单见 `SHA256SUMS` 与 [RELEASE-H17.md](./RELEASE-H17.md)。
+制品必须来自已核验的 H20 代码 commit、`v3.4.10-h20` tag 或本地交付包；使用滚动 `master` 下载时务必按上面命令核对 SHA-256。包文件清单见 `SHA256SUMS` 与 [RELEASE-H20.md](./RELEASE-H20.md)。
 
 无参数运行当前文件进入主菜单时，脚本会尝试把它复制到 `/usr/local/bin/vless-server.sh`，并创建 `/usr/local/bin/vless` 与 `/usr/bin/vless` 软链接；首次协议安装成功后也会再次确保快捷命令存在。只运行 `--help` 等 CLI 分支不会触发这一步。进入菜单后选择 `1 安装协议`；成功后可运行：
 
@@ -79,19 +79,19 @@ sudo /usr/local/bin/vless-server.sh --help
 
 ### 3.2 已有部署：菜单更新的历史行为
 
-**此节说明现有更新器。** 菜单 12 固定公开滚动 `master`；H17 晋升到该源后，更新器取得的即为本修订，并自动与远端 `SHA256SUMS` 交叉核对，但仍须按上文备份并核对。需要最可控的路径时按 3.3 节手工替换。
+**此节说明现有更新器。** 菜单 12 固定公开滚动 `master`；H20 晋升到该源后，更新器取得的即为本修订，并自动与远端 `SHA256SUMS` 交叉核对，但仍须按上文备份并核对。需要最可控的路径时按 3.3 节手工替换。
 
 旧编号版本仍可能按 release/tag 版本号判断，首次迁移需要手工替换；已经采用滚动模式的安装，其更新器行为如下：
 
 1. 在启动新脚本前备份 `/etc/vless-reality/`；已有 CF Tunnel 时同时备份 `/etc/cloudflared/`。无参数启动会在任何菜单选择和更新询问前初始化/迁移数据库并同步系统脚本；仅进入菜单不会自动同步 Tunnel、改写 Xray/cloudflared 配置或重启/HUP相关服务。不能先启动再补备份。
 2. 运行 `sudo vless`，选择 `12 检查脚本更新`。
 3. 脚本下载远程 `master` 制品并与 `SHA256SUMS` 核对；版本不低于本地且字节不同时才询问更新。
-4. 替换前检查下载内容的 Bash shebang 与语法，先在同目录生成并逐字节核对 `.bak` 备份（备份失败即中止，不替换现役脚本）；替换成功后通过新进程执行 `--apply-configs` 重建并重载 Xray 与 sing-box。
+4. 替换前检查下载内容的 Bash shebang 与语法，先在同目录生成并逐字节核对 `.bak` 备份（备份失败即中止，不替换现役脚本）；替换成功后通过新进程执行 `--apply-configs` 重建并重载 Xray 与 sing-box，并同步刷新 `/etc/vless-reality/watchdog.sh` 与 Alpine `/etc/init.d/vless-singbox`。
 5. 自动应用失败时流程返回非零并明确提示，已验证的新脚本与 `.bak` 备份均保留。无论是否报错，更新后仍建议执行第 9 节的配置、服务与连接验证。
 
 ### 3.3 已有部署：手动替换
 
-H17 可使用手工替换路径：启动前备份现役脚本和配置目录，再按 3.1 校验本地交付包；替换 `/usr/local/bin/vless-server.sh` 后执行 `sudo /usr/local/bin/vless-server.sh --apply-configs` 或进入菜单选择 `14 重建全部配置`，并执行第 9 节验证。菜单 14 会在重载前对各核心配置执行预检（`xray run -test` / `sing-box check`）；任一核心预检失败时保留原配置、不重启该核心并返回非零提示。
+H20 可使用手工替换路径：启动前备份现役脚本和配置目录，再按 3.1 校验本地交付包；替换 `/usr/local/bin/vless-server.sh` 后执行 `sudo /usr/local/bin/vless-server.sh --apply-configs`（同时刷新核心配置与 `watchdog.sh`/Alpine init）或进入菜单选择 `14 重建全部配置`，并执行第 9 节验证。菜单 14 与 `--apply-configs` 统一经持锁 `rebuild_and_reload_{xray,singbox}` 在重载前执行预检（`xray run -test` / `sing-box check`）并遵守 `paused`/F04 守卫；任一核心预检失败时保留原配置、不重启该核心并返回非零提示。
 
 ## 4. 配置文件架构
 
@@ -140,7 +140,7 @@ H17 可使用手工替换路径：启动前备份现役脚本和配置目录，�
 **服务与协议卸载风险：**
 
 - 菜单 7 的“停止/重启所有服务”、卸载 Hysteria2/TUIC，以及完全卸载都会执行端口跳跃清理。清理只根据 `db.json` 中 `hop_enable=1` 的精确协议/端口/范围，成对删除对应 IPv4/IPv6 `PREROUTING` 与 `OUTPUT` 规则；数据库缺失或字段无效时不删除任何规则。操作后仍应核对本项目规则是否清干净。
-- 卸载单个 Xray/sing-box 协议或端口会先停止对应共享核心并删除整份派生配置，再为所有剩余协议重建；重建失败时共享服务不会恢复，所有剩余协议会中断。操作前备份 `db.json`、派生配置并安排停机/回滚。
+- 卸载单个 Xray/sing-box 协议或端口时，先校验数据库删除成功，再通过持锁的 `rebuild_and_reload_{xray,singbox}` 在临时文件渲染并预检剩余协议配置（`xray run -test` / `sing-box check`）；预检失败时保留原配置与运行中服务，不会拖停其余正常端口，预检通过后才原子替换并重载一次（尊重 `paused` 与 F04 空用户自动停服状态）。操作前仍建议备份 `db.json` 与派生配置。
 - 仅在 Hysteria2 或 TUIC 的最后一个端口（或全部端口）删除后清理该协议共享证书目录；删除单个端口且仍有保留端口时证书继续保留。
 
 ### 安装协议菜单
@@ -184,7 +184,7 @@ H17 可使用手工替换路径：启动前备份现役脚本和配置目录，�
 
 AnyTLS 的实际 inbound 与服务由 sing-box 管理。当前安装路径仍会额外下载未用于 inbound 服务的 `anytls-server` / `anytls-client`；实际运行服务仍是 sing-box。安装 AnyTLS 时，脚本会在 `/etc/vless-reality/certs/anytls/` 生成独立自签证书；SNI 变化时会重新生成。
 
-配置生成器默认使用这份独立证书；若独立证书缺失，会回退到全局 `server.crt` / `server.key`。此外，当 `cert_domain`、全局 `server.crt` 存在且记录域名与 AnyTLS SNI 一致时，也会切换到全局证书。两条分支都不验证 `server.key` 是否存在，也不验证证书链或颁发者，因此必须人工核对证书、私钥和域名匹配。
+配置生成器默认使用这份独立自签证书；当全局 `server.crt`/`server.key` 通过统一严格校验 `_anytls_secure "$sni"`（底层调用 `_is_real_cert` 执行系统 CA 链验证 `openssl verify -purpose sslserver`、`-untrusted` 中间链、`-verify_hostname` SAN 主机名匹配、`-checkend 0` 有效期及公私钥配对检验，且 `cert_domain` 与 SNI 一致）时，会与 Hysteria2 / TUIC 一致切换到全局真实证书；若全局证书缺少中间链、过期或私钥不匹配，则安全回退独立自签证书，避免拖垮 `sing-box check`。
 
 完成证书配置后使用菜单 14 重建，并核对 inbound：
 
@@ -193,7 +193,7 @@ jq -r '.inbounds[] | select(.type=="anytls") | {tag,listen_port,tls:.tls.certifi
   /etc/vless-reality/singbox.json
 ```
 
-随后检查服务状态并重新生成客户端链接。分享链接是否去掉 `allowInsecure` 使用另一套判定：SNI 必须匹配 `cert_domain`，且全局证书的 issuer 文本必须命中脚本内置的子串列表。它不是 CA/证书链验证，既可能拒绝其它可信 issuer，也可能因 `R3`、`E1` 等短标记出现在无关 issuer 中而误判。自签兜底会保留不安全验证选项；仍须独立检查证书链、有效期、SAN/主机名与私钥匹配。
+随后检查服务状态并重新生成客户端链接。分享链接、Clash/Surge 订阅以及入站证书选择现已统一共用 `_anytls_secure` / `_is_real_cert` 密码学校验判据（已彻底移除旧版基于 `R3`/`E1`/`ZeroSSL` 等 issuer 子串的回退判定）：仅当全局 `server.crt` 为完整证书链（`fullchain.pem`）且通过系统 CA 信任链、SAN、有效期与私钥配对校验时，才关闭 `allowInsecure` / `skip-cert-verify`；自签兜底仍自动附带跳过验证参数。外部导入的第三方 `hysteria2`/`anytls` 节点默认输出 `skip-cert-verify: false`（见 [RELEASE-H20.md](./RELEASE-H20.md) 迁移说明）。
 
 ## 8. 命令行与常见操作
 
@@ -251,7 +251,7 @@ sing-box check -c /etc/vless-reality/singbox.json
 
 **AnyTLS 仍显示不安全验证**
 
-核对 `cert_domain`、AnyTLS SNI、inbound 证书/私钥路径，并检查证书 issuer 是否命中脚本内置的 CA 识别列表。自签兜底保留 `allowInsecure` 是预期行为；若使用其它可信 CA，脚本仍可能因 issuer 不在列表中而保留该参数。
+核对 `/etc/vless-reality/cert_domain`、AnyTLS SNI、以及 `/etc/vless-reality/certs/server.crt` 是否包含完整中间链（`fullchain.pem`）且与 `server.key` 公私钥配对、未过期并被系统 CA 信任库验证通过（可用 `openssl verify -purpose sslserver` 自检）。自签兜底保留 `allowInsecure` 是预期行为。
 
 **sing-box 配额没有自动封禁**
 
@@ -297,11 +297,11 @@ sing-box check -c /etc/vless-reality/singbox.json
 
 “完全卸载”并不等于删除所有证书、核心二进制或主机级副作用。执行前备份配置、root crontab、iptables/ip6tables、相关 sysctl 与共享服务状态；如需连证书和整个配置目录一并删除，必须按脚本最后显示的命令另行操作。
 
-## 11. H17 验收基线
+## 11. H20 验收基线
 
-H17 产品 SHA-256 为 `f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`（握手 `3.4.10-h17`；内部审计基线 H16 为 `7645d99e0b935c31c2462ae3328d0d806c77efe7ee35909f347b9aed97decc16`；公开仓上一正式版 H15 为 `f8606553c3410e6c66c177bb205ee81052681a228a3e704d6ed549fbc060f13a`），相对 H14-rc.1（`6ea18a9e…eaa34`）累计完成初始审计 P0/P1/关键 P2 及 H16/H17 外部审计与复审全部修复，审计与整改见 [docs/AUDIT-H14-RC1.md](./docs/AUDIT-H14-RC1.md)、[docs/REMEDIATION-AND-ARCHITECTURE.md](./docs/REMEDIATION-AND-ARCHITECTURE.md)、[RELEASE-H16.md](./RELEASE-H16.md) 与 [RELEASE-H17.md](./RELEASE-H17.md)。
+H20 产品 SHA-256 为 `4f781c66b7d40721281db85f3f66471643c6cf690f60e8e43bb8664a60a92be6`（握手 `3.4.10-h20`；公开仓上一正式版 H17 为 `f66536a0d74e36e90f461293ca9212669e87b492628e93e9b1900ec9aefbd548`；内部审计基线 H18/H19 未单独公开发行），相对 H14-rc.1（`6ea18a9e…eaa34`）累计完成初始审计 P0/P1/关键 P2、H16/H17 外部审计与复审，以及 H18–H20 全维度安全加固、类级同类自审与深模块收敛全部整改，详见 [docs/AUDIT-H14-RC1.md](./docs/AUDIT-H14-RC1.md)、[docs/REMEDIATION-AND-ARCHITECTURE.md](./docs/REMEDIATION-AND-ARCHITECTURE.md)、[RELEASE-H18.md](./RELEASE-H18.md)、[RELEASE-H19.md](./RELEASE-H19.md) 与 [RELEASE-H20.md](./RELEASE-H20.md)。
 
-CI 入口为 `bash tests/run-ci.sh <mode>`，模式：`syntax`、`static`（ShellCheck error 级）、`unit`（`--awk-bin mawk|gawk` 各一遍，含 mutation 与 identity）、`xray-e2e`、`auth-e2e`、`singbox-e2e`（固定 Xray 26.3.27 / sing-box 1.14.4）、`stateful-upgrade`（H13/H14 → H17 真实制品升级）、`webroot-e2e`、`installer-e2e`（Docker 10 组生命周期，无网络、TEST-NET 靶机，同时断言回环仍被阻断与真实 `--apply-configs` 入口）。工作流使用完整历史检出（`fetch-depth: 0`），否则 `stateful-upgrade` 会因找不到历史基线而失败。
+CI 入口为 `bash tests/run-ci.sh <mode>`，模式：`syntax`、`static`（ShellCheck error 级 + 强制 8 项 `scripts/check-static-invariants.py` 静态结构不变量门禁）、`unit`（`--awk-bin mawk|gawk` 各一遍，含真实函数体变异自检与文档一致性契约校验）、`xray-e2e`、`auth-e2e`、`singbox-e2e`（固定 Xray 26.3.27 / sing-box 1.14.4）、`stateful-upgrade`（H13/H14 → H20 真实制品升级）、`webroot-e2e`、`installer-e2e`（Docker 10 组生命周期，无网络、TEST-NET 靶机，同时断言回环仍被阻断与真实 `--apply-configs` 入口）。工作流使用完整历史检出（`fetch-depth: 0`），否则 `stateful-upgrade` 会因找不到历史基线而失败。
 
 边界：CI Web 只覆盖函数/HTTP/service spy；Docker 为私有 leaf pin，不证明公网 CA、强沙箱或自动回滚；干净 Debian/systemd 与 Alpine/OpenRC 的真实 init 全生命周期未自动化；sing-box 协议、`ss-legacy`、SOCKS5 无逐用户流量计量。
 

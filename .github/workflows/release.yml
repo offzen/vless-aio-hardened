@@ -15,7 +15,7 @@ concurrency:
 jobs:
   preflight:
     name: Verify Tag Metadata, Manifest & Public Hygiene
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && github.event.repository.private == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -39,7 +39,7 @@ jobs:
 
   ci:
     name: Full Verification Gate
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && github.event.repository.private == false
     needs: [preflight]
     uses: ./.github/workflows/ci.yml
     permissions:
@@ -47,7 +47,7 @@ jobs:
 
   release:
     name: Package, Attest & Publish Release
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && github.event.repository.private == false
     needs: [preflight, ci]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -125,7 +125,3 @@ jobs:
             gh release edit "$GITHUB_REF_NAME" --notes-file "$notes_file"
           fi
           gh release upload "$GITHUB_REF_NAME" release-dist/* --clobber
-
-      - name: Report private release candidate verification
-        if: ${{ github.event.repository.private == true }}
-        run: echo "::notice::Release candidate verification completed. Attested releases are published only from the public release repository."

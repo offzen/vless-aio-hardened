@@ -1,5 +1,36 @@
 # Changelog
 
+## H20 — 全维度安全加固、深模块收敛与发布门禁闭环版（2026-11-28；公开基线 H17 直升包含 H18 + H19 + H20 全部整改）
+
+兼容握手：`3.4.10-h20`。产品 SHA-256：`4f781c66b7d40721281db85f3f66471643c6cf690f60e8e43bb8664a60a92be6`。详见 [RELEASE-H20.md](./RELEASE-H20.md)。
+
+> **公开升级总览（`v3.4.10-h17` → `v3.4.10-h20`）**：内部审计基线 H18（F01–F08 / R01 / R03）与 H19（D2–D5、D7–D12、SA-01–SA-07）未单独公开发行；本次公开版 `v3.4.10-h20` 一并交付 H18、H19 与 H20 全部安全与可靠性改进（含外部自签 `hy2`/`anytls` 默认严格校验证书迁移说明，详见下方与 [RELEASE-H20.md](./RELEASE-H20.md)）。
+
+**供应链安全、零 `eval` 与外部订阅边界加固（SEC-1–SEC-4）**
+- SEC-1 移除 `download_wgcf` 非可信第三方 GitHub 代理（`gh-proxy.com`/`ghps.cc`/`gh.ddlc.top`/`ghproxy.net`），统一收口至官方 GitHub Release + `_install_binary` digest/ELF/原子安装校验。
+- SEC-2 抽出唯一安全拉取原语 `_http_fetch_sub_raw` 统一 `fetch_subscription` 与 `parse_subscription`（强制空白/控制字符拒绝、`jq -Rn` 编码、`curl -K -`、`--proto '=http,https'`、`--proto-redir '=http,https'`、`--max-redirs 5`、`--max-filesize 2097152` + `head -c 2097153` 流式硬截断防无 `Content-Length` 分块 OOM）；彻底删除旧 `urldecode`（`printf '%b'`），`_urldecode` 与新增 `_strict_base64_decode_noctrl` 严格保留字面 `+`、对裸/残缺 `%`、非法 Base64 及 `%00..%1F`/`%7F` 控制字符（含尾随 LF/NUL）fail-closed 返回错误，统一 `parse_proxy_link` 各协议查询参数解码、先截断 `?query` 再必检 `@` 并归一化方括号 IPv6（`ss://` 支持明文/旧格式密码含 `@` 并对畸形无 `:` userinfo 输出 stderr 告警）。
+- SEC-3 全仓彻底清零 `eval`：`_install_binary` 改为白名单 `_install_binary_extract`（`xray_zip`/`singbox_tar`/`anytls_zip`/`raw_bin:*`），`_save_join_info` 改为显式参数计数 + 数组参数调用（仅索引 0 替换 `%s`，移除 `_q`、`--` 分隔符冲突与 `eval "$cmd"`）。
+- SEC-4 `install_snell` / `install_snell_v5` / `install_naive` / `install_cloudflared` 补齐 `--max-time 900`、ELF 魔数校验与 GitHub API `digest` 校验（移除 `install_naive` 以 root 执行未验签产物的探针）；`_get_release_changelog` 补超时，`get_ipv4`/`get_ipv6`/`get_ip_country` 切至 HTTPS + 超时。
+
+**生命周期收敛、升级闭环、证书/流量/Nginx 与解析修复（SA-08–SA-14、STYLE-1–STYLE-2）**
+- SA-08（升级闭环）：`create_server_scripts` 改为临时文件原子替换并校验写入返回码（写失败保留原脚本不截断），`_apply_configs_cli` 自动刷新 `$CFG/watchdog.sh`（运行且未暂停时重启 `vless-watchdog`，脚本刷新或重启失败显式告警并置非零退出码；`migrate-anytls-singbox.sh` 在 `sing-box` 端口接管成功后仅对辅助刷新异常输出告警而不误回滚）与 Alpine `/etc/init.d/vless-singbox`。
+- SA-09（F04/ACME 统一守卫）：`_apply_configs_cli --ensure-singbox` 补齐 `! is_paused && [[ -f "$CFG/singbox.json" && ! -e "$CFG/.singbox-stopped-empty" ]]` 门禁；新增顶层 `_acme_cert_reload_cmd` 统一 HTTP-01 / DNS-01 / 手动 DNS 三条证书签发路径（统一 `0600` 权限、拒绝路径控制字符并对单引号做 POSIX 安全转义、传播 `--install-cert` 与重载失败码、遵守 `paused` 与 `.singbox-stopped-empty`、仅重载已运行服务与平滑 reload 活跃 Nginx）。
+- SA-10（AnyTLS 证书一致性）：`generate_singbox_config` 的 `anytls` 分支改用 `_anytls_secure "$sni"`（与 `hy2`/`tuic` 完全对齐），全局证书异常时安全回退独立自签证书不再拖垮 `sing-box check`。
+- SA-11（流量配额防漏禁与退避）：`_traffic_collect_to_journal` 过滤 `statsquery` 空闲零值计数，`_sync_all_user_traffic_locked` 阶段 2 配额扫描或禁用失败时原子持久化 `$CFG/cache/.quota-check-pending`（`0600`，`fail_count<TAB>next_retry_epoch`，落盘失败保留 `traffic.pending` 不截断），首次失败下轮立即补扫，连续失败按 60s–3600s 指数退避（含十进制解析与 `>3600s` 时钟回拨保护）跳过空 pending 时的冗余整库 `jq` 扫描（仍返回非零）。
+- SA-12（Clash YAML / IPv6 / SS / 日期边界）：`_flatten_clash_yaml_proxies` 跟踪 `item_indent` 正确解析节点内缩进块序列与 flow 数组，对多元素 `alpn` 无损保留并联动 `external_link_to_clash` 输出合法多元素 YAML 数组 `["h3", "http/1.1"]`、`external_link_to_surge` 取主 ALPN 不再误丢节点；`_valid_sub_server` 与 `_normalize_sub_server` 正式兼容并规范化方括号 IPv6 `[2001:db8::1]`；修复 `parse_ss_link` 与 `parse_proxy_link` 旧/明文格式密码含 `@`；`_date_add_days_ymd` 增加偏移上限与 `_valid_ymd` 校验防溢出。
+- SA-13（Nginx 隔离与原子安装）：`create_fake_website` 改用 `$CFG/certs/server.crt`（修复硬编码 `/etc/vless-reality/certs/`）并统一经 `_nginx_install_conf` 原子安装与前置备份校验。
+- SA-14（深模块收敛）：`_rebuild_and_reload_{xray,singbox}_impl` 内建 `is_paused` 守卫，`_regenerate_proxy_configs`、`uninstall_specific_protocol` 剩余协议重载与 `do_install_server` 443 主协议替换全部委托 `rebuild_and_reload_{xray,singbox}`（继承 `.reload-apply.<core>.lock` 与 `.reload-pending` ack）。
+- STYLE-1/2：修复 `gen_xray_ip_routing_outbounds`/`gen_xray_ip_routing_rules`/`gen_xray_routing_rules`/`gen_singbox_routing_rules`/`show_single_protocol_info` 5 处末行条件码泄漏；`start_services` ShadowTLS 后端重启失败不再 `|| true` 吞错；分流域名切分改 `IFS=',' read -ra` 防通配符展开；`vless-server.sh` 与 `migrate-anytls-singbox.sh` flock 锁文件改为子 shell `umask 077` 创建不污染外层 `umask`；`rm -rf` 统一补充 `--`。
+
+**发布流程、静态不变量与真变异门禁（REL-1–REL-4、SA-15）**
+- REL-1/REL-4：全面对齐 `README.md`、`USAGE.md`、`RELEASE-H20.md`、`CHANGELOG.md`、`FIXES.md`、`tests/README.md` 至 `3.4.10-h20` 与最新 SHA-256，并在 `tests/test-ci-workflow-contract.sh` 固化文档-版本-哈希一致性硬门禁。
+- REL-2：`check-version-bump.sh` 在 tag push 全零 `--base` 时仅匹配有效 `refs/tags/v*` 对比严格低于 `CUR_VER` 的最高语义化 tag 并统一十进制比较；`scripts/check-public-hygiene.py` 扩展扫描待发提交范围的提交头、标签附注与历史补丁；`.gitea/workflows/ci.yml` 补齐 `--base` 传递；`.github/workflows/release.yml` 全 3 作业限定公开仓执行（私有仓零配额消耗且不输出假绿通告）。
+- SA-15：`scripts/check-static-invariants.py` 升级至 8 项结构不变量（支持 heredoc-aware 函数抽取、注释剥离、全词 `eval`、禁用旧 `urldecode` 与非可信代理、校验 `--proto-redir`/`--max-filesize` 与深模块收敛）；`tests/run-ci.sh` 将静态不变量改为 fail-closed 并抬升 `MIN_UNIT_TESTS=29`；重写 `tests/test-h19-audit-regression.sh` M6/M8/M9/M10 为真实函数体变异测试并新增 `tests/test-h20-hardening.sh`。
+
+**包含的前置内部基线（H18 + H19，相对公开基线 H17 新增）**
+- H18（F01–F08 / R01 / R03）：外部订阅 YAML 双引号序列化与控制字符拒绝、统一默认开启证书校验（`skip-cert-verify: false`）、`_is_real_cert` 严格 CA 链+SAN+私钥配对校验、sing-box 全禁用自动停服与自动恢复（F04）、`_nginx_install_conf` 前置备份校验、Clash YAML 解析重构与 TUIC 支持、Debian `dpkg-query` 严格依赖检查、订阅 URL `curl -K -` 脱敏与流量单遍聚合。
+- H19（D2–D5、D7–D12、SA-01–SA-07）：流量聚合失败保账、单次整库配额读取、证书防误删与残余 issuer 子串清零、gRPC `serviceName` 往返、Alpine `gcompat` `_pgrep` 与 OpenRC POSIX `start_pre`/非执行 `STLS_PASSWORD`、纯 AWK 公历日期替代 `date -d`、`watchdog.sh` `paused`/F04 守卫。
+
 ## H19 — H18 审计回归闭环与全仓类级自审加固版（2026-11-27；修复 D2–D5、D7–D12、Alpine 实机缺陷及全仓自审 SA-01–SA-07）
 
 兼容握手：`3.4.10-h19`。产品 SHA-256：`07dae560f3fd73cfdbe82a72687fd50617a20e0cd771130f8b3f6c9f4bf0b912`。详见 [RELEASE-H19.md](./RELEASE-H19.md)。

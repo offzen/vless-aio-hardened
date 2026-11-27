@@ -130,6 +130,13 @@ git -C "$r" tag v3.4.10-h5
 mk_script "$r" 3.4.10-h5 b; commit "$r" changed; orphan_head "$r" snapshot
 check "--base 全 0 哨兵值 → 降级选基准并拦下(1)" "$(run_gate "$r" --base 0000000000000000000000000000000000000000)" "1"
 
+r="$(new_repo o7b)"; mk_script "$r" 3.4.10-h4 a; commit "$r" h4
+git -C "$r" tag v3.4.10-h4
+mk_script "$r" 3.4.10-h5 b; commit "$r" h5
+git -C "$r" tag v3.4.10-h5
+mk_script "$r" 3.4.10-h5 c; commit "$r" unbumped-on-new-branch
+check "--base 全 0 + 多历史 tag + 未抬版本新分支 → 仍与最高 tag(h5) 比并拦下(1)" "$(run_gate "$r" --base 0000000000000000000000000000000000000000)" "1"
+
 echo ""
 echo "########## 3. 边界与放行 ##########"
 

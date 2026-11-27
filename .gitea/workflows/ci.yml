@@ -14,6 +14,10 @@ on:
       - 'release/**'
   workflow_dispatch:
 
+concurrency:
+  group: forgejo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   forgejo-ci:
     name: Private Forgejo Linux Gate
@@ -42,13 +46,23 @@ jobs:
           printf 'awk: %s\n' "$(command -v gawk) $(command -v mawk)"
 
       - name: Verify manifest, hygiene, version bump, static checks, dual AWK & upgrade
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
           test "$(git rev-parse --is-shallow-repository)" = false
           sha256sum -c SHA256SUMS
           bash scripts/refresh-manifest.sh --check
           python3 scripts/check-public-hygiene.py
-          bash check-version-bump.sh
+          base_args=()
+          if [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" ]]; then
+            base_args=(--base "$PR_BASE_SHA")
+          elif [[ "$EVENT_NAME" == "push" && -n "$PUSH_BEFORE_SHA" ]]; then
+            base_args=(--base "$PUSH_BEFORE_SHA")
+          fi
+          bash check-version-bump.sh "${base_args[@]}"
           bash tests/run-ci.sh syntax
           bash tests/run-ci.sh static
           bash tests/run-ci.sh unit --awk-bin mawk

@@ -50,7 +50,26 @@ check 'release.yml triggers on v* tags' grep -Fq "'v*'" "$REL_YML"
 check 'release.yml calls ./.github/workflows/ci.yml via workflow_call' grep -Fq 'uses: ./.github/workflows/ci.yml' "$REL_YML"
 check 'release.yml gates release job on preflight and ci' grep -Fq 'needs: [preflight, ci]' "$REL_YML"
 check 'release.yml uses Sigstore actions/attest-build-provenance@v2' grep -Fq 'uses: actions/attest-build-provenance@v2' "$REL_YML"
-check 'release.yml restricts attestation/publish to public repos' grep -Fq 'github.event.repository.private == false' "$REL_YML"
+check 'release.yml restricts all 3 jobs (preflight/ci/release) to public repos (zero private quota burn or false-green RC)' \
+    bash -c '[ "$(grep -Fc "github.event.repository.private == false" "$1")" -ge 3 ]' _ "$REL_YML"
+check 'run-ci.sh enforces scripts/check-static-invariants.py fail-closed' \
+    grep -Fq '[[ -f scripts/check-static-invariants.py ]] || fail' "$ROOT/tests/run-ci.sh"
+
+# Release documentation alignment contract (REL-1 / REL-4):
+# README.md, USAGE.md, CHANGELOG.md, FIXES.md, and RELEASE-H<N>.md must match script VERSION & product SHA-256
+SCRIPT_VER=$(sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' "$ROOT/vless-server.sh" | head -n1)
+PRODUCT_SHA=$(sha256sum "$ROOT/vless-server.sh" | awk '{print $1}')
+H_NUM="${SCRIPT_VER##*-h}"
+check "doc-alignment: README.md references current VERSION ($SCRIPT_VER) and SHA-256" \
+    bash -c 'grep -Fq "$1" "$3" && grep -Fq "$2" "$3"' _ "$SCRIPT_VER" "$PRODUCT_SHA" "$ROOT/README.md"
+check "doc-alignment: USAGE.md references current VERSION ($SCRIPT_VER) and SHA-256" \
+    bash -c 'grep -Fq "$1" "$3" && grep -Fq "$2" "$3"' _ "$SCRIPT_VER" "$PRODUCT_SHA" "$ROOT/USAGE.md"
+check "doc-alignment: CHANGELOG.md references current VERSION ($SCRIPT_VER) and SHA-256" \
+    bash -c 'grep -Fq "$1" "$3" && grep -Fq "$2" "$3"' _ "$SCRIPT_VER" "$PRODUCT_SHA" "$ROOT/CHANGELOG.md"
+check "doc-alignment: FIXES.md references current VERSION ($SCRIPT_VER) and SHA-256" \
+    bash -c 'grep -Fq "$1" "$3" && grep -Fq "$2" "$3"' _ "$SCRIPT_VER" "$PRODUCT_SHA" "$ROOT/FIXES.md"
+check "doc-alignment: RELEASE-H${H_NUM}.md exists and references VERSION ($SCRIPT_VER) and SHA-256" \
+    bash -c 'test -f "$3" && grep -Fq "$1" "$3" && grep -Fq "$2" "$3"' _ "$SCRIPT_VER" "$PRODUCT_SHA" "$ROOT/RELEASE-H${H_NUM}.md"
 
 # Hygiene scanner positive + negative verification in isolated temp git repo
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/aio-hygiene-test.XXXXXX")
@@ -81,6 +100,19 @@ printf 'custom-internal-host.example\n' > "$TMP/custom.txt"
 git -C "$TMP" add custom.txt
 git -C "$TMP" commit -qm "add custom host"
 check 'hygiene scanner honors VLESS_HYGIENE_FORBIDDEN_REGEX' bash -c '! VLESS_HYGIENE_FORBIDDEN_REGEX="custom-internal-host" python3 "$1" --repo "$2"' _ "$HYGIENE" "$TMP"
+
+git -C "$TMP" rm -q custom.txt
+git -C "$TMP" commit -qm "clean before tag"
+git -C "$TMP" tag v1.0.0
+GIT_AUTHOR_EMAIL="op@node.internal" GIT_COMMITTER_EMAIL="op@node.internal" \
+    git -C "$TMP" commit --allow-empty -qm "internal author email"
+check 'hygiene scanner rejects internal .internal commit author email' bash -c '! python3 "$1" --repo "$2"' _ "$HYGIENE" "$TMP"
+
+git -C "$TMP" reset -q --hard v1.0.0
+printf 'transient=%s%s\n' 'http://192.168.' '1.10:9000/api' > "$TMP/transient.txt"
+git -C "$TMP" add transient.txt && git -C "$TMP" commit -qm "transient leak"
+git -C "$TMP" rm -q transient.txt && git -C "$TMP" commit -qm "remove transient leak"
+check 'hygiene scanner rejects transient secret in outgoing v*..HEAD commit range' bash -c '! python3 "$1" --repo "$2"' _ "$HYGIENE" "$TMP"
 
 check 'hygiene scanner passes on live repository (--allow-dirty)' python3 "$HYGIENE" --repo "$ROOT" --allow-dirty
 

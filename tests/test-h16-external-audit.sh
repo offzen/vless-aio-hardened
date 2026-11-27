@@ -432,25 +432,26 @@ J
         bash -c 'awk "/--sync-traffic\\)/,/;;/" "$1" | grep -q "_reload_pending xray"' _ "$PRODUCT"
 )
 
-# ═════════════ A6 分享链接生成：口令按字面处理 ═════════════
+# ═════════════ A6 分享链接生成：口令按字面处理（H20 零 eval 数组分发） ═════════════
 sec_join_quoting() ( fresh_env join
     get_ipv4() { echo 203.0.113.9; }; get_ipv6() { echo ""; }
     PWNED="$SEC/pwned"
     LINKARGS="$SEC/linkargs"
     gen_trojan_link() { : >"$LINKARGS"; local a; for a in "$@"; do printf '%s\n' "$a" >>"$LINKARGS"; done; echo "trojan://stub"; }
     i=0
-    for pw in "a b" 'x$(touch '"$PWNED"')y' 'q`touch '"$PWNED"'`q' "it's" 'semi;touch '"$PWNED" '%s-literal' '[bracket]*' ; do
+    for pw in "a b" 'x$(touch '"$PWNED"')y' 'q`touch '"$PWNED"'`q' "it's" 'semi;touch '"$PWNED" '%s-literal' '[bracket]*' '--' '%s' ; do
         i=$((i + 1))
         _save_join_info "trojan" "TROJAN|%s|443|$pw|sni.example" \
-            "gen_trojan_link %s $(_q 443) $(_q "$pw") $(_q sni.example)"
+            gen_trojan_link 4 "%s" "443" "$pw" "sni.example"
         check "A6 password #$i is passed verbatim to the link generator" \
             bash -c '[[ "$(sed -n 3p "$1")" == "$2" ]]' _ "$LINKARGS" "$pw"
         check "A6 password #$i: first arg is the server IP" eq "$(sed -n 1p "$LINKARGS")" 203.0.113.9
         check "A6 password #$i: exactly four args" eq "$(wc -l <"$LINKARGS" | tr -d ' ')" 4
     done
     check 'A6 no command embedded in a password was executed' test ! -e "$PWNED"
-    check 'A6 every _save_join_info caller quotes user values through _q' \
-        bash -c '! grep -nE "^[[:space:]]+\"gen_[a-z0-9_]+_link .*\\$[a-z_]+" "$1" | grep -v "_q " | grep -q .' _ "$PRODUCT"
+    sji_body=$(declare -f _save_join_info)
+    check 'A6 _save_join_info uses direct argv dispatch with zero eval' \
+        bash -c '[[ -n "$1" ]] && ! grep -Eq "(^|[^A-Za-z0-9_])eval([[:space:]]|$)" <<<"$1"' _ "$sji_body"
 )
 
 # ═════════════ A7 完整卸载：仅清理本项目配置的 WARP ═════════════
@@ -472,7 +473,7 @@ J
     register_protocol trojan '{"port":9443,"password":"p","sni":"t.example"}' >/dev/null 2>&1; rc=$?
     check 'A8 failed DB write makes register_protocol return non-zero' test "$rc" -ne 0
     check 'A8 failed DB write sets the failure flag' eq "${_REGISTER_FAILED:-0}" 1
-    _save_join_info trojan 'TROJAN|%s|9443|p|t.example' 'gen_trojan_link %s 9443 p t.example' >/dev/null 2>&1; rc=$?
+    _save_join_info trojan 'TROJAN|%s|9443|p|t.example' gen_trojan_link 4 '%s' 9443 p t.example >/dev/null 2>&1; rc=$?
     check 'A8 join info is not generated after a failed registration' test "$rc" -ne 0
     check 'A8 no join file was written for the unregistered protocol' test ! -e "$CFG/trojan.join"
     check 'A8 existing healthy protocol is untouched' eq "$(jq -r '.xray["vless-ws"].uuid' "$DB_FILE")" aaaa
@@ -589,7 +590,7 @@ sec_sub_txn() ( fresh_env subtxn
     lineno() { grep -n -- "$1" <<<"$body" | head -1 | cut -d: -f1; }
     check 'A13 UUID regeneration no longer rotates before confirmation' bash -c '! grep -q reset_sub_uuid <<<"$1"' _ "$body"
     check 'A13 old subscription dir is removed only after the nginx check' \
-        bash -c '[[ -n "$1" && -n "$2" && "$1" -lt "$2" ]]' _ "$(lineno 'Nginx 配置错误，已恢复原配置')" "$(lineno 'rm -rf "$CFG/subscription/$old_uuid"')"
+        bash -c '[[ -n "$1" && -n "$2" && "$1" -lt "$2" ]]' _ "$(lineno 'Nginx 配置错误，已恢复原配置')" "$(lineno 'rm -rf -- "$CFG/subscription/$old_uuid"')"
     check 'A13 sub.info is written only after the nginx reload' \
         bash -c '[[ -n "$1" && -n "$2" && "$1" -lt "$2" ]]' _ "$(lineno 'reload_ok -ne 1')" "$(lineno '_write_sub_info')"
     check 'A13 rollback cleans newly created webroot placeholder only when absent before' \

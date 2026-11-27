@@ -84,16 +84,16 @@ version_gt() {
     for ((i=0; i<${#v1_arr[@]} || i<${#v2_arr[@]}; i++)); do
         local n1=${v1_arr[i]:-0} n2=${v2_arr[i]:-0}
         if [[ "$n1" =~ ^[0-9]+$ && "$n2" =~ ^[0-9]+$ ]]; then
-            ((n1 > n2)) && return 0
-            ((n1 < n2)) && return 1
+            ((10#$n1 > 10#$n2)) && return 0
+            ((10#$n1 < 10#$n2)) && return 1
         else
             [[ "$n1" > "$n2" ]] && return 0
             [[ "$n1" < "$n2" ]] && return 1
         fi
     done
 
-    [[ "$rev1" =~ ^[0-9]+$ ]] || rev1=-1
-    [[ "$rev2" =~ ^[0-9]+$ ]] || rev2=-1
+    if [[ "$rev1" =~ ^[0-9]+$ ]]; then rev1=$((10#$rev1)); else rev1=-1; fi
+    if [[ "$rev2" =~ ^[0-9]+$ ]]; then rev2=$((10#$rev2)); else rev2=-1; fi
     ((rev1 > rev2)) && return 0
     ((rev1 < rev2)) && return 1
     return 1
@@ -104,19 +104,25 @@ extract_version() {
     sed -n 's/^readonly VERSION="\([^"]*\)".*/\1/p' | head -1
 }
 
-# 仓库内最高的语义化 tag（输出带 v 前缀，如 v3.4.10-h5）；无则返回 1
+# 仓库内最高的语义化发布 tag（仅匹配可解析为 commit 的 refs/tags/v*）；若传入 max_exclusive 则只选严格低于该版本的最高 tag
 highest_semver_tag() {
-    local t v best=""
+    local max_exclusive="${1:-}"
+    local t v best_ver="" best_tag=""
     while IFS= read -r t; do
-        [ -n "$t" ] || continue
+        [[ "$t" == v* ]] || continue
         v="${t#v}"
         is_semver "$v" || continue
-        if [ -z "$best" ] || version_gt "$v" "$best"; then
-            best="$v"
+        git rev-parse --verify -q "refs/tags/${t}^{commit}" >/dev/null 2>&1 || continue
+        if [ -n "$max_exclusive" ] && ! version_gt "$max_exclusive" "$v"; then
+            continue
         fi
-    done < <(git tag -l 2>/dev/null)
-    [ -n "$best" ] || return 1
-    printf 'v%s\n' "$best"
+        if [ -z "$best_ver" ] || version_gt "$v" "$best_ver"; then
+            best_ver="$v"
+            best_tag="$t"
+        fi
+    done < <(git for-each-ref --format='%(refname:short)' 'refs/tags/v*' 2>/dev/null)
+    [ -n "$best_tag" ] || return 1
+    printf '%s\n' "$best_tag"
 }
 
 # ---------- 0. 环境与被检脚本 ----------
@@ -142,15 +148,44 @@ fi
 # ---------- 1. 选基准 ----------
 BASE_SHA=""
 BASE_SRC=""
+ALL_ZERO_BASE=0
 if [ -n "$BASE_REF" ]; then
-    # 全 0 是 GitHub 首次推送/部分 force push 的哨兵值，视为「无基准」
+    # 全 0 是 GitHub 首次推送 / tag push / 部分 force push 的哨兵值：
+    # 优先对比「严格低于当前 VERSION 的最高历史发布 tag」（避免多提交分支打 tag 时退回同版本 HEAD^ 误失败）。
     if [[ "$BASE_REF" =~ ^0+$ ]]; then
-        BASE_SRC=""
+        ALL_ZERO_BASE=1
     elif git rev-parse --verify -q "$BASE_REF^{commit}" >/dev/null 2>&1; then
         BASE_SHA="$(git rev-parse "$BASE_REF^{commit}")"
         BASE_SRC="--base $BASE_REF"
     else
         info "提示：--base $BASE_REF 在本地对象库中不存在（force push 后旧提交不可达），降级选基准"
+    fi
+fi
+if [ -z "$BASE_SHA" ] && [ "$ALL_ZERO_BASE" -eq 1 ]; then
+    # 全 0 哨兵需区分两类合法与非法场景：
+    # 1) 已有 >= CUR_VER 的发布 tag 且不指向 HEAD（例如已发 v3.4.10-h20 后又在未抬版本号的新分支改脚本或降级）：
+    #    必须与该最高 tag 比较（fail-closed 拦下未抬升/降级）。
+    # 2) 最高 tag 恰好 == v$CUR_VER 且指向 HEAD（多提交分支打 tag push）或最高 tag < v$CUR_VER（新未发布版本分支）：
+    #    对比严格低于 CUR_VER 的最高历史发布 tag。
+    if TOP_TAG="$(highest_semver_tag)"; then
+        TOP_VER="${TOP_TAG#v}"
+        HEAD_SHA="$(git rev-parse HEAD 2>/dev/null || true)"
+        TOP_SHA="$(git rev-parse "$TOP_TAG^{commit}" 2>/dev/null || true)"
+        if [ "$TOP_VER" = "$CUR_VER" ] && [ "$TOP_SHA" = "$HEAD_SHA" ]; then
+            if PREV_TAG="$(highest_semver_tag "$CUR_VER")"; then
+                BASE_SHA="$(git rev-parse "$PREV_TAG^{commit}" 2>/dev/null)"
+                BASE_SRC="prev-tag $PREV_TAG"
+            else
+                BASE_SHA="$TOP_SHA"
+                BASE_SRC="tag $TOP_TAG"
+            fi
+        elif ! version_gt "$CUR_VER" "$TOP_VER"; then
+            BASE_SHA="$TOP_SHA"
+            BASE_SRC="tag $TOP_TAG"
+        else
+            BASE_SHA="$TOP_SHA"
+            BASE_SRC="prev-tag $TOP_TAG"
+        fi
     fi
 fi
 if [ -z "$BASE_SHA" ] && git rev-parse --verify -q 'HEAD^' >/dev/null 2>&1; then

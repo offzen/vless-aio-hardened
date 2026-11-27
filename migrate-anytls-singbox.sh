@@ -207,14 +207,14 @@ MIG_LOCK_DIR=""
 MIG_FLOCK_FD=""
 acquire_db_lock() {
     local lock_dir="${DB}.lock" flock_file="${DB}.lock.flock"
-    local i pid old_umask fd=""
+    local i pid fd=""
     MIG_LOCK_DIR=""
     MIG_FLOCK_FD=""
     if command -v flock > /dev/null 2>&1; then
-        old_umask=$(umask)
-        umask 077
+        if [[ ! -e "$flock_file" ]]; then
+            ( umask 077; : >> "$flock_file" ) 2>/dev/null || true
+        fi
         if { exec {fd}>"$flock_file"; } 2>/dev/null; then
-            umask "$old_umask"
             local flocked=0
             if flock -x -n "$fd" 2>/dev/null; then
                 flocked=1
@@ -235,8 +235,6 @@ acquire_db_lock() {
                 return 1
             fi
             MIG_FLOCK_FD="$fd"
-        else
-            umask "$old_umask"
         fi
     fi
     for i in $(seq 1 100); do
@@ -370,7 +368,19 @@ perform_prod_takeover() {
     if unit_known vless-anytls && unit_active vless-anytls; then
         unit_stop vless-anytls || warn "停止旧服务 vless-anytls 失败，继续尝试接管"
     fi
-    if "$script_bin" --apply-configs --ensure-singbox > /dev/null 2>&1 && takeover_verified "$ports"; then
+    local apply_rc=0 takeover_ok=0
+    "$script_bin" --apply-configs --ensure-singbox > /dev/null 2>&1 || apply_rc=$?
+    if takeover_verified "$ports"; then
+        if [[ $apply_rc -eq 0 ]]; then
+            takeover_ok=1
+        elif ! unit_active vless-anytls \
+            && [[ -s "$CFG_DEFAULT/singbox.json" ]] \
+            && jq -e '.inbounds[]? | select(.type == "anytls")' "$CFG_DEFAULT/singbox.json" > /dev/null 2>&1; then
+            takeover_ok=1
+            warn "--apply-configs 返回非零 (rc=$apply_rc，辅助脚本或无关组件刷新异常)，但 sing-box AnyTLS 配置落盘与端口接管已验证成功"
+        fi
+    fi
+    if [[ $takeover_ok -eq 1 ]]; then
         ok "sing-box 已接管：vless-singbox 运行中，端口 $port_summary 均在监听"
         disable_legacy_anytls
         clear_migration_state
